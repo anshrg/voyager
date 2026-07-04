@@ -5,10 +5,12 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
-## Current milestone: M0 — skeleton + FITS open spike (~90% done)
+## Current milestone: M0 — skeleton + FITS open spike (DONE except real-file validation)
 
-M0 remaining: (1) verify the app end-to-end visually, (2) get real user FITS
-files, (3) then start M1 (tiled WebGL image rendering — see CLAUDE.md roadmap).
+All M0 exit criteria verified 2026-07-03 (UI render, IPC, bundled-app
+file-open routing). Sole remaining item: run the app + bench on **real user
+FITS files** (blocked on user providing them). Then M1 (tiled WebGL image
+rendering — see CLAUDE.md roadmap).
 
 ## What works (verified)
 
@@ -29,32 +31,38 @@ files, (3) then start M1 (tiled WebGL image rendering — see CLAUDE.md roadmap)
   showing open-time. `src/api.ts` = typed IPC wrappers; `src/main.ts` = UI.
 - **App launches**: `npx tauri dev -- -- /abs/path/file.fits` runs, window
   created onscreen (confirmed via CGWindowList), vite on :1420.
+- **End-to-end UI verified visually (2026-07-03)**: screenshot loop works now
+  (Screen Recording + Accessibility granted). Confirmed: argv-opened fixture
+  renders 3 HDUs in sidebar (PRIMARY/SCI/CATALOG with dims + BITPIX), header
+  card table with typed values (escaped quote `O'NEILL FIELD`, D-exponent CD
+  values), status bar shows path/size/HDU count/open-ms. Clicking an HDU via
+  `osascript … click at {x,y}` switches the header table correctly. stderr
+  shows `[ds10] open_fits … 3 HDUs in 11.3 ms` (IPC loop verified; the
+  eprintln in `open_fits` was kept — it's a useful log line).
+
+- **Bundled app + Apple Events open verified (2026-07-03)**: `npm run tauri
+  build` produced DS10.app + DMG; registered via `lsregister -f`. Both
+  `open -a DS10 file.fits` at launch (opened in 5.3 ms) and opening a second
+  file into the **running** instance (17.2 ms, status bar updates) work —
+  the `RunEvent::Opened` → `dispatch_open` plumbing is correct end-to-end.
 
 ## In flight / NOT yet verified
 
-- **End-to-end UI check**: nobody has *seen* the app render a file yet.
-  Previous session couldn't screenshot: terminal lacked Screen Recording
-  permission (screencapture silently returns wallpaper-only) and osascript
-  lacked Accessibility. **User has now granted both** (effective after
-  terminal restart) — so: launch app, `screencapture -x shot.png`, Read the
-  png, confirm HDU list + header cards render, argv-opened file appears.
-- An `eprintln!` was just added to `open_fits` in `lib.rs` (logs path/HDUs/ms
-  to stderr) to verify the frontend→backend IPC loop from process output.
-  Not yet compiled/run. Keep or remove after verification, either is fine.
-- File association (double-click .fits in Finder) is declared in
-  `tauri.conf.json` but only works in a **bundled** app (`npm run tauri build`,
-  then open the .app once to register with LaunchServices). Untested.
-- Dialog open (⌘O) untested end-to-end (needs a human or the screenshot loop).
+- Plain `open file.fits` / Finder double-click does NOT reach DS10 on this
+  machine because the user's default .fits handler is a personal Automator
+  app (`com.apple.automator.fits2topcat` per LSHandlers). Not a DS10 bug —
+  DS10 claims the type correctly. User decides if/when to flip the default
+  (right-click → Get Info → Open with → Change All, or wait until DS10
+  replaces the TOPCAT workflow).
+- Dialog open (⌘O) untested end-to-end (needs a human).
 
 ## Environment facts
 
 - macOS arm64; **Node v18** (system); Rust via rustup →
   `export PATH="$HOME/.cargo/bin:$PATH"` before any cargo command (PATH does
   not persist between Bash calls).
-- **Disk is critically low: ~1.6 GiB free of 926 GiB.** Blocked creating a
-  2 GB benchmark file (used 500 MB instead, since deleted). Debug+release
-  cargo target dirs consume several GB — `cargo clean` frees space if
-  desperate, at the cost of a ~5 min rebuild. User should clear space.
+- Disk space recovered: **63 GiB free** as of 2026-07-03 (was 1.6 GiB — user
+  cleared space). Big benchmark files are OK to create again (delete after).
 - Regenerate a benchmark file with the inline python snippet in git history,
   or: any big local FITS. **Ask the user for 2–3 representative real FITS
   files (largest image, typical image, big catalog table) — still not done.**
@@ -70,21 +78,23 @@ files, (3) then start M1 (tiled WebGL image rendering — see CLAUDE.md roadmap)
 - `tsconfig` needs `lib: ES2022` (done) — v18-era default was too old for
   `Array.at`.
 - Tauri argv passthrough that works: `npx tauri dev -- -- <abs-path>`.
+- Screenshot loop that works: `screencapture -x shot.png` + Read the png;
+  UI clicks via `osascript -e 'tell app "System Events" to tell process
+  "ds10" to click at {x, y}'` (coords = screen points ≈ retina px / 2).
+- Don't `open` the .app while `tauri build` is still in its DMG-bundling
+  phase — bundle_dmg.sh has the app mounted/busy and results are confusing.
+- Stale vite on :1420 from a dead session blocks `tauri dev`
+  (`Error: Port 1420 is already in use`) — `lsof -ti :1420 | xargs kill`.
 
 ## Immediate next steps (in order)
 
-1. Relaunch app (`npx tauri dev -- -- $PWD/fixtures/sample.fits`), screenshot
-   (permissions now granted), confirm UI renders HDUs/header correctly; check
-   stderr shows the `[ds10] open_fits` line.
-2. `npm run tauri build`; open the bundled .app; test double-clicking a .fits
-   in Finder routes into the app (M0 exit criterion).
-3. Get real FITS files from the user; run bench_open + the app on them; note
-   any parser failures here.
-4. Update this file + commit; declare M0 done.
-5. M1 kickoff (per CLAUDE.md): Rust tile server (cutouts + downsample levels,
-   binary IPC via `tauri::ipc::Response`), WebGL2 canvas with pan/zoom,
-   zscale/stretch/colormap shaders. fitsgl (see CLAUDE.md §5) is the design
-   reference — no code copying (unlicensed).
+1. **Get real FITS files from the user** (largest image, typical image, big
+   catalog table); run bench_open + the app on them; note any parser
+   failures here. Disk has room now (63 GiB free).
+2. Declare M0 fully done, then M1 kickoff (per CLAUDE.md): Rust tile server
+   (cutouts + downsample levels, binary IPC via `tauri::ipc::Response`),
+   WebGL2 canvas with pan/zoom, zscale/stretch/colormap shaders. fitsgl
+   (see CLAUDE.md §5) is the design reference — no code copying (unlicensed).
 
 ## Decisions made during M0 (rationale in CLAUDE.md)
 
