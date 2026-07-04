@@ -1,5 +1,6 @@
 import {
   getHeader,
+  listOpenFiles,
   onOpenRequest,
   openFits,
   pickFitsFile,
@@ -8,16 +9,22 @@ import {
   type FileSummary,
   type HduInfo,
   type HeaderCard,
+  type ScaleMode,
 } from "./api";
+import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
+
+type ViewTab = "image" | "header";
 
 interface AppState {
   file: FileSummary | null;
   selectedHdu: number;
   cards: HeaderCard[];
   filter: string;
+  tab: ViewTab;
 }
 
-const state: AppState = { file: null, selectedHdu: 0, cards: [], filter: "" };
+const state: AppState = { file: null, selectedHdu: 0, cards: [], filter: "", tab: "header" };
+let viewer: Viewer | null = null;
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -89,6 +96,17 @@ function valueText(v: CardValue | null): string {
   }
 }
 
+/** An image HDU the viewer can display (2-D or a cube's first plane). */
+function isViewableImage(hdu: HduInfo): boolean {
+  return (
+    hdu.kind === "image" &&
+    hdu.shape.length >= 2 &&
+    hdu.shape[0] > 0 &&
+    hdu.shape[1] > 0 &&
+    hdu.data_len > 0
+  );
+}
+
 function renderHduList(): void {
   const list = must<HTMLElement>("hdu-list");
   list.replaceChildren();
@@ -133,7 +151,7 @@ function renderCards(): void {
 }
 
 function renderStatus(): void {
-  const status = must<HTMLElement>("status");
+  const status = must<HTMLElement>("status-file");
   if (!state.file) {
     status.textContent = "No file open";
     return;
@@ -143,24 +161,63 @@ function renderStatus(): void {
   status.textContent = `${f.path} — ${formatBytes(f.size)} — ${f.hdus.length} HDU${plural} — opened in ${f.open_ms.toFixed(1)} ms`;
 }
 
+function currentHdu(): HduInfo | null {
+  return state.file?.hdus[state.selectedHdu] ?? null;
+}
+
+/** Show/hide panes + toolbar controls to match the active tab. */
+function renderView(): void {
+  const hdu = currentHdu();
+  const viewable = hdu !== null && isViewableImage(hdu);
+  if (!viewable) state.tab = "header";
+
+  must<HTMLElement>("view-tabs").style.display = viewable ? "" : "none";
+  must<HTMLElement>("image-pane").style.display = state.tab === "image" ? "" : "none";
+  must<HTMLElement>("header-pane").style.display = state.tab === "header" ? "" : "none";
+  must<HTMLElement>("image-controls").style.display =
+    state.tab === "image" && viewable ? "" : "none";
+  must<HTMLElement>("filter-box").style.display = state.tab === "header" ? "" : "none";
+
+  for (const tab of ["image", "header"] as const) {
+    must<HTMLElement>(`tab-${tab}`).classList.toggle("active", state.tab === tab);
+  }
+}
+
 async function selectHdu(index: number): Promise<void> {
   if (!state.file) return;
+  const hdu = state.file.hdus[index];
   state.selectedHdu = index;
-  state.cards = await getHeader(state.file.path, index);
+  state.tab = isViewableImage(hdu) ? "image" : "header";
   renderHduList();
+  renderView();
+
+  if (isViewableImage(hdu) && viewer) {
+    // shape is FITS order: NAXIS1 (x) first.
+    await viewer.setImage(state.file.path, index, hdu.shape[0], hdu.shape[1]);
+  } else {
+    viewer?.clear();
+  }
+  state.cards = await getHeader(state.file.path, index);
   renderCards();
 }
 
+function setTab(tab: ViewTab): void {
+  state.tab = tab;
+  renderView();
+}
+
 async function openPath(path: string): Promise<void> {
-  const status = must<HTMLElement>("status");
+  const status = must<HTMLElement>("status-file");
   try {
     status.textContent = `Opening ${path}…`;
     state.file = await openFits(path);
-    state.selectedHdu = 0;
     must<HTMLElement>("empty-state").style.display = "none";
     must<HTMLElement>("content").style.display = "";
     renderStatus();
-    await selectHdu(0);
+    // JWST-style files have an empty primary HDU; jump straight to the
+    // first image HDU that actually has pixels (usually SCI).
+    const first = state.file.hdus.find(isViewableImage);
+    await selectHdu(first ? first.index : 0);
   } catch (err) {
     state.file = null;
     status.textContent = `Failed to open ${path}: ${String(err)}`;
@@ -172,6 +229,22 @@ async function openViaDialog(): Promise<void> {
   if (path) await openPath(path);
 }
 
+function makeSelect(
+  id: string,
+  options: readonly string[],
+  onChange: (value: string) => void,
+): HTMLSelectElement {
+  const select = el("select", "control-select");
+  select.id = id;
+  for (const name of options) {
+    const opt = el("option", "", name);
+    opt.value = name;
+    select.append(opt);
+  }
+  select.addEventListener("change", () => onChange(select.value));
+  return select;
+}
+
 function buildUi(): void {
   const root = must<HTMLElement>("app");
   root.replaceChildren();
@@ -180,13 +253,36 @@ function buildUi(): void {
   const title = el("span", "app-title", "DS10");
   const openBtn = el("button", "open-btn", "Open…");
   openBtn.addEventListener("click", () => void openViaDialog());
+
+  // Image controls (visible only on the image tab).
+  const controls = el("div", "image-controls");
+  controls.id = "image-controls";
+  controls.style.display = "none";
+  const colormapSel = makeSelect(
+    "colormap-select",
+    COLORMAPS.map((c) => c.name),
+    (v) => viewer?.setColormap(v),
+  );
+  const stretchSel = makeSelect("stretch-select", STRETCHES, (v) =>
+    viewer?.setStretch(v as Stretch),
+  );
+  const scaleSel = makeSelect("scale-select", ["zscale", "minmax"], (v) => {
+    void viewer?.applyScaleMode(v as ScaleMode);
+  });
+  const limitsLabel = el("span", "limits-label", "");
+  limitsLabel.id = "limits-label";
+  const fitBtn = el("button", "", "Fit");
+  fitBtn.addEventListener("click", () => viewer?.fit());
+  controls.append(colormapSel, stretchSel, scaleSel, fitBtn, limitsLabel);
+
   const filter = el("input", "filter");
+  filter.id = "filter-box";
   filter.placeholder = "Filter header cards…";
   filter.addEventListener("input", () => {
     state.filter = filter.value;
     renderCards();
   });
-  toolbar.append(title, openBtn, filter);
+  toolbar.append(title, openBtn, controls, filter);
 
   const content = el("div", "content");
   content.id = "content";
@@ -199,6 +295,23 @@ function buildUi(): void {
   sidebar.append(sidebarHead, hduList);
 
   const main = el("main", "main");
+
+  const tabs = el("div", "view-tabs");
+  tabs.id = "view-tabs";
+  tabs.style.display = "none";
+  for (const tab of ["image", "header"] as const) {
+    const btn = el("button", "tab", tab === "image" ? "Image" : "Header");
+    btn.id = `tab-${tab}`;
+    btn.addEventListener("click", () => setTab(tab));
+    tabs.append(btn);
+  }
+
+  const imagePane = el("div", "image-pane");
+  imagePane.id = "image-pane";
+  imagePane.style.display = "none";
+
+  const headerPane = el("div", "header-pane");
+  headerPane.id = "header-pane";
   const table = el("table", "cards");
   const thead = el("thead");
   const headRow = el("tr");
@@ -207,7 +320,9 @@ function buildUi(): void {
   const tbody = el("tbody");
   tbody.id = "card-body";
   table.append(thead, tbody);
-  main.append(table);
+  headerPane.append(table);
+
+  main.append(tabs, imagePane, headerPane);
   content.append(sidebar, main);
 
   const empty = el("div", "empty-state");
@@ -218,8 +333,11 @@ function buildUi(): void {
   );
 
   const status = el("footer", "status");
-  status.id = "status";
-  status.textContent = "No file open";
+  const statusFile = el("span", "status-file", "No file open");
+  statusFile.id = "status-file";
+  const readout = el("span", "readout");
+  readout.id = "readout";
+  status.append(statusFile, readout);
 
   root.append(toolbar, empty, content, status);
 
@@ -229,15 +347,27 @@ function buildUi(): void {
       void openViaDialog();
     }
   });
+
+  viewer = new Viewer(imagePane, {
+    onReadout: (info) => {
+      readout.textContent =
+        info.x === null ? "" : `x ${info.x}  y ${info.y}  ${info.value}`;
+    },
+    onLimits: (lo, hi) => {
+      must<HTMLElement>("limits-label").textContent =
+        `[${lo.toPrecision(5)}, ${hi.toPrecision(5)}]`;
+    },
+  });
 }
 
 async function init(): Promise<void> {
   buildUi();
   // Live open requests (double-click while the app is already running).
   await onOpenRequest((path) => void openPath(path));
-  // Files that arrived before this listener existed (launched by double-click).
+  // Files that arrived before this listener existed (launched by double-click),
+  // else whatever the backend already has open (recovers vite hot-reloads).
   const pending = await takePendingOpens();
-  const last = pending.at(-1);
+  const last = pending.at(-1) ?? (await listOpenFiles()).at(-1);
   if (last) await openPath(last);
 }
 

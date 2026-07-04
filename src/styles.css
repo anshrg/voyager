@@ -142,7 +142,76 @@ button:hover {
 
 .main {
   flex: 1 1 auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.view-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 2px;
+  padding: 6px 12px 0;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: var(--bg);
+  color: var(--fg-dim);
+  padding: 4px 16px;
+}
+
+.tab.active {
+  background: var(--bg-hover);
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.image-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  background: #0e1013;
+}
+
+.image-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.header-pane {
+  flex: 1 1 auto;
   overflow: auto;
+}
+
+.image-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+
+.limits-label {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
 table.cards {
@@ -202,6 +271,8 @@ table.cards td {
 
 .status {
   flex: 0 0 auto;
+  display: flex;
+  gap: 16px;
   padding: 6px 12px;
   background: var(--bg-panel);
   border-top: 1px solid var(--border);
@@ -209,6 +280,17 @@ table.cards td {
   font-family: var(--mono);
   font-size: 11px;
   white-space: nowrap;
+}
+
+.status-file {
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.readout {
+  flex: 0 0 auto;
+  color: var(--fg);
+  min-width: 24ch;
+  text-align: right;
 }

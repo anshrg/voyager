@@ -99,7 +99,9 @@ fn scale_limits_match_astropy() {
     let (file, expected) = load();
     for check in expected["scale_checks"].as_array().unwrap() {
         let hdu = check["hdu"].as_u64().unwrap() as usize;
-        let values = tiles::gather_values(&file, hdu, 4_000_000).unwrap();
+        // Same target the app uses; the fixture image is far smaller, so
+        // this is the astropy-exact full-read path either way.
+        let values = tiles::gather_values(&file, hdu, 200_000).unwrap();
 
         let want = check["zscale"].as_array().unwrap();
         let (lo, hi) =

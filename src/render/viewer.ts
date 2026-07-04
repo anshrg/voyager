@@ -1,0 +1,428 @@
+// Tiled WebGL2 image viewer: pan/zoom camera over an image pyramid served
+// by the Rust backend. Level L samples every 2^L-th pixel (DS9 block-sample
+// semantics), so tiles are cheap even on multi-GB mmap'd files.
+//
+// Draw strategy: the coarsest level (whole image in one tile per axis) is
+// fetched eagerly and drawn as a backdrop every frame; visible tiles at the
+// target level draw on top as they stream in. Missing tiles therefore show
+// a low-res preview instead of holes.
+
+import { getPixel, getScaleLimits, getTile, TILE, type ScaleMode } from "../api";
+import { COLORMAPS } from "./colormaps.gen";
+import {
+  createTileProgram,
+  createTileTexture,
+  uploadLut,
+  type Stretch,
+  type TileProgram,
+  STRETCHES,
+} from "./gl";
+
+const MAX_GPU_TILES = 600; // ~150 MB of R32F at 256²
+const NAN_READOUT = "NaN";
+
+interface CachedTile {
+  tex: WebGLTexture;
+  w: number;
+  h: number;
+  lastUsed: number;
+}
+
+export interface ReadoutInfo {
+  /** FITS 1-based pixel coordinates, or null when off-image. */
+  x: number | null;
+  y: number | null;
+  value: string;
+}
+
+export interface ViewerCallbacks {
+  onReadout(info: ReadoutInfo): void;
+  onLimits(lo: number, hi: number): void;
+}
+
+interface ImageRef {
+  path: string;
+  hdu: number;
+  nx: number;
+  ny: number;
+  maxLevel: number;
+}
+
+export class Viewer {
+  private readonly canvas: HTMLCanvasElement;
+  private readonly p: TileProgram;
+  private readonly callbacks: ViewerCallbacks;
+
+  private image: ImageRef | null = null;
+  /** Bumped on setImage; stale async responses are discarded. */
+  private generation = 0;
+
+  // Camera: image-pixel coordinates of the canvas center, and device pixels
+  // per image pixel.
+  private cx = 0;
+  private cy = 0;
+  private scale = 1;
+  /** Until the user pans/zooms, resizes re-fit (covers the canvas getting
+   *  its real size only after the pane becomes visible). */
+  private userNavigated = false;
+
+  private limits: [number, number] = [0, 1];
+  /** Tiles draw only once real limits arrive — avoids a wrong-stretch flash. */
+  private limitsReady = false;
+  private stretchIndex = 0;
+
+  private tiles = new Map<string, CachedTile>();
+  private inflight = new Set<string>();
+  private tick = 0;
+  private drawQueued = false;
+
+  // Readout throttling: at most one get_pixel in flight.
+  private readoutBusy = false;
+  private readoutPending: [number, number] | null = null;
+
+  constructor(container: HTMLElement, callbacks: ViewerCallbacks) {
+    this.callbacks = callbacks;
+    this.canvas = document.createElement("canvas");
+    this.canvas.className = "image-canvas";
+    container.append(this.canvas);
+    this.p = createTileProgram(this.canvas);
+    this.setColormap("gray");
+
+    new ResizeObserver(() => this.resize()).observe(container);
+    this.resize();
+    this.bindInput();
+  }
+
+  // ---- public API -------------------------------------------------------
+
+  async setImage(path: string, hdu: number, nx: number, ny: number): Promise<void> {
+    this.generation++;
+    this.clearTiles();
+    this.limitsReady = false;
+    let maxLevel = 0;
+    while (Math.ceil(Math.max(nx, ny) / 2 ** maxLevel) > TILE) maxLevel++;
+    this.image = { path, hdu, nx, ny, maxLevel };
+    this.fit();
+    await this.applyScaleMode("zscale");
+  }
+
+  clear(): void {
+    this.generation++;
+    this.image = null;
+    this.clearTiles();
+    this.requestDraw();
+  }
+
+  fit(): void {
+    if (!this.image) return;
+    const { nx, ny } = this.image;
+    this.userNavigated = false;
+    this.scale = Math.max(
+      1e-6,
+      0.98 * Math.min(this.canvas.width / nx, this.canvas.height / ny),
+    );
+    this.cx = nx / 2;
+    this.cy = ny / 2;
+    this.requestDraw();
+  }
+
+  async applyScaleMode(mode: ScaleMode): Promise<void> {
+    if (!this.image) return;
+    const gen = this.generation;
+    const lim = await getScaleLimits(this.image.path, this.image.hdu, mode);
+    if (gen !== this.generation) return;
+    this.limits = [lim.lo, lim.hi];
+    this.limitsReady = true;
+    this.callbacks.onLimits(lim.lo, lim.hi);
+    this.requestDraw();
+  }
+
+  setStretch(name: Stretch): void {
+    this.stretchIndex = STRETCHES.indexOf(name);
+    this.requestDraw();
+  }
+
+  setColormap(name: string): void {
+    const cmap = COLORMAPS.find((c) => c.name === name);
+    if (!cmap) return;
+    uploadLut(this.p, cmap.rgb);
+    this.requestDraw();
+  }
+
+  // ---- camera & input ---------------------------------------------------
+
+  private resize(): void {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(this.canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.round(this.canvas.clientHeight * dpr));
+    if (w !== this.canvas.width || h !== this.canvas.height) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+      if (!this.userNavigated) this.fit();
+      this.requestDraw();
+    }
+  }
+
+  /** Event position → image pixel coordinates (0-based, continuous). */
+  private toImage(e: MouseEvent): [number, number] {
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const dx = (e.clientX - rect.left) * dpr - this.canvas.width / 2;
+    const dy = (e.clientY - rect.top) * dpr - this.canvas.height / 2;
+    // Screen y grows down, image y grows up.
+    return [this.cx + dx / this.scale, this.cy - dy / this.scale];
+  }
+
+  private bindInput(): void {
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    this.canvas.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      this.canvas.setPointerCapture(e.pointerId);
+      this.updateReadout(e);
+    });
+    this.canvas.addEventListener("pointerup", (e) => {
+      dragging = false;
+      this.canvas.releasePointerCapture(e.pointerId);
+    });
+    this.canvas.addEventListener("pointermove", (e) => {
+      if (dragging) {
+        this.userNavigated = true;
+        const dpr = window.devicePixelRatio || 1;
+        this.cx -= ((e.clientX - lastX) * dpr) / this.scale;
+        this.cy += ((e.clientY - lastY) * dpr) / this.scale;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        this.requestDraw();
+      }
+      this.updateReadout(e);
+    });
+    this.canvas.addEventListener("pointerleave", () => {
+      this.callbacks.onReadout({ x: null, y: null, value: "" });
+    });
+
+    this.canvas.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        if (!this.image) return;
+        this.userNavigated = true;
+        const [ix, iy] = this.toImage(e);
+        const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002));
+        const minScale =
+          0.5 * Math.min(this.canvas.width / this.image.nx, this.canvas.height / this.image.ny);
+        this.scale = Math.min(64, Math.max(minScale, this.scale * factor));
+        // Keep the image point under the cursor fixed.
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const dx = (e.clientX - rect.left) * dpr - this.canvas.width / 2;
+        const dy = (e.clientY - rect.top) * dpr - this.canvas.height / 2;
+        this.cx = ix - dx / this.scale;
+        this.cy = iy + dy / this.scale;
+        this.requestDraw();
+      },
+      { passive: false },
+    );
+
+    this.canvas.addEventListener("dblclick", () => this.fit());
+  }
+
+  private updateReadout(e: MouseEvent): void {
+    if (!this.image) return;
+    const [fx, fy] = this.toImage(e);
+    const x = Math.floor(fx);
+    const y = Math.floor(fy);
+    if (x < 0 || y < 0 || x >= this.image.nx || y >= this.image.ny) {
+      this.callbacks.onReadout({ x: null, y: null, value: "" });
+      return;
+    }
+    // DS9 shows FITS 1-based coordinates.
+    this.callbacks.onReadout({ x: x + 1, y: y + 1, value: "…" });
+    this.readoutPending = [x, y];
+    void this.pumpReadout();
+  }
+
+  private async pumpReadout(): Promise<void> {
+    if (this.readoutBusy || !this.readoutPending || !this.image) return;
+    const [x, y] = this.readoutPending;
+    this.readoutPending = null;
+    this.readoutBusy = true;
+    const gen = this.generation;
+    try {
+      const v = await getPixel(this.image.path, this.image.hdu, x, y);
+      if (gen === this.generation) {
+        const text = v === null ? NAN_READOUT : formatValue(v);
+        this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text });
+      }
+    } catch {
+      // File may have been closed mid-flight; readout just goes blank.
+    } finally {
+      this.readoutBusy = false;
+      if (this.readoutPending) void this.pumpReadout();
+    }
+  }
+
+  // ---- tiles ------------------------------------------------------------
+
+  private clearTiles(): void {
+    for (const t of this.tiles.values()) this.p.gl.deleteTexture(t.tex);
+    this.tiles.clear();
+    this.inflight.clear();
+  }
+
+  private tileKey(level: number, tx: number, ty: number): string {
+    return `${level}/${tx}/${ty}`;
+  }
+
+  private requestTile(level: number, tx: number, ty: number): void {
+    if (!this.image) return;
+    const key = this.tileKey(level, tx, ty);
+    if (this.tiles.has(key) || this.inflight.has(key)) return;
+    this.inflight.add(key);
+    const gen = this.generation;
+    const { path, hdu } = this.image;
+    getTile(path, hdu, level, tx, ty)
+      .then((tile) => {
+        if (gen !== this.generation) return;
+        this.inflight.delete(key);
+        const tex = createTileTexture(this.p.gl, tile.w, tile.h, tile.data);
+        this.tiles.set(key, { tex, w: tile.w, h: tile.h, lastUsed: this.tick });
+        this.evict();
+        this.requestDraw();
+      })
+      .catch((err: unknown) => {
+        this.inflight.delete(key);
+        console.error(`tile ${key} failed:`, err);
+      });
+  }
+
+  private evict(): void {
+    if (this.tiles.size <= MAX_GPU_TILES) return;
+    const entries = [...this.tiles.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    const drop = entries.slice(0, this.tiles.size - MAX_GPU_TILES);
+    for (const [key, t] of drop) {
+      // Never evict the backdrop level; it's tiny and always needed.
+      if (this.image && key.startsWith(`${this.image.maxLevel}/`)) continue;
+      this.p.gl.deleteTexture(t.tex);
+      this.tiles.delete(key);
+    }
+  }
+
+  // ---- drawing ----------------------------------------------------------
+
+  private requestDraw(): void {
+    if (this.drawQueued) return;
+    this.drawQueued = true;
+    requestAnimationFrame(() => {
+      this.drawQueued = false;
+      this.draw();
+    });
+  }
+
+  /** Draw all cached tiles of `level` that intersect the view; request
+   *  missing ones. With render=false only requests (prefetch while scale
+   *  limits are still being computed). Returns true if fully covered. */
+  private drawLevel(level: number, request: boolean, render = true): boolean {
+    if (!this.image) return false;
+    const { gl, uniforms } = this.p;
+    const { nx, ny } = this.image;
+    const stride = 2 ** level;
+    const lw = Math.ceil(nx / stride);
+    const lh = Math.ceil(ny / stride);
+
+    // Visible image rect from the camera.
+    const halfW = this.canvas.width / 2 / this.scale;
+    const halfH = this.canvas.height / 2 / this.scale;
+    const ix0 = Math.max(0, this.cx - halfW);
+    const ix1 = Math.min(nx, this.cx + halfW);
+    const iy0 = Math.max(0, this.cy - halfH);
+    const iy1 = Math.min(ny, this.cy + halfH);
+    if (ix0 >= ix1 || iy0 >= iy1) return true;
+
+    const t0x = Math.floor(ix0 / stride / TILE);
+    const t1x = Math.min(Math.ceil(lw / TILE) - 1, Math.floor((ix1 - 1) / stride / TILE));
+    const t0y = Math.floor(iy0 / stride / TILE);
+    const t1y = Math.min(Math.ceil(lh / TILE) - 1, Math.floor((iy1 - 1) / stride / TILE));
+
+    let complete = true;
+    for (let ty = t0y; ty <= t1y; ty++) {
+      for (let tx = t0x; tx <= t1x; tx++) {
+        const key = this.tileKey(level, tx, ty);
+        const tile = this.tiles.get(key);
+        if (!tile) {
+          complete = false;
+          if (request) this.requestTile(level, tx, ty);
+          continue;
+        }
+        tile.lastUsed = this.tick;
+        if (!render) continue;
+        const x0 = tx * TILE * stride;
+        const y0 = ty * TILE * stride;
+        const w = Math.min(tile.w * stride, nx - x0);
+        const h = Math.min(tile.h * stride, ny - y0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tile.tex);
+        gl.uniform4f(uniforms.rect, x0, y0, w, h);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+    }
+    return complete;
+  }
+
+  private draw(): void {
+    const { gl, program, vao, uniforms, lutTex } = this.p;
+    this.tick++;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0.055, 0.06, 0.07, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!this.image) return;
+    if (!this.limitsReady) {
+      // Prefetch visible tiles while zscale runs; draw once limits arrive.
+      const lvl = Math.min(
+        this.image.maxLevel,
+        Math.max(0, Math.floor(Math.log2(1 / this.scale))),
+      );
+      if (lvl !== this.image.maxLevel) this.drawLevel(this.image.maxLevel, true, false);
+      this.drawLevel(lvl, true, false);
+      return;
+    }
+
+    gl.useProgram(program);
+    gl.bindVertexArray(vao);
+    gl.uniform2f(uniforms.center, this.cx, this.cy);
+    gl.uniform1f(uniforms.scale, this.scale);
+    gl.uniform2f(uniforms.viewport, this.canvas.width, this.canvas.height);
+    gl.uniform2f(uniforms.limits, this.limits[0], this.limits[1]);
+    gl.uniform1i(uniforms.stretch, this.stretchIndex);
+    gl.uniform1i(uniforms.tex, 0);
+    gl.uniform1i(uniforms.lut, 1);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, lutTex);
+
+    // Target level: finest level whose sampling is not coarser than the
+    // screen (floor of log2 image-px-per-screen-px), clamped to the pyramid.
+    const level = Math.min(
+      this.image.maxLevel,
+      Math.max(0, Math.floor(Math.log2(1 / this.scale))),
+    );
+
+    // Backdrop (coarsest level) first so missing tiles show a preview.
+    if (level !== this.image.maxLevel) this.drawLevel(this.image.maxLevel, true);
+    this.drawLevel(level, true);
+    gl.bindVertexArray(null);
+  }
+}
+
+function formatValue(v: number): string {
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e6 || a < 1e-4) return v.toExponential(6);
+  return v.toPrecision(8);
+}
+
+export { STRETCHES, type Stretch } from "./gl";
+export { COLORMAPS } from "./colormaps.gen";

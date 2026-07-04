@@ -71,12 +71,19 @@ async fn get_tile(
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
     let file = lookup(&state, &path)?;
+    let t0 = Instant::now();
     let tile = tauri::async_runtime::spawn_blocking(move || {
         tiles::extract_tile(&file, hdu, level, tx, ty)
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+    eprintln!(
+        "[ds10] tile L{level} ({tx},{ty}) {}x{} in {:.1} ms",
+        tile.w,
+        tile.h,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
 
     let mut buf = Vec::with_capacity(8 + tile.data.len() * 4);
     buf.extend_from_slice(&tile.w.to_le_bytes());
@@ -103,9 +110,14 @@ async fn get_scale_limits(
     state: State<'_, AppState>,
 ) -> Result<ScaleLimits, String> {
     let file = lookup(&state, &path)?;
+    let t0 = Instant::now();
+    let mode_label = mode.clone();
     let limits = tauri::async_runtime::spawn_blocking(move || -> Result<(f64, f64), String> {
+        // ~200k samples: two orders more than zscale's nsamples=1000 keeps
+        // limits stable, while touching few enough pages that a cold 5 GiB
+        // mosaic stays well inside the 1 s first-render budget.
         let values =
-            tiles::gather_values(&file, hdu, 4_000_000).map_err(|e| e.to_string())?;
+            tiles::gather_values(&file, hdu, 200_000).map_err(|e| e.to_string())?;
         let result = match mode.as_str() {
             "zscale" => tiles::zscale::zscale(&values, &tiles::zscale::ZScaleParams::default()),
             "minmax" => tiles::zscale::minmax(&values),
@@ -115,6 +127,12 @@ async fn get_scale_limits(
     })
     .await
     .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[ds10] scale_limits {mode_label} = ({:.6}, {:.6}) in {:.1} ms",
+        limits.0,
+        limits.1,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
     Ok(ScaleLimits {
         lo: limits.0,
         hi: limits.1,
@@ -173,6 +191,13 @@ fn take_pending_opens(state: State<'_, AppState>) -> Vec<String> {
     std::mem::take(&mut *state.pending_opens.lock().unwrap())
 }
 
+/// Paths currently open in backend state. Lets a reloaded frontend (vite
+/// hot-reload in dev, or a future window respawn) recover its session.
+#[tauri::command]
+fn list_open_files(state: State<'_, AppState>) -> Vec<String> {
+    state.files.lock().unwrap().keys().cloned().collect()
+}
+
 fn looks_like_fits(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     [".fits", ".fit", ".fts", ".fits.gz", ".fits.fz"]
@@ -201,7 +226,8 @@ pub fn run() {
             get_scale_limits,
             get_pixel,
             close_fits,
-            take_pending_opens
+            take_pending_opens,
+            list_open_files
         ])
         .setup(|app| {
             // Files passed on the command line (dev workflow / Linux later).
