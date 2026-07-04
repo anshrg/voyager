@@ -5,12 +5,11 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
-## Current milestone: M0 — skeleton + FITS open spike (DONE except real-file validation)
+## Current milestone: M0 — **DONE** (2026-07-03). Next: M1 kickoff.
 
-All M0 exit criteria verified 2026-07-03 (UI render, IPC, bundled-app
-file-open routing). Sole remaining item: run the app + bench on **real user
-FITS files** (blocked on user providing them). Then M1 (tiled WebGL image
-rendering — see CLAUDE.md roadmap).
+All exit criteria verified: UI render, IPC, bundled-app file-open routing,
+and real-file validation (see below). M1 = tiled WebGL image rendering
+(see CLAUDE.md roadmap + step list at bottom).
 
 ## What works (verified)
 
@@ -40,6 +39,23 @@ rendering — see CLAUDE.md roadmap).
   shows `[ds10] open_fits … 3 HDUs in 11.3 ms` (IPC loop verified; the
   eprintln in `open_fits` was kept — it's a useful log line).
 
+- **Real-file validation (2026-07-03)** — user's three representative files,
+  all parse and render correctly in bench_open **and** the bundled app:
+  - `/Volumes/Extreme SSD/data/primer-uds/images/primeruds_nrc_f444w_sci.fits`
+    — 5.0 GiB, single 41800×32000 float32 SCI HDU. Open: 28.5 ms cold from
+    external SSD / 0.4 ms warm. Corner spot-read is NaN (blank coverage —
+    expected; M1 shaders must handle NaN).
+  - `~/research/miri-photometry/egs/data/images/i2d/ceers-miri-pointings/`
+    `ceers_miri1_f770w_i2d.fits` — 63 MB JWST i2d, 10 HDUs (empty primary,
+    SCI/ERR/CON/WHT/VAR_*, HDRTAB bintable 3×409 cols, ASDF). This is the
+    "typical image" shape to optimize UX for (auto-select SCI, not primary?).
+  - `/Volumes/Extreme SSD/data/euclid/catalogs/dawn-v1_7/edfn_dawn_catalog_dr1_v1.7_lp.fits`
+    — 29.6 GiB bintable, **26,965,827 rows × 157 cols**. Open: 126.7 ms cold
+    / 0.7 ms warm. This is the M4 table-viewer stress target; 1M-row sort
+    target will need rethinking at 27M rows (chunked/lazy column reads).
+  - External-drive caveat: opens only touch header blocks so the cable
+    doesn't matter for open-time; it WILL matter for M1 full-res pixel
+    streaming (copy a big file to internal disk when benchmarking M1).
 - **Bundled app + Apple Events open verified (2026-07-03)**: `npm run tauri
   build` produced DS10.app + DMG; registered via `lsregister -f`. Both
   `open -a DS10 file.fits` at launch (opened in 5.3 ms) and opening a second
@@ -88,13 +104,14 @@ rendering — see CLAUDE.md roadmap).
 
 ## Immediate next steps (in order)
 
-1. **Get real FITS files from the user** (largest image, typical image, big
-   catalog table); run bench_open + the app on them; note any parser
-   failures here. Disk has room now (63 GiB free).
-2. Declare M0 fully done, then M1 kickoff (per CLAUDE.md): Rust tile server
-   (cutouts + downsample levels, binary IPC via `tauri::ipc::Response`),
-   WebGL2 canvas with pan/zoom, zscale/stretch/colormap shaders. fitsgl
-   (see CLAUDE.md §5) is the design reference — no code copying (unlicensed).
+1. M1 kickoff (per CLAUDE.md): Rust tile server (cutouts + downsample levels,
+   binary IPC via `tauri::ipc::Response`), WebGL2 canvas with pan/zoom,
+   zscale/stretch/colormap shaders. fitsgl (see CLAUDE.md §5) is the design
+   reference — no code copying (unlicensed). Bench against the PRIMER 5 GiB
+   image (copy to internal disk first — external cable will skew streaming
+   numbers). Shaders must handle NaN pixels (blank mosaic coverage).
+2. M1 UX detail from real files: JWST i2d files open on an EMPTY primary
+   HDU — auto-select the first image HDU with data (usually SCI).
 
 ## Decisions made during M0 (rationale in CLAUDE.md)
 
