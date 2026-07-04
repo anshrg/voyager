@@ -1,16 +1,18 @@
 pub mod fits;
+pub mod tiles;
 
 use fits::FitsFile;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 
 /// Open files stay in state so their mmaps remain valid across commands.
+/// Arc lets tile extraction run outside the map lock (parallel requests).
 #[derive(Default)]
 struct AppState {
-    files: Mutex<HashMap<String, FitsFile>>,
+    files: Mutex<HashMap<String, Arc<FitsFile>>>,
     /// Paths received (via file association or argv) before the frontend
     /// was ready to handle them.
     pending_opens: Mutex<Vec<String>>,
@@ -42,8 +44,95 @@ fn open_fits(path: String, state: State<'_, AppState>) -> Result<FileSummary, St
         hdus: file.hdus.clone(),
         open_ms,
     };
-    state.files.lock().unwrap().insert(path, file);
+    state.files.lock().unwrap().insert(path, Arc::new(file));
     Ok(summary)
+}
+
+fn lookup(state: &State<'_, AppState>, path: &str) -> Result<Arc<FitsFile>, String> {
+    state
+        .files
+        .lock()
+        .unwrap()
+        .get(path)
+        .cloned()
+        .ok_or_else(|| "file not open".to_string())
+}
+
+/// Binary tile fetch: [u32 w, u32 h] little-endian, then w*h f32 LE pixels
+/// (row-major, row 0 = lowest FITS row). Async so extraction (which may
+/// fault mmap pages in from disk) runs off the main thread.
+#[tauri::command]
+async fn get_tile(
+    path: String,
+    hdu: usize,
+    level: u32,
+    tx: u32,
+    ty: u32,
+    state: State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let file = lookup(&state, &path)?;
+    let tile = tauri::async_runtime::spawn_blocking(move || {
+        tiles::extract_tile(&file, hdu, level, tx, ty)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let mut buf = Vec::with_capacity(8 + tile.data.len() * 4);
+    buf.extend_from_slice(&tile.w.to_le_bytes());
+    buf.extend_from_slice(&tile.h.to_le_bytes());
+    for v in &tile.data {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(tauri::ipc::Response::new(buf))
+}
+
+#[derive(Serialize)]
+struct ScaleLimits {
+    lo: f64,
+    hi: f64,
+}
+
+/// Display scale limits. `mode` is "zscale" or "minmax"; large images are
+/// sampled (see tiles::gather_values) so this stays fast on multi-GB files.
+#[tauri::command]
+async fn get_scale_limits(
+    path: String,
+    hdu: usize,
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<ScaleLimits, String> {
+    let file = lookup(&state, &path)?;
+    let limits = tauri::async_runtime::spawn_blocking(move || -> Result<(f64, f64), String> {
+        let values =
+            tiles::gather_values(&file, hdu, 4_000_000).map_err(|e| e.to_string())?;
+        let result = match mode.as_str() {
+            "zscale" => tiles::zscale::zscale(&values, &tiles::zscale::ZScaleParams::default()),
+            "minmax" => tiles::zscale::minmax(&values),
+            other => return Err(format!("unknown scale mode: {other}")),
+        };
+        result.ok_or_else(|| "image has no finite pixels".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(ScaleLimits {
+        lo: limits.0,
+        hi: limits.1,
+    })
+}
+
+/// Pixel readout at FITS 0-based (x, y). None = NaN/BLANK (JSON has no NaN).
+#[tauri::command]
+fn get_pixel(
+    path: String,
+    hdu: usize,
+    x: u64,
+    y: u64,
+    state: State<'_, AppState>,
+) -> Result<Option<f64>, String> {
+    let file = lookup(&state, &path)?;
+    let v = tiles::pixel_at(&file, hdu, x, y).map_err(|e| e.to_string())?;
+    Ok(if v.is_nan() { None } else { Some(v) })
 }
 
 #[derive(Serialize)]
@@ -108,6 +197,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_fits,
             get_header,
+            get_tile,
+            get_scale_limits,
+            get_pixel,
             close_fits,
             take_pending_opens
         ])

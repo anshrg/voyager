@@ -4,6 +4,7 @@
 //!   scripts/venv/bin/python scripts/gen_fixtures.py
 
 use ds10_lib::fits::{FitsFile, HduKind};
+use ds10_lib::tiles;
 use serde_json::Value as Json;
 use std::path::PathBuf;
 
@@ -90,5 +91,72 @@ fn pixel_values_match_astropy() {
             (got - want).abs() <= 1e-6 * want.abs().max(1.0),
             "pixel ({x},{y}) HDU {hdu}: got {got}, want {want}"
         );
+    }
+}
+
+#[test]
+fn scale_limits_match_astropy() {
+    let (file, expected) = load();
+    for check in expected["scale_checks"].as_array().unwrap() {
+        let hdu = check["hdu"].as_u64().unwrap() as usize;
+        let values = tiles::gather_values(&file, hdu, 4_000_000).unwrap();
+
+        let want = check["zscale"].as_array().unwrap();
+        let (lo, hi) =
+            tiles::zscale::zscale(&values, &tiles::zscale::ZScaleParams::default()).unwrap();
+        for (got, want) in [(lo, want[0].as_f64().unwrap()), (hi, want[1].as_f64().unwrap())] {
+            assert!(
+                (got - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "HDU {hdu} zscale: got ({lo}, {hi}), want {want}"
+            );
+        }
+
+        let want = check["minmax"].as_array().unwrap();
+        let (lo, hi) = tiles::zscale::minmax(&values).unwrap();
+        // ~1 ULP tolerance: JSON round-tripping of f64 extremes.
+        for (got, want, which) in [
+            (lo, want[0].as_f64().unwrap(), "min"),
+            (hi, want[1].as_f64().unwrap(), "max"),
+        ] {
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "HDU {hdu} {which}: got {got}, want {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tiles_match_astropy_striding() {
+    let (file, expected) = load();
+    for check in expected["tile_checks"].as_array().unwrap() {
+        let hdu = check["hdu"].as_u64().unwrap() as usize;
+        let level = check["level"].as_u64().unwrap() as u32;
+        let tx = check["tx"].as_u64().unwrap() as u32;
+        let ty = check["ty"].as_u64().unwrap() as u32;
+        let tile = tiles::extract_tile(&file, hdu, level, tx, ty).unwrap();
+        assert_eq!(
+            (tile.w as u64, tile.h as u64),
+            (
+                check["w"].as_u64().unwrap(),
+                check["h"].as_u64().unwrap()
+            ),
+            "HDU {hdu} level {level} tile dims"
+        );
+        for s in check["samples"].as_array().unwrap() {
+            let i = s["i"].as_u64().unwrap() as u32;
+            let j = s["j"].as_u64().unwrap() as u32;
+            let got = tile.data[(j * tile.w + i) as usize];
+            match s["value"].as_f64() {
+                Some(want) => assert!(
+                    ((got as f64) - want).abs() <= 1e-6 * want.abs().max(1.0),
+                    "HDU {hdu} level {level} tile ({i},{j}): got {got}, want {want}"
+                ),
+                None => assert!(
+                    got.is_nan(),
+                    "HDU {hdu} level {level} tile ({i},{j}): want NaN, got {got}"
+                ),
+            }
+        }
     }
 }

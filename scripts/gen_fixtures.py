@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+from astropy.visualization import ZScaleInterval
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -24,6 +25,8 @@ def build_sample() -> fits.HDUList:
     yy, xx = np.mgrid[0:ny, 0:nx]
     data = (np.sin(xx / 7.0) * 100.0 + yy * 3.0).astype(np.float32)
     data[10, 20] = np.float32(-999.25)
+    # NaN block: blank mosaic coverage; the viewer and zscale must skip it.
+    data[0:4, 40:44] = np.nan
     primary = fits.PrimaryHDU(data=data)
     h = primary.header
     h["OBJECT"] = ("O'NEILL FIELD", "target with escaped quote")
@@ -106,7 +109,60 @@ def expectations(hdul: fits.HDUList, path: Path) -> dict:
                 {"hdu": 1, "x": x, "y": y, "value": float(sci[y, x]) * sci_scale + sci_zero}
             )
 
-    return {"file": path.name, "hdus": hdus, "pixel_checks": checks}
+    # Display-scaling and tile ground truth. Tiles are block-SAMPLED
+    # (every 2^level-th pixel), so expected level-L values come from
+    # numpy striding, and zscale limits from astropy's ZScaleInterval.
+    with fits.open(path, do_not_scale_image_data=True) as raw:
+        images = {
+            0: raw[0].data.astype(np.float64),
+            1: raw[1].data.astype(np.float64) * raw[1].header.get("BSCALE", 1.0)
+            + raw[1].header.get("BZERO", 0.0),
+        }
+
+    def num_or_null(v: float) -> float | None:
+        return None if np.isnan(v) else float(v)
+
+    scale_checks = []
+    for hdu_index, img in images.items():
+        zlo, zhi = ZScaleInterval().get_limits(img)
+        scale_checks.append(
+            {
+                "hdu": hdu_index,
+                "zscale": [float(zlo), float(zhi)],
+                "minmax": [float(np.nanmin(img)), float(np.nanmax(img))],
+            }
+        )
+
+    tile_checks = []
+    for hdu_index, img in images.items():
+        for level in (0, 1):
+            sampled = img[:: 2**level, :: 2**level]
+            h, w = sampled.shape  # whole image fits in one 256px tile
+            samples = []
+            for (i, j) in [(0, 0), (w - 1, h - 1), (w // 2, h // 3), (5, 7)]:
+                samples.append({"i": i, "j": j, "value": num_or_null(sampled[j, i])})
+            if hdu_index == 0 and level == 0:
+                # Inside the NaN block (x 40..44, y 0..4).
+                samples.append({"i": 41, "j": 2, "value": None})
+            tile_checks.append(
+                {
+                    "hdu": hdu_index,
+                    "level": level,
+                    "tx": 0,
+                    "ty": 0,
+                    "w": w,
+                    "h": h,
+                    "samples": samples,
+                }
+            )
+
+    return {
+        "file": path.name,
+        "hdus": hdus,
+        "pixel_checks": checks,
+        "scale_checks": scale_checks,
+        "tile_checks": tile_checks,
+    }
 
 
 def main() -> None:

@@ -370,6 +370,12 @@ impl FitsFile {
         self.hdus.get(index).ok_or(FitsError::BadHdu(index))
     }
 
+    /// The whole file as a byte slice (mmap-backed; reads fault pages in on
+    /// demand). Used by the tiles module for data-unit access.
+    pub fn data(&self) -> &[u8] {
+        &self.mmap
+    }
+
     /// Raw big-endian pixel at FITS 0-based pixel index (x, y) of a 2-D image
     /// HDU, with BSCALE/BZERO applied. Used for readout and fixture tests.
     pub fn pixel_value(&self, hdu_index: usize, x: u64, y: u64) -> Result<f64> {
