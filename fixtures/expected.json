@@ -1,0 +1,91 @@
+{
+  "file": "sample.fits",
+  "hdus": [
+    {
+      "index": 0,
+      "kind": "image",
+      "name": null,
+      "bitpix": -32,
+      "shape": [
+        64,
+        48
+      ],
+      "header_cards": {
+        "OBJECT": "O'NEILL FIELD",
+        "CRVAL1": 150.1163213,
+        "EXPTIME": 1200.0
+      }
+    },
+    {
+      "index": 1,
+      "kind": "image",
+      "name": "SCI",
+      "bitpix": 16,
+      "shape": [
+        64,
+        48
+      ],
+      "header_cards": {
+        "BSCALE": 2.0,
+        "BZERO": 100.0
+      }
+    },
+    {
+      "index": 2,
+      "kind": "bin_table",
+      "name": "CATALOG",
+      "bitpix": 8,
+      "shape": [
+        40,
+        123
+      ],
+      "header_cards": {
+        "TFIELDS": 5
+      }
+    }
+  ],
+  "pixel_checks": [
+    {
+      "hdu": 0,
+      "x": 0,
+      "y": 0,
+      "value": 0.0
+    },
+    {
+      "hdu": 0,
+      "x": 20,
+      "y": 10,
+      "value": -999.25
+    },
+    {
+      "hdu": 0,
+      "x": 63,
+      "y": 47,
+      "value": 182.21185302734375
+    },
+    {
+      "hdu": 0,
+      "x": 31,
+      "y": 24,
+      "value": -23.999343872070312
+    },
+    {
+      "hdu": 1,
+      "x": 0,
+      "y": 0,
+      "value": -59900.0
+    },
+    {
+      "hdu": 1,
+      "x": 5,
+      "y": 3,
+      "value": -59506.0
+    },
+    {
+      "hdu": 1,
+      "x": 63,
+      "y": 47,
+      "value": -53758.0
+    }
+  ]
+}
