@@ -7,7 +7,7 @@
 // target level draw on top as they stream in. Missing tiles therefore show
 // a low-res preview instead of holes.
 
-import { getPixel, getScaleLimits, getTile, TILE, type ScaleMode } from "../api";
+import { getReadout, getScaleLimits, getTile, TILE, type ScaleMode } from "../api";
 import { COLORMAPS } from "./colormaps.gen";
 import {
   createTileProgram,
@@ -33,11 +33,15 @@ export interface ReadoutInfo {
   x: number | null;
   y: number | null;
   value: string;
+  /** Sexagesimal sky position, or "" when the HDU has no WCS. */
+  sky: string;
 }
 
 export interface ViewerCallbacks {
   onReadout(info: ReadoutInfo): void;
   onLimits(lo: number, hi: number): void;
+  /** Right-drag colormap adjustment (defaults: bias 0.5, contrast 1). */
+  onContrastBias(bias: number, contrast: number): void;
 }
 
 interface ImageRef {
@@ -70,15 +74,21 @@ export class Viewer {
   /** Tiles draw only once real limits arrive — avoids a wrong-stretch flash. */
   private limitsReady = false;
   private stretchIndex = 0;
+  // DS9-style colormap manipulation (right-drag), applied in the shader.
+  private bias = 0.5;
+  private contrast = 1.0;
 
   private tiles = new Map<string, CachedTile>();
   private inflight = new Set<string>();
   private tick = 0;
   private drawQueued = false;
 
-  // Readout throttling: at most one get_pixel in flight.
+  // Readout throttling: at most one get_readout in flight.
   private readoutBusy = false;
   private readoutPending: [number, number] | null = null;
+  /** Last sky string, shown while the next readout is in flight so the
+   *  status bar doesn't flicker between updates. */
+  private lastSky = "";
 
   constructor(container: HTMLElement, callbacks: ViewerCallbacks) {
     this.callbacks = callbacks;
@@ -103,6 +113,7 @@ export class Viewer {
     while (Math.ceil(Math.max(nx, ny) / 2 ** maxLevel) > TILE) maxLevel++;
     this.image = { path, hdu, nx, ny, maxLevel };
     this.fit();
+    this.resetContrastBias();
     await this.applyScaleMode("zscale");
   }
 
@@ -131,9 +142,34 @@ export class Viewer {
     const gen = this.generation;
     const lim = await getScaleLimits(this.image.path, this.image.hdu, mode);
     if (gen !== this.generation) return;
-    this.limits = [lim.lo, lim.hi];
+    this.setLimits(lim.lo, lim.hi);
+  }
+
+  /** Set display limits directly (histogram handle drag). */
+  setLimits(lo: number, hi: number): void {
+    this.limits = [lo, hi];
     this.limitsReady = true;
-    this.callbacks.onLimits(lim.lo, lim.hi);
+    this.callbacks.onLimits(lo, hi);
+    this.requestDraw();
+  }
+
+  getLimits(): [number, number] {
+    return [this.limits[0], this.limits[1]];
+  }
+
+  /** Center the view on a FITS 0-based (possibly fractional) pixel,
+   *  keeping the current zoom. */
+  centerOn(x: number, y: number): void {
+    this.userNavigated = true;
+    this.cx = x + 0.5;
+    this.cy = y + 0.5;
+    this.requestDraw();
+  }
+
+  resetContrastBias(): void {
+    this.bias = 0.5;
+    this.contrast = 1.0;
+    this.callbacks.onContrastBias(this.bias, this.contrast);
     this.requestDraw();
   }
 
@@ -173,12 +209,41 @@ export class Viewer {
     return [this.cx + dx / this.scale, this.cy - dy / this.scale];
   }
 
+  /** Right-drag position → colormap params (DS9 semantics: horizontal =
+   *  bias 0..1, vertical = contrast, exponential around 1 at mid-height). */
+  private applyContrastBias(e: PointerEvent): void {
+    const rect = this.canvas.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    this.bias = fx;
+    this.contrast = 2 ** (2 * (1 - 2 * fy)); // top 4×, middle 1, bottom ¼
+    this.callbacks.onContrastBias(this.bias, this.contrast);
+    this.requestDraw();
+  }
+
   private bindInput(): void {
     let dragging = false;
+    let cbDragging = false;
     let lastX = 0;
     let lastY = 0;
+    let lastRightDown = 0;
 
+    this.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
     this.canvas.addEventListener("pointerdown", (e) => {
+      if (e.button === 2) {
+        // Double-right-click resets contrast/bias, single starts a drag.
+        const now = performance.now();
+        if (now - lastRightDown < 350) {
+          this.resetContrastBias();
+        } else {
+          cbDragging = true;
+          this.applyContrastBias(e);
+        }
+        lastRightDown = now;
+        this.canvas.setPointerCapture(e.pointerId);
+        return;
+      }
+      if (e.button !== 0) return;
       dragging = true;
       lastX = e.clientX;
       lastY = e.clientY;
@@ -187,9 +252,14 @@ export class Viewer {
     });
     this.canvas.addEventListener("pointerup", (e) => {
       dragging = false;
+      cbDragging = false;
       this.canvas.releasePointerCapture(e.pointerId);
     });
     this.canvas.addEventListener("pointermove", (e) => {
+      if (cbDragging) {
+        this.applyContrastBias(e);
+        return;
+      }
       if (dragging) {
         this.userNavigated = true;
         const dpr = window.devicePixelRatio || 1;
@@ -202,7 +272,7 @@ export class Viewer {
       this.updateReadout(e);
     });
     this.canvas.addEventListener("pointerleave", () => {
-      this.callbacks.onReadout({ x: null, y: null, value: "" });
+      this.callbacks.onReadout({ x: null, y: null, value: "", sky: "" });
     });
 
     this.canvas.addEventListener(
@@ -237,11 +307,11 @@ export class Viewer {
     const x = Math.floor(fx);
     const y = Math.floor(fy);
     if (x < 0 || y < 0 || x >= this.image.nx || y >= this.image.ny) {
-      this.callbacks.onReadout({ x: null, y: null, value: "" });
+      this.callbacks.onReadout({ x: null, y: null, value: "", sky: "" });
       return;
     }
     // DS9 shows FITS 1-based coordinates.
-    this.callbacks.onReadout({ x: x + 1, y: y + 1, value: "…" });
+    this.callbacks.onReadout({ x: x + 1, y: y + 1, value: "…", sky: this.lastSky });
     this.readoutPending = [x, y];
     void this.pumpReadout();
   }
@@ -253,10 +323,11 @@ export class Viewer {
     this.readoutBusy = true;
     const gen = this.generation;
     try {
-      const v = await getPixel(this.image.path, this.image.hdu, x, y);
+      const r = await getReadout(this.image.path, this.image.hdu, x, y);
       if (gen === this.generation) {
-        const text = v === null ? NAN_READOUT : formatValue(v);
-        this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text });
+        const text = r.value === null ? NAN_READOUT : formatValue(r.value);
+        this.lastSky = r.sky ?? "";
+        this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text, sky: this.lastSky });
       }
     } catch {
       // File may have been closed mid-flight; readout just goes blank.
@@ -397,6 +468,7 @@ export class Viewer {
     gl.uniform1f(uniforms.scale, this.scale);
     gl.uniform2f(uniforms.viewport, this.canvas.width, this.canvas.height);
     gl.uniform2f(uniforms.limits, this.limits[0], this.limits[1]);
+    gl.uniform2f(uniforms.cb, this.bias, this.contrast);
     gl.uniform1i(uniforms.stretch, this.stretchIndex);
     gl.uniform1i(uniforms.tex, 0);
     gl.uniform1i(uniforms.lut, 1);

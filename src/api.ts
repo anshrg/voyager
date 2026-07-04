@@ -98,14 +98,57 @@ export function getScaleLimits(
   return invoke<ScaleLimits>("get_scale_limits", { path, hdu, mode });
 }
 
-/** Pixel readout at FITS 0-based (x, y); null = NaN/BLANK. */
-export function getPixel(
+export interface Readout {
+  /** Pixel value; null = NaN/BLANK. */
+  value: number | null;
+  /** Sky position in degrees when the HDU has a usable WCS. */
+  ra: number | null;
+  dec: number | null;
+  /** Pre-formatted sexagesimal "hh:mm:ss.sss ±dd:mm:ss.ss". */
+  sky: string | null;
+}
+
+/** Pixel + sky readout at FITS 0-based (x, y). */
+export function getReadout(
   path: string,
   hdu: number,
   x: number,
   y: number,
-): Promise<number | null> {
-  return invoke<number | null>("get_pixel", { path, hdu, x, y });
+): Promise<Readout> {
+  return invoke<Readout>("get_readout", { path, hdu, x, y });
+}
+
+export interface GotoResult {
+  /** FITS 0-based fractional pixel of the requested sky position. */
+  x: number;
+  y: number;
+  ra: number;
+  dec: number;
+}
+
+/** Parse a coordinate query and locate it on the image (throws a
+ *  user-facing message string on failure). */
+export function resolveCoord(
+  path: string,
+  hdu: number,
+  query: string,
+): Promise<GotoResult> {
+  return invoke<GotoResult>("resolve_coord", { path, hdu, query });
+}
+
+export interface Histogram {
+  lo: number;
+  hi: number;
+  counts: number[];
+}
+
+/** Pixel-distribution histogram over the scale-limit spatial sample. */
+export function getHistogram(
+  path: string,
+  hdu: number,
+  bins: number,
+): Promise<Histogram> {
+  return invoke<Histogram>("get_histogram", { path, hdu, bins });
 }
 
 export function takePendingOpens(): Promise<string[]> {

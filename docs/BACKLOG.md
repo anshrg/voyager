@@ -39,8 +39,15 @@ anything. Promote items into a milestone deliberately, not casually.
 - Keyboard shortcuts for zoom (+/-/0), stretch cycling, colormap cycling.
 - NaN rendering color: currently fixed near-black; consider making it
   configurable (DS9 lets you pick the blank color).
-- Readout could also show WCS sky coordinates once M2's WCS lands (currently
-  image x/y/value only).
+- Full SIP distortion terms in WCS (M2 ignores `-SIP` suffixes; fine for
+  drizzled mosaics, wrong by up to ~arcsec on distorted cal frames).
+- Readout coordinate display options: decimal degrees toggle, galactic,
+  epoch display (currently sexagesimal fk5-style only).
+- Goto box: accept pixel coordinates (e.g. "px 512 400") in addition to sky.
+- Histogram niceties: axis tick labels, linear/log y toggle, zoom into a
+  sub-range, editable numeric limit fields.
+- Contrast/bias: match DS9's exact bias/contrast→LUT mapping if the current
+  one (bias = x, contrast = 2^(2(1−2y)), i.e. ¼…4×) feels off side-by-side.
 
 ## User ideas (add here as they come up)
 

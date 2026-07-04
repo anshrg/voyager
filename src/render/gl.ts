@@ -38,6 +38,7 @@ precision highp float;
 uniform sampler2D u_tex;    // R32F tile
 uniform sampler2D u_lut;    // 256x1 RGBA8 colormap
 uniform vec2 u_limits;      // lo, hi
+uniform vec2 u_cb;          // colormap bias (0..1), contrast (>0)
 uniform int u_stretch;
 in vec2 v_uv;
 out vec4 outColor;
@@ -63,6 +64,9 @@ void main() {
   float span = u_limits.y - u_limits.x;
   float t = clamp((v - u_limits.x) / (abs(span) < 1e-30 ? 1e-30 : span), 0.0, 1.0);
   t = stretchFn(t);
+  // DS9-style colormap manipulation: bias slides the transfer window,
+  // contrast steepens it (identity at bias 0.5, contrast 1).
+  t = clamp(0.5 + (t - u_cb.x) * u_cb.y, 0.0, 1.0);
   outColor = texture(u_lut, vec2((t * 255.0 + 0.5) / 256.0, 0.5));
 }`;
 
@@ -79,6 +83,7 @@ export interface TileProgram {
     tex: WebGLUniformLocation;
     lut: WebGLUniformLocation;
     limits: WebGLUniformLocation;
+    cb: WebGLUniformLocation;
     stretch: WebGLUniformLocation;
   };
 }
@@ -157,6 +162,7 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
       tex: uniform(gl, program, "u_tex"),
       lut: uniform(gl, program, "u_lut"),
       limits: uniform(gl, program, "u_limits"),
+      cb: uniform(gl, program, "u_cb"),
       stretch: uniform(gl, program, "u_stretch"),
     },
   };

@@ -4,6 +4,7 @@ import {
   onOpenRequest,
   openFits,
   pickFitsFile,
+  resolveCoord,
   takePendingOpens,
   type CardValue,
   type FileSummary,
@@ -11,6 +12,7 @@ import {
   type HeaderCard,
   type ScaleMode,
 } from "./api";
+import { HistogramPanel } from "./render/histogram";
 import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
 
 type ViewTab = "image" | "header";
@@ -25,6 +27,9 @@ interface AppState {
 
 const state: AppState = { file: null, selectedHdu: 0, cards: [], filter: "", tab: "header" };
 let viewer: Viewer | null = null;
+let histPanel: HistogramPanel | null = null;
+/** `${path}#${hdu}` the histogram was last loaded for (lazy: only when shown). */
+let histLoadedFor: string | null = null;
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -183,6 +188,17 @@ function renderView(): void {
   }
 }
 
+/** Load histogram counts if the panel is open and showing a stale HDU. */
+function ensureHistogram(): void {
+  if (!histPanel?.visible || !state.file) return;
+  const hdu = state.file.hdus[state.selectedHdu];
+  if (!isViewableImage(hdu)) return;
+  const key = `${state.file.path}#${state.selectedHdu}`;
+  if (histLoadedFor === key) return;
+  histLoadedFor = key;
+  void histPanel.load(state.file.path, state.selectedHdu);
+}
+
 async function selectHdu(index: number): Promise<void> {
   if (!state.file) return;
   const hdu = state.file.hdus[index];
@@ -192,10 +208,13 @@ async function selectHdu(index: number): Promise<void> {
   renderView();
 
   if (isViewableImage(hdu) && viewer) {
+    ensureHistogram();
     // shape is FITS order: NAXIS1 (x) first.
     await viewer.setImage(state.file.path, index, hdu.shape[0], hdu.shape[1]);
   } else {
     viewer?.clear();
+    histPanel?.clear();
+    histLoadedFor = null;
   }
   state.cards = await getHeader(state.file.path, index);
   renderCards();
@@ -271,9 +290,42 @@ function buildUi(): void {
   });
   const limitsLabel = el("span", "limits-label", "");
   limitsLabel.id = "limits-label";
+  const cbLabel = el("span", "limits-label", "");
+  cbLabel.id = "cb-label";
+  cbLabel.title = "Right-drag on the image: ← bias → / ↑ contrast ↓. Double-right-click resets.";
   const fitBtn = el("button", "", "Fit");
   fitBtn.addEventListener("click", () => viewer?.fit());
-  controls.append(colormapSel, stretchSel, scaleSel, fitBtn, limitsLabel);
+  const histBtn = el("button", "", "Hist");
+  histBtn.id = "hist-btn";
+  histBtn.addEventListener("click", () => {
+    if (!histPanel) return;
+    histBtn.classList.toggle("active-btn", histPanel.toggle());
+    ensureHistogram();
+  });
+  const gotoBox = el("input", "goto");
+  gotoBox.id = "goto-box";
+  gotoBox.placeholder = "goto α δ";
+  gotoBox.title =
+    'Center on a coordinate: "150.116 2.206", "10:00:27.9 +02:12:20", "10h00m28s 2d12m21s"';
+  gotoBox.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !state.file) return;
+    const query = gotoBox.value.trim();
+    if (!query) return;
+    resolveCoord(state.file.path, state.selectedHdu, query)
+      .then((r) => {
+        gotoBox.classList.remove("goto-error");
+        gotoBox.title = "";
+        viewer?.centerOn(r.x, r.y);
+        flashCrosshair();
+      })
+      .catch((err: unknown) => {
+        gotoBox.classList.add("goto-error");
+        gotoBox.title = String(err);
+        must<HTMLElement>("readout").textContent = String(err);
+      });
+  });
+  gotoBox.addEventListener("input", () => gotoBox.classList.remove("goto-error"));
+  controls.append(colormapSel, stretchSel, scaleSel, fitBtn, histBtn, gotoBox, limitsLabel, cbLabel);
 
   const filter = el("input", "filter");
   filter.id = "filter-box";
@@ -309,6 +361,9 @@ function buildUi(): void {
   const imagePane = el("div", "image-pane");
   imagePane.id = "image-pane";
   imagePane.style.display = "none";
+  const crosshair = el("div", "goto-crosshair");
+  crosshair.id = "goto-crosshair";
+  imagePane.append(crosshair);
 
   const headerPane = el("div", "header-pane");
   headerPane.id = "header-pane";
@@ -348,16 +403,35 @@ function buildUi(): void {
     }
   });
 
+  histPanel = new HistogramPanel(imagePane, (lo, hi) => viewer?.setLimits(lo, hi));
+
   viewer = new Viewer(imagePane, {
     onReadout: (info) => {
       readout.textContent =
-        info.x === null ? "" : `x ${info.x}  y ${info.y}  ${info.value}`;
+        info.x === null
+          ? ""
+          : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`;
     },
     onLimits: (lo, hi) => {
       must<HTMLElement>("limits-label").textContent =
         `[${lo.toPrecision(5)}, ${hi.toPrecision(5)}]`;
+      histPanel?.setLimits(lo, hi);
+    },
+    onContrastBias: (bias, contrast) => {
+      const isDefault = Math.abs(bias - 0.5) < 1e-3 && Math.abs(contrast - 1) < 1e-3;
+      must<HTMLElement>("cb-label").textContent = isDefault
+        ? ""
+        : `b ${bias.toFixed(2)} c ${contrast.toFixed(2)}`;
     },
   });
+}
+
+/** Brief crosshair pulse at the view center after a goto. */
+function flashCrosshair(): void {
+  const mark = must<HTMLElement>("goto-crosshair");
+  mark.classList.remove("flash");
+  void mark.offsetWidth; // restart the CSS animation
+  mark.classList.add("flash");
 }
 
 async function init(): Promise<void> {

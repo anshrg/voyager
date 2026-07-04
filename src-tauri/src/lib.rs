@@ -140,18 +140,102 @@ async fn get_scale_limits(
     })
 }
 
-/// Pixel readout at FITS 0-based (x, y). None = NaN/BLANK (JSON has no NaN).
+#[derive(Serialize)]
+struct Readout {
+    /// Pixel value; None = NaN/BLANK (JSON has no NaN).
+    value: Option<f64>,
+    /// Sky position in degrees, when the HDU has a usable WCS.
+    ra: Option<f64>,
+    dec: Option<f64>,
+    /// Pre-formatted sexagesimal "hh:mm:ss.sss ±dd:mm:ss.ss".
+    sky: Option<String>,
+}
+
+/// Pixel readout at FITS 0-based (x, y), with sky coordinates when the HDU
+/// carries a supported WCS (integer pixel coordinate = pixel center).
 #[tauri::command]
-fn get_pixel(
+fn get_readout(
     path: String,
     hdu: usize,
     x: u64,
     y: u64,
     state: State<'_, AppState>,
-) -> Result<Option<f64>, String> {
+) -> Result<Readout, String> {
     let file = lookup(&state, &path)?;
     let v = tiles::pixel_at(&file, hdu, x, y).map_err(|e| e.to_string())?;
-    Ok(if v.is_nan() { None } else { Some(v) })
+    let info = file.hdu(hdu).map_err(|e| e.to_string())?;
+    let sky = wcs::Wcs::from_header(&info.header).map(|w| w.pix_to_world(x as f64, y as f64));
+    Ok(Readout {
+        value: if v.is_nan() { None } else { Some(v) },
+        ra: sky.map(|(ra, _)| ra),
+        dec: sky.map(|(_, dec)| dec),
+        sky: sky.map(|(ra, dec)| {
+            format!("{} {}", wcs::coords::fmt_ra_hms(ra), wcs::coords::fmt_dec_dms(dec))
+        }),
+    })
+}
+
+#[derive(Serialize)]
+struct GotoResult {
+    /// FITS 0-based fractional pixel of the requested sky position.
+    x: f64,
+    y: f64,
+    ra: f64,
+    dec: f64,
+}
+
+/// Parse a coordinate query ("150.116 2.206", "10:00:27.9 +02:12:20", …)
+/// and locate it on the image. Errors are user-facing messages.
+#[tauri::command]
+fn resolve_coord(
+    path: String,
+    hdu: usize,
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<GotoResult, String> {
+    let file = lookup(&state, &path)?;
+    let info = file.hdu(hdu).map_err(|e| e.to_string())?;
+    let (ra, dec) = wcs::coords::parse_coord(&query)?;
+    let w = wcs::Wcs::from_header(&info.header)
+        .ok_or_else(|| "this HDU has no supported WCS (TAN)".to_string())?;
+    let (x, y) = w
+        .world_to_pix(ra, dec)
+        .ok_or_else(|| "coordinate is on the far side of the sky".to_string())?;
+    Ok(GotoResult { x, y, ra, dec })
+}
+
+#[derive(Serialize)]
+struct Histogram {
+    lo: f64,
+    hi: f64,
+    counts: Vec<u32>,
+}
+
+/// Pixel-distribution histogram over the same spatial sample used for scale
+/// limits; range = finite min..max of the sample.
+#[tauri::command]
+async fn get_histogram(
+    path: String,
+    hdu: usize,
+    bins: usize,
+    state: State<'_, AppState>,
+) -> Result<Histogram, String> {
+    let file = lookup(&state, &path)?;
+    let t0 = Instant::now();
+    let hist = tauri::async_runtime::spawn_blocking(move || -> Result<Histogram, String> {
+        let values = tiles::gather_values(&file, hdu, 200_000).map_err(|e| e.to_string())?;
+        let (lo, hi) =
+            tiles::zscale::minmax(&values).ok_or_else(|| "image has no finite pixels".to_string())?;
+        let counts = tiles::histogram(&values, bins, lo, hi);
+        Ok(Histogram { lo, hi, counts })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[ds10] histogram {bins} bins in {:.1} ms",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(hist)
 }
 
 #[derive(Serialize)]
@@ -225,7 +309,9 @@ pub fn run() {
             get_header,
             get_tile,
             get_scale_limits,
-            get_pixel,
+            get_readout,
+            resolve_coord,
+            get_histogram,
             close_fits,
             take_pending_opens,
             list_open_files
