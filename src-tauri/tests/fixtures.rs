@@ -5,6 +5,7 @@
 
 use ds10_lib::fits::{FitsFile, HduKind};
 use ds10_lib::tiles;
+use ds10_lib::wcs::Wcs;
 use serde_json::Value as Json;
 use std::path::PathBuf;
 
@@ -125,6 +126,58 @@ fn scale_limits_match_astropy() {
                 "HDU {hdu} {which}: got {got}, want {want}"
             );
         }
+    }
+}
+
+#[test]
+fn wcs_matches_astropy() {
+    let (file, expected) = load();
+    let checks = expected["wcs_checks"].as_array().unwrap();
+    assert!(!checks.is_empty());
+    for check in checks {
+        let hdu = check["hdu"].as_u64().unwrap() as usize;
+        let wcs = Wcs::from_header(&file.hdus[hdu].header)
+            .unwrap_or_else(|| panic!("HDU {hdu}: WCS did not parse"));
+
+        for p in check["pix2world"].as_array().unwrap() {
+            let (x, y) = (p["x"].as_f64().unwrap(), p["y"].as_f64().unwrap());
+            let (want_ra, want_dec) = (p["ra"].as_f64().unwrap(), p["dec"].as_f64().unwrap());
+            let (ra, dec) = wcs.pix_to_world(x, y);
+            assert!(
+                (ra - want_ra).abs() < 1e-6 && (dec - want_dec).abs() < 1e-6,
+                "HDU {hdu} pix2world({x},{y}): got ({ra},{dec}), want ({want_ra},{want_dec})"
+            );
+        }
+        for p in check["world2pix"].as_array().unwrap() {
+            let (ra, dec) = (p["ra"].as_f64().unwrap(), p["dec"].as_f64().unwrap());
+            let (want_x, want_y) = (p["x"].as_f64().unwrap(), p["y"].as_f64().unwrap());
+            let (x, y) = wcs
+                .world_to_pix(ra, dec)
+                .unwrap_or_else(|| panic!("HDU {hdu} world2pix({ra},{dec}) returned None"));
+            assert!(
+                (x - want_x).abs() < 1e-5 && (y - want_y).abs() < 1e-5,
+                "HDU {hdu} world2pix({ra},{dec}): got ({x},{y}), want ({want_x},{want_y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn histogram_matches_numpy() {
+    let (file, expected) = load();
+    for check in expected["hist_checks"].as_array().unwrap() {
+        let hdu = check["hdu"].as_u64().unwrap() as usize;
+        let bins = check["bins"].as_u64().unwrap() as usize;
+        let (lo, hi) = (check["lo"].as_f64().unwrap(), check["hi"].as_f64().unwrap());
+        let want: Vec<u32> = check["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let values = tiles::gather_values(&file, hdu, 200_000).unwrap();
+        let got = tiles::histogram(&values, bins, lo, hi);
+        assert_eq!(got, want, "HDU {hdu} histogram");
     }
 }
 

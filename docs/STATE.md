@@ -64,7 +64,9 @@ M2 = navigation (goto coordinate → needs WCS module, histogram).
 
 - Finder default-handler situation unchanged from M0 (user's Automator app
   owns .fits; DS10 works via `open -a DS10`).
-- Dialog open (⌘O) still untested end-to-end (needs a human).
+- Dialog open **verified by user via Ctrl+O** (2026-07-04). Note: the user
+  has ⌘O bound to something else system-wide, so Ctrl+O is their path —
+  keep both accelerators working.
 - Stretch functions beyond linear/log not visually compared against DS9
   side-by-side (definitions transcribed from DS9 docs; user should eyeball
   asinh especially).

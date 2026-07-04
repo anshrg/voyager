@@ -1,5 +1,6 @@
 pub mod fits;
 pub mod tiles;
+pub mod wcs;
 
 use fits::FitsFile;
 use serde::Serialize;

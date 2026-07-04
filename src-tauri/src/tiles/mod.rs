@@ -200,6 +200,25 @@ pub fn gather_values(file: &FitsFile, hdu_index: usize, target: usize) -> Result
     Ok(out)
 }
 
+/// Histogram with numpy semantics: `bins` equal-width bins spanning
+/// [lo, hi], left-inclusive, the top edge inclusive in the last bin;
+/// non-finite and out-of-range values are ignored.
+pub fn histogram(values: &[f64], bins: usize, lo: f64, hi: f64) -> Vec<u32> {
+    let mut counts = vec![0u32; bins];
+    if bins == 0 || !(hi > lo) {
+        return counts;
+    }
+    let scale = bins as f64 / (hi - lo);
+    for &v in values {
+        if !v.is_finite() || v < lo || v > hi {
+            continue;
+        }
+        let idx = (((v - lo) * scale) as usize).min(bins - 1);
+        counts[idx] += 1;
+    }
+    counts
+}
+
 /// Single-pixel readout with BSCALE/BZERO applied (NaN for BLANK).
 pub fn pixel_at(file: &FitsFile, hdu_index: usize, x: u64, y: u64) -> Result<f64> {
     let hdu = file.hdu(hdu_index)?;

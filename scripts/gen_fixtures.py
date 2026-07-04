@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 from astropy.visualization import ZScaleInterval
+from astropy.wcs import WCS
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -65,7 +66,49 @@ def build_sample() -> fits.HDUList:
     )
     table = fits.BinTableHDU.from_columns(cols, name="CATALOG")
 
-    return fits.HDUList([primary, sci, table])
+    # Tiny image HDUs exercising the WCS variants the Rust module supports.
+    # Data content is irrelevant; only the headers matter.
+    tiny = np.zeros((24, 32), dtype=np.float32)
+
+    # Rotated + slightly skewed CD matrix at high declination.
+    rot = fits.ImageHDU(data=tiny, name="ROT")
+    rot.header["CTYPE1"] = "RA---TAN"
+    rot.header["CTYPE2"] = "DEC--TAN"
+    rot.header["CRVAL1"] = 83.6331
+    rot.header["CRVAL2"] = 61.2007
+    rot.header["CRPIX1"] = 16.5
+    rot.header["CRPIX2"] = 12.25
+    rot.header["CD1_1"] = -2.11e-4 * np.cos(np.radians(33.0))
+    rot.header["CD1_2"] = 2.05e-4 * np.sin(np.radians(33.0))
+    rot.header["CD2_1"] = 2.11e-4 * np.sin(np.radians(33.0))
+    rot.header["CD2_2"] = 2.05e-4 * np.cos(np.radians(33.0))
+
+    # Legacy CDELT + CROTA2 form.
+    rota = fits.ImageHDU(data=tiny, name="ROTA")
+    rota.header["CTYPE1"] = "RA---TAN"
+    rota.header["CTYPE2"] = "DEC--TAN"
+    rota.header["CRVAL1"] = 210.802
+    rota.header["CRVAL2"] = -12.454
+    rota.header["CRPIX1"] = 10.0
+    rota.header["CRPIX2"] = 14.0
+    rota.header["CDELT1"] = -1.7e-4
+    rota.header["CDELT2"] = 1.7e-4
+    rota.header["CROTA2"] = -18.5
+
+    # Latitude axis first (CTYPE1 = DEC--TAN): CRVAL1 is the Dec.
+    swap = fits.ImageHDU(data=tiny, name="SWAP")
+    swap.header["CTYPE1"] = "DEC--TAN"
+    swap.header["CTYPE2"] = "RA---TAN"
+    swap.header["CRVAL1"] = 2.2058057
+    swap.header["CRVAL2"] = 150.1163213
+    swap.header["CRPIX1"] = 8.0
+    swap.header["CRPIX2"] = 20.0
+    swap.header["CD1_1"] = 9.0e-5
+    swap.header["CD1_2"] = -1.1e-5
+    swap.header["CD2_1"] = 1.2e-5
+    swap.header["CD2_2"] = 8.7e-5
+
+    return fits.HDUList([primary, sci, table, rot, rota, swap])
 
 
 def expectations(hdul: fits.HDUList, path: Path) -> dict:
@@ -156,12 +199,64 @@ def expectations(hdul: fits.HDUList, path: Path) -> dict:
                 }
             )
 
+    # WCS ground truth: astropy's TAN transform at reference, corner, and
+    # fractional pixels (origin=0), plus world→pixel at nearby sky points.
+    wcs_checks = []
+    with fits.open(path) as raw:
+        for hdu_index in (0, 3, 4, 5):
+            header = raw[hdu_index].header
+            w = WCS(header)
+            nx, ny = header["NAXIS1"], header["NAXIS2"]
+            pix_pts = [
+                (0.0, 0.0),
+                (nx - 1.0, ny - 1.0),
+                (nx / 3.0, ny / 4.0),
+                (10.25, 7.75),
+            ]
+            # astropy returns/accepts world values in WCS axis order, which
+            # for the SWAP HDU is (dec, ra).
+            lon_i, lat_i = (1, 0) if header["CTYPE1"].startswith("DEC") else (0, 1)
+            p2w = []
+            for (x, y) in pix_pts:
+                world = w.wcs_pix2world([[x, y]], 0)[0]
+                p2w.append(
+                    {"x": x, "y": y, "ra": float(world[lon_i]), "dec": float(world[lat_i])}
+                )
+            # Sky points a bit off the field center (still on-image scale).
+            ra0 = header[f"CRVAL{lon_i + 1}"]
+            dec0 = header[f"CRVAL{lat_i + 1}"]
+            w2p = []
+            for (dra, ddec) in [(0.0, 0.0), (0.004, -0.003), (-0.0025, 0.0015)]:
+                ra, dec = ra0 + dra, dec0 + ddec
+                world = [ra, dec] if lon_i == 0 else [dec, ra]
+                x, y = w.wcs_world2pix([world], 0)[0]
+                w2p.append({"ra": float(ra), "dec": float(dec), "x": float(x), "y": float(y)})
+            wcs_checks.append({"hdu": hdu_index, "pix2world": p2w, "world2pix": w2p})
+
+    # Histogram ground truth: np.histogram over finite pixels, min..max range.
+    hist_checks = []
+    for hdu_index, img in images.items():
+        finite = img[np.isfinite(img)]
+        lo, hi = float(finite.min()), float(finite.max())
+        counts, _ = np.histogram(finite, bins=16, range=(lo, hi))
+        hist_checks.append(
+            {
+                "hdu": hdu_index,
+                "bins": 16,
+                "lo": lo,
+                "hi": hi,
+                "counts": [int(c) for c in counts],
+            }
+        )
+
     return {
         "file": path.name,
         "hdus": hdus,
         "pixel_checks": checks,
         "scale_checks": scale_checks,
         "tile_checks": tile_checks,
+        "wcs_checks": wcs_checks,
+        "hist_checks": hist_checks,
     }
 
 
