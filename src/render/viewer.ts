@@ -7,8 +7,9 @@
 // target level draw on top as they stream in. Missing tiles therefore show
 // a low-res preview instead of holes.
 
-import { getReadout, getScaleLimits, getTile, TILE, type ScaleMode } from "../api";
+import { getReadout, getScaleLimits, getTile, TILE, type PixelRegion, type ScaleMode } from "../api";
 import { COLORMAPS } from "./colormaps.gen";
+import { drawRegions } from "./regionlayer";
 import {
   createTileProgram,
   createTileTexture,
@@ -54,8 +55,11 @@ interface ImageRef {
 
 export class Viewer {
   private readonly canvas: HTMLCanvasElement;
+  private readonly overlay: HTMLCanvasElement;
   private readonly p: TileProgram;
   private readonly callbacks: ViewerCallbacks;
+  /** Loaded region overlay (pixel space of the current HDU), or null. */
+  private regions: PixelRegion[] | null = null;
 
   private image: ImageRef | null = null;
   /** Bumped on setImage; stale async responses are discarded. */
@@ -95,6 +99,9 @@ export class Viewer {
     this.canvas = document.createElement("canvas");
     this.canvas.className = "image-canvas";
     container.append(this.canvas);
+    this.overlay = document.createElement("canvas");
+    this.overlay.className = "region-canvas";
+    container.append(this.overlay);
     this.p = createTileProgram(this.canvas);
     this.setColormap("gray");
 
@@ -109,6 +116,7 @@ export class Viewer {
     this.generation++;
     this.clearTiles();
     this.limitsReady = false;
+    this.regions = null;
     let maxLevel = 0;
     while (Math.ceil(Math.max(nx, ny) / 2 ** maxLevel) > TILE) maxLevel++;
     this.image = { path, hdu, nx, ny, maxLevel };
@@ -120,8 +128,20 @@ export class Viewer {
   clear(): void {
     this.generation++;
     this.image = null;
+    this.regions = null;
     this.clearTiles();
     this.requestDraw();
+  }
+
+  /** Replace (or clear, with null) the region overlay. Regions are in the
+   *  current HDU's 0-based pixel space (backend-resolved). */
+  setRegions(regions: PixelRegion[] | null): void {
+    this.regions = regions;
+    this.requestDraw();
+  }
+
+  hasRegions(): boolean {
+    return this.regions !== null && this.regions.length > 0;
   }
 
   fit(): void {
@@ -194,6 +214,8 @@ export class Viewer {
     if (w !== this.canvas.width || h !== this.canvas.height) {
       this.canvas.width = w;
       this.canvas.height = h;
+      this.overlay.width = w;
+      this.overlay.height = h;
       if (!this.userNavigated) this.fit();
       this.requestDraw();
     }
@@ -210,13 +232,15 @@ export class Viewer {
   }
 
   /** Right-drag position → colormap params (DS9 semantics: horizontal =
-   *  bias 0..1, vertical = contrast, exponential around 1 at mid-height). */
+   *  bias, vertical = contrast, exponential around 1 at mid-height).
+   *  Bias spans −0.5..1.5 so the edges fully saturate even at contrast 1
+   *  (t' = 0.5 + (t − bias)·c reaches all-white/all-black at bias ∓0.5). */
   private applyContrastBias(e: PointerEvent): void {
     const rect = this.canvas.getBoundingClientRect();
     const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
-    this.bias = fx;
-    this.contrast = 2 ** (2 * (1 - 2 * fy)); // top 4×, middle 1, bottom ¼
+    this.bias = 2 * fx - 0.5;
+    this.contrast = 5 ** (1 - 2 * fy); // top 5×, middle 1, bottom ⅕
     this.callbacks.onContrastBias(this.bias, this.contrast);
     this.requestDraw();
   }
@@ -444,12 +468,24 @@ export class Viewer {
     return complete;
   }
 
+  private drawOverlay(): void {
+    drawRegions(this.overlay, this.image ? this.regions : null, {
+      cx: this.cx,
+      cy: this.cy,
+      scale: this.scale,
+      width: this.overlay.width,
+      height: this.overlay.height,
+      dpr: window.devicePixelRatio || 1,
+    });
+  }
+
   private draw(): void {
     const { gl, program, vao, uniforms, lutTex } = this.p;
     this.tick++;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.055, 0.06, 0.07, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    this.drawOverlay();
     if (!this.image) return;
     if (!this.limitsReady) {
       // Prefetch visible tiles while zscale runs; draw once limits arrive.

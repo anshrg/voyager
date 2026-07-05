@@ -47,8 +47,29 @@ anything. Promote items into a milestone deliberately, not casually.
 - Histogram niceties: axis tick labels, linear/log y toggle, zoom into a
   sub-range, editable numeric limit fields.
 - Contrast/bias: match DS9's exact bias/contrast→LUT mapping if the current
-  one (bias = x, contrast = 2^(2(1−2y)), i.e. ¼…4×) feels off side-by-side.
+  one feels off side-by-side. (2026-07-04 user feedback applied: contrast
+  now 5^(1−2y) i.e. ⅕…5×, bias extended to −0.5…1.5 so the drag edges fully
+  saturate at contrast 1.)
+
+## From M3 implementation (parked, not blocking)
+
+- Region save: write loaded/modified regions back to .reg (DS9-compatible
+  formatting, preserve frame + units where possible).
+- More shapes: annulus (common in photometry), line, vector, text regions
+  (parser currently warns + skips them).
+- Exact fk5 ↔ icrs frame rotation (~23 mas; currently treated as equal —
+  fine for JWST pixel scales, visible on sub-arcsec HST work).
+- Galactic-frame regions (needs coordinate transform).
+- Region interaction: hover highlight, click-to-inspect (center/radius in
+  readout), drag-to-move/resize, create-new-region UI.
+- Region text label size option (fixed 11px now).
 
 ## User ideas (add here as they come up)
 
+- **Multi-frame (2026-07-04)**: open multiple images at once, DS9-style —
+  frames you can flick between (tab/blink) *and* a tiled layout showing
+  several at once. Implies per-frame view state (scale limits, stretch,
+  colormap, pan/zoom), frame cycling keys, and eventually WCS-locked
+  pan/zoom across frames. Natural fit after M3 or alongside M5 image↔table
+  linking; needs a milestone slot of its own.
 - (the user has "many various improvements" to explicate — collect them here)

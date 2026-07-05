@@ -1,0 +1,7 @@
+# rotated + skewed CD at dec +61: stresses the Jacobian/SVD conversion
+icrs
+circle(83.6331,61.2007,3.0")
+ellipse(83.6340,61.2010,4.0",2.0",25) # color=magenta
+box(83.6320,61.2004,6.0",3.0",60)
+polygon(83.6345,61.2002,83.6338,61.2015,83.6318,61.2010,83.6325,61.2000)
+point(83.63285,61.20095)

@@ -1,9 +1,11 @@
 import {
   getHeader,
   listOpenFiles,
+  loadRegionFile,
   onOpenRequest,
   openFits,
   pickFitsFile,
+  pickRegionFile,
   resolveCoord,
   takePendingOpens,
   type CardValue,
@@ -30,6 +32,8 @@ let viewer: Viewer | null = null;
 let histPanel: HistogramPanel | null = null;
 /** `${path}#${hdu}` the histogram was last loaded for (lazy: only when shown). */
 let histLoadedFor: string | null = null;
+/** Loaded .reg file; regions re-resolve per HDU (sky coords → that HDU's WCS). */
+let regionPath: string | null = null;
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -199,6 +203,32 @@ function ensureHistogram(): void {
   void histPanel.load(state.file.path, state.selectedHdu);
 }
 
+/** (Re)load the picked .reg file for the current HDU and show warnings. */
+async function applyRegions(): Promise<void> {
+  if (!state.file || !viewer) return;
+  const readout = must<HTMLElement>("readout");
+  if (!regionPath) {
+    viewer.setRegions(null);
+  } else {
+    try {
+      const result = await loadRegionFile(state.file.path, state.selectedHdu, regionPath);
+      viewer.setRegions(result.regions);
+      readout.textContent =
+        result.warnings.length > 0
+          ? `regions: ${result.warnings[0]}${
+              result.warnings.length > 1 ? ` (+${result.warnings.length - 1} more)` : ""
+            }`
+          : `${result.regions.length} region${result.regions.length === 1 ? "" : "s"} loaded`;
+      if (result.warnings.length > 0) console.warn("region warnings:", result.warnings);
+    } catch (err) {
+      regionPath = null;
+      viewer.setRegions(null);
+      readout.textContent = `regions: ${String(err)}`;
+    }
+  }
+  must<HTMLElement>("region-clear-btn").style.display = viewer.hasRegions() ? "" : "none";
+}
+
 async function selectHdu(index: number): Promise<void> {
   if (!state.file) return;
   const hdu = state.file.hdus[index];
@@ -211,6 +241,7 @@ async function selectHdu(index: number): Promise<void> {
     ensureHistogram();
     // shape is FITS order: NAXIS1 (x) first.
     await viewer.setImage(state.file.path, index, hdu.shape[0], hdu.shape[1]);
+    await applyRegions();
   } else {
     viewer?.clear();
     histPanel?.clear();
@@ -302,6 +333,24 @@ function buildUi(): void {
     histBtn.classList.toggle("active-btn", histPanel.toggle());
     ensureHistogram();
   });
+  const regBtn = el("button", "", "Reg…");
+  regBtn.title = "Load a DS9 region file (.reg) onto the image";
+  regBtn.addEventListener("click", () => {
+    void (async () => {
+      const picked = await pickRegionFile();
+      if (!picked) return;
+      regionPath = picked;
+      await applyRegions();
+    })();
+  });
+  const regClearBtn = el("button", "", "×");
+  regClearBtn.id = "region-clear-btn";
+  regClearBtn.title = "Clear regions";
+  regClearBtn.style.display = "none";
+  regClearBtn.addEventListener("click", () => {
+    regionPath = null;
+    void applyRegions();
+  });
   const gotoBox = el("input", "goto");
   gotoBox.id = "goto-box";
   gotoBox.placeholder = "goto α δ";
@@ -325,7 +374,18 @@ function buildUi(): void {
       });
   });
   gotoBox.addEventListener("input", () => gotoBox.classList.remove("goto-error"));
-  controls.append(colormapSel, stretchSel, scaleSel, fitBtn, histBtn, gotoBox, limitsLabel, cbLabel);
+  controls.append(
+    colormapSel,
+    stretchSel,
+    scaleSel,
+    fitBtn,
+    histBtn,
+    regBtn,
+    regClearBtn,
+    gotoBox,
+    limitsLabel,
+    cbLabel,
+  );
 
   const filter = el("input", "filter");
   filter.id = "filter-box";

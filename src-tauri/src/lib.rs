@@ -1,4 +1,5 @@
 pub mod fits;
+pub mod regions;
 pub mod tiles;
 pub mod wcs;
 
@@ -239,6 +240,45 @@ async fn get_histogram(
 }
 
 #[derive(Serialize)]
+struct RegionLoadResult {
+    regions: Vec<regions::PixelRegion>,
+    warnings: Vec<String>,
+}
+
+/// Parse a DS9 .reg file and resolve it to pixel space for one HDU (sky
+/// regions go through the HDU's WCS). Unsupported content comes back as
+/// warnings, not errors — partial loads are normal for DS9 files.
+#[tauri::command]
+fn load_region_file(
+    path: String,
+    hdu: usize,
+    region_path: String,
+    state: State<'_, AppState>,
+) -> Result<RegionLoadResult, String> {
+    let file = lookup(&state, &path)?;
+    let info = file.hdu(hdu).map_err(|e| e.to_string())?;
+    let wcs = wcs::Wcs::from_header(&info.header);
+    let text = std::fs::read_to_string(&region_path)
+        .map_err(|e| format!("cannot read {region_path}: {e}"))?;
+    let parsed = regions::parse::parse(&text);
+    let mut warnings = parsed.warnings;
+    let mut out = Vec::new();
+    for (i, region) in parsed.regions.iter().enumerate() {
+        match region.to_pixel(wcs.as_ref()) {
+            Ok(pix) => out.push(pix),
+            Err(e) => warnings.push(format!("region {}: {e}", i + 1)),
+        }
+    }
+    eprintln!(
+        "[ds10] regions {} — {} loaded, {} warnings",
+        region_path,
+        out.len(),
+        warnings.len()
+    );
+    Ok(RegionLoadResult { regions: out, warnings })
+}
+
+#[derive(Serialize)]
 struct HeaderCard {
     key: String,
     value: Option<fits::Value>,
@@ -312,6 +352,7 @@ pub fn run() {
             get_readout,
             resolve_coord,
             get_histogram,
+            load_region_file,
             close_fits,
             take_pending_opens,
             list_open_files

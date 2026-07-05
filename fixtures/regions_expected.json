@@ -1,0 +1,301 @@
+{
+  "files": [
+    {
+      "file": "image.reg",
+      "hdu": 0,
+      "regions": [
+        {
+          "shape": "circle",
+          "x": 31.0,
+          "y": 23.0,
+          "r": 10.5,
+          "include": true,
+          "color": "red",
+          "width": 2.0,
+          "dash": false,
+          "text": "core"
+        },
+        {
+          "shape": "ellipse",
+          "x": 19.0,
+          "y": 29.0,
+          "rx": 8.0,
+          "ry": 4.0,
+          "angle": 25.0,
+          "include": true,
+          "color": "green",
+          "width": 1.0,
+          "dash": true
+        },
+        {
+          "shape": "box",
+          "x": 39.0,
+          "y": 19.0,
+          "w": 12.5,
+          "h": 6.0,
+          "angle": 75.0,
+          "include": true,
+          "color": "cyan",
+          "width": 1.0,
+          "dash": false
+        },
+        {
+          "shape": "polygon",
+          "xs": [
+            4.0,
+            19.0,
+            14.0
+          ],
+          "ys": [
+            4.0,
+            7.0,
+            19.0
+          ],
+          "include": true,
+          "color": "green",
+          "width": 1.0,
+          "dash": false,
+          "text": "poly one"
+        },
+        {
+          "shape": "point",
+          "x": 9.0,
+          "y": 39.0,
+          "include": true,
+          "color": "yellow",
+          "dash": false
+        },
+        {
+          "shape": "box",
+          "x": 49.0,
+          "y": 39.0,
+          "w": 8.0,
+          "h": 8.0,
+          "angle": 0.0,
+          "include": false,
+          "color": "green",
+          "width": 1.0,
+          "dash": false
+        }
+      ]
+    },
+    {
+      "file": "icrs.reg",
+      "hdu": 0,
+      "regions": [
+        {
+          "shape": "circle",
+          "x": 31.0,
+          "y": 22.999999999578996,
+          "r": 10.000000396768774,
+          "include": true,
+          "color": "green",
+          "dash": false
+        },
+        {
+          "shape": "circle",
+          "x": 39.54966117339143,
+          "y": 9.649333003424669,
+          "r": 8.00000032446075,
+          "include": true,
+          "color": "red",
+          "dash": false,
+          "text": "sexagesimal"
+        },
+        {
+          "shape": "ellipse",
+          "x": 45.545214469653246,
+          "y": 28.31600080579116,
+          "rx": 10.00000042416191,
+          "ry": 5.000000202280905,
+          "angle": 30.000004503877335,
+          "include": true,
+          "color": "green",
+          "width": 3.0,
+          "dash": false
+        },
+        {
+          "shape": "box",
+          "x": 15.567444035493487,
+          "y": 34.31600112068388,
+          "w": 20.000000811600657,
+          "h": 10.000000388468628,
+          "angle": 44.99999497737588,
+          "include": true,
+          "color": "blue",
+          "dash": true
+        },
+        {
+          "shape": "polygon",
+          "xs": [
+            21.562997008451426,
+            39.54965970035593,
+            51.54077072807293
+          ],
+          "ys": [
+            15.115999934006549,
+            40.316000896530554,
+            10.316000673147151
+          ],
+          "include": true,
+          "color": "green",
+          "dash": false
+        },
+        {
+          "shape": "point",
+          "x": 29.557069917522544,
+          "y": 22.982666671227204,
+          "include": true,
+          "color": "green",
+          "dash": false
+        },
+        {
+          "shape": "circle",
+          "x": 33.554106173039926,
+          "y": 22.315999989803398,
+          "r": 10.000000402998763,
+          "include": false,
+          "color": "green",
+          "dash": false
+        },
+        {
+          "shape": "box",
+          "x": 31.0,
+          "y": 22.999999999578996,
+          "w": 12.000000490608453,
+          "h": 6.000000230818304,
+          "angle": 9.999999931507341,
+          "include": true,
+          "color": "green",
+          "dash": false,
+          "text": "degree units"
+        }
+      ]
+    },
+    {
+      "file": "rot.reg",
+      "hdu": 3,
+      "regions": [
+        {
+          "shape": "circle",
+          "x": 15.499999999990944,
+          "y": 11.249999999985647,
+          "r": 4.006827038429645,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "ellipse",
+          "x": 14.551068793150497,
+          "y": 13.629218763950355,
+          "rx": 5.2690179625023275,
+          "ry": 2.7084385717138155,
+          "angle": 351.6045517899835,
+          "include": true,
+          "color": "magenta",
+          "dash": false
+        },
+        {
+          "shape": "box",
+          "x": 16.83194769503759,
+          "y": 8.614810690477402,
+          "w": 7.947851572564862,
+          "h": 4.040000689843344,
+          "angle": 28.141295305288722,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "polygon",
+          "xs": [
+            11.528636626992453,
+            16.22465801127283,
+            18.763605885995755,
+            14.842052010918104
+          ],
+          "ys": [
+            10.99635628356964,
+            15.418763517816792,
+            10.813516135969559,
+            7.618305370607704
+          ],
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "point",
+          "x": 16.6240047137546,
+          "y": 11.952801704477599,
+          "include": true,
+          "dash": false
+        }
+      ]
+    },
+    {
+      "file": "mixed.reg",
+      "hdu": 0,
+      "regions": [
+        {
+          "shape": "circle",
+          "x": 31.0,
+          "y": 22.999999999578996,
+          "r": 10.000000396768774,
+          "include": true,
+          "color": "red",
+          "dash": false
+        },
+        {
+          "shape": "circle",
+          "x": 39.54966067962674,
+          "y": 19.91600008248359,
+          "r": 6.666666937228818,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "point",
+          "x": 27.55855184886632,
+          "y": 25.916000148882343,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "box",
+          "x": 29.0,
+          "y": 19.0,
+          "w": 10.0,
+          "h": 5.0,
+          "angle": 15.0,
+          "include": true,
+          "dash": false,
+          "text": "pixel box"
+        },
+        {
+          "shape": "circle",
+          "x": 11.0,
+          "y": 11.0,
+          "r": 4.0,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "polygon",
+          "xs": [
+            2.0,
+            8.0,
+            8.0,
+            2.0
+          ],
+          "ys": [
+            2.0,
+            2.0,
+            8.0,
+            8.0
+          ],
+          "include": false,
+          "dash": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# sky frame, sexagesimal + decimal + mixed size units, tiny HST-like field
+global color=green
+icrs
+circle(150.1163213,2.2058057,0.30")
+circle(10:00:27.9000,+02:12:20.500,0.24") # color=red text={sexagesimal}
+ellipse(150.116200,2.205850,0.30",0.15",30) # width=3
+box(150.116450,2.205900,0.6",0.3",45) # color=blue dash=1
+polygon(150.116400,2.205740,150.116250,2.205950,150.116150,2.205700)
+point(10:00:27.92,+2:12:20.9) # point=x
+-circle(150.116300,2.205800,0.005')
+box(150.1163213,2.2058057,0.0001d,0.00005d,10) # text={degree units}

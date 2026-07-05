@@ -1,0 +1,7 @@
+# frame switching + semicolon-separated statements on one line
+icrs; circle(150.1163213,2.2058057,0.3") # color=red
+circle(150.116250,2.205780,0.2"); point(150.116350,2.205830)
+image
+box(30,20,10,5,15) # text={pixel box}
+circle(12,12,4)
+-polygon(3,3,9,3,9,9,3,9)

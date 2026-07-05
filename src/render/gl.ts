@@ -38,7 +38,7 @@ precision highp float;
 uniform sampler2D u_tex;    // R32F tile
 uniform sampler2D u_lut;    // 256x1 RGBA8 colormap
 uniform vec2 u_limits;      // lo, hi
-uniform vec2 u_cb;          // colormap bias (0..1), contrast (>0)
+uniform vec2 u_cb;          // colormap bias (-0.5..1.5), contrast (>0)
 uniform int u_stretch;
 in vec2 v_uv;
 out vec4 outColor;

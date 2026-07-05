@@ -35,7 +35,8 @@ pub fn fmt_dec_dms(dec_deg: f64) -> String {
 /// One token → degrees. `is_ra` controls the sexagesimal unit (hours for
 /// RA unless the token says degrees with a 'd'). Accepted forms:
 /// "150.1163", "10:00:27.9", "10h00m27.9s", "+02:12:20", "-2d12m20s".
-fn parse_token(token: &str, is_ra: bool) -> Option<f64> {
+/// Also used by the DS9 region parser (same DS9 conventions).
+pub(crate) fn parse_token(token: &str, is_ra: bool) -> Option<f64> {
     let t = token.trim();
     if t.is_empty() {
         return None;

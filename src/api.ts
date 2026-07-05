@@ -151,6 +151,51 @@ export function getHistogram(
   return invoke<Histogram>("get_histogram", { path, hdu, bins });
 }
 
+/** A region resolved to image-pixel space by the backend (FITS 0-based
+ *  pixel-center coordinates; angles in degrees CCW from +x; ellipse
+ *  rx/ry are semi-axes, box w/h full side lengths). */
+export type PixelRegion = {
+  include: boolean;
+  color: string | null;
+  width: number | null;
+  dash: boolean;
+  text: string | null;
+  /** Point marker style ("circle", "cross", "x", …). */
+  point: string | null;
+} & (
+  | { shape: "circle"; x: number; y: number; r: number }
+  | { shape: "ellipse"; x: number; y: number; rx: number; ry: number; angle: number }
+  | { shape: "box"; x: number; y: number; w: number; h: number; angle: number }
+  | { shape: "polygon"; xs: number[]; ys: number[] }
+  | { shape: "point"; x: number; y: number }
+);
+
+export interface RegionLoadResult {
+  regions: PixelRegion[];
+  warnings: string[];
+}
+
+/** Parse a DS9 .reg file and resolve it against one HDU's pixel grid. */
+export function loadRegionFile(
+  path: string,
+  hdu: number,
+  regionPath: string,
+): Promise<RegionLoadResult> {
+  return invoke<RegionLoadResult>("load_region_file", { path, hdu, regionPath });
+}
+
+export async function pickRegionFile(): Promise<string | null> {
+  const selected = await openDialog({
+    multiple: false,
+    directory: false,
+    filters: [
+      { name: "DS9 regions", extensions: ["reg"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
 export function takePendingOpens(): Promise<string[]> {
   return invoke<string[]>("take_pending_opens");
 }
