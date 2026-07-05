@@ -48,8 +48,7 @@ pub fn parse(text: &str) -> RegionFile {
             match &frame {
                 FrameState::Unsupported(_) => {} // already warned at the frame line
                 FrameState::Ok(f) => match parse_shape(stmt, *f, &global) {
-                    Ok(Some(region)) => out.regions.push(region),
-                    Ok(None) => {}
+                    Ok(regions) => out.regions.extend(regions),
                     Err(msg) => out.warnings.push(format!("line {}: {msg}", lineno + 1)),
                 },
             }
@@ -109,8 +108,9 @@ fn frame_keyword(lower: &str) -> Option<FrameState> {
     }
 }
 
-/// Parse one shape statement. Ok(None) = recognized but ignorable.
-fn parse_shape(stmt: &str, frame: Frame, global: &Props) -> Result<Option<Region>, String> {
+/// Parse one shape statement. Usually one region; a multi-radius annulus
+/// expands to several (like astropy-regions).
+fn parse_shape(stmt: &str, frame: Frame, global: &Props) -> Result<Vec<Region>, String> {
     let (include, rest) = match stmt.strip_prefix('-') {
         Some(r) => (false, r),
         None => (true, stmt.strip_prefix('+').unwrap_or(stmt)),
@@ -141,11 +141,11 @@ fn parse_shape(stmt: &str, frame: Frame, global: &Props) -> Result<Option<Region
     };
 
     match name.as_str() {
-        "circle" | "ellipse" | "box" | "polygon" | "point" => {
-            build_shape(&name, &args, frame, include, props).map(Some)
+        "circle" | "ellipse" | "box" | "polygon" | "point" | "annulus" => {
+            build_shapes(&name, &args, frame, include, props)
         }
         // Recognized DS9 shapes we don't support yet.
-        "annulus" | "panda" | "epanda" | "bpanda" | "line" | "vector" | "text"
+        "panda" | "epanda" | "bpanda" | "line" | "vector" | "text"
         | "ruler" | "compass" | "projection" | "segment" | "composite" => {
             Err(format!("shape \"{name}\" is not supported yet — skipped"))
         }
@@ -153,13 +153,13 @@ fn parse_shape(stmt: &str, frame: Frame, global: &Props) -> Result<Option<Region
     }
 }
 
-fn build_shape(
+fn build_shapes(
     name: &str,
     args: &[&str],
     frame: Frame,
     include: bool,
     props: Props,
-) -> Result<Region, String> {
+) -> Result<Vec<Region>, String> {
     let pos = |i: usize| -> Result<(f64, f64), String> {
         parse_position(args.get(i).copied(), args.get(i + 1).copied(), frame)
     };
@@ -184,6 +184,27 @@ fn build_shape(
             expect_args(name, args.len(), &[3])?;
             let (x, y) = pos(0)?;
             Shape::Circle { x, y, r: size(2)? }
+        }
+        "annulus" => {
+            // annulus(x, y, r1, r2[, r3, …]) — N radii = N−1 concentric
+            // annuli on consecutive radius pairs (astropy-regions semantics).
+            if args.len() < 4 {
+                return Err(format!("annulus: expected ≥4 arguments, got {}", args.len()));
+            }
+            let (x, y) = pos(0)?;
+            let radii: Vec<f64> = (2..args.len()).map(size).collect::<Result<_, _>>()?;
+            if radii.windows(2).any(|w| w[1] <= w[0]) {
+                return Err("annulus: radii must be strictly increasing".into());
+            }
+            return Ok(radii
+                .windows(2)
+                .map(|w| Region {
+                    frame,
+                    shape: Shape::Annulus { x, y, rin: w[0], rout: w[1] },
+                    include,
+                    props: props.clone(),
+                })
+                .collect());
         }
         "ellipse" => {
             expect_args(name, args.len(), &[4, 5])?;
@@ -215,7 +236,7 @@ fn build_shape(
         }
         _ => unreachable!("caller filters shape names"),
     };
-    Ok(Region { frame, shape, include, props })
+    Ok(vec![Region { frame, shape, include, props }])
 }
 
 fn expect_args(name: &str, got: usize, want: &[usize]) -> Result<(), String> {
@@ -444,12 +465,41 @@ mod tests {
 
     #[test]
     fn unsupported_frame_and_shape_warn_and_skip() {
-        let f = parse("galactic\ncircle(120,45,0.1)\nimage\nannulus(5,5,2,4)\nbogus(1,2)\n");
+        let f = parse("galactic\ncircle(120,45,0.1)\nimage\npanda(5,5,0,360,4,2,4,1)\nbogus(1,2)\n");
         assert!(f.regions.is_empty());
         assert_eq!(f.warnings.len(), 3, "{:?}", f.warnings);
         assert!(f.warnings[0].contains("galactic"));
-        assert!(f.warnings[1].contains("annulus"));
+        assert!(f.warnings[1].contains("panda"));
         assert!(f.warnings[2].contains("bogus"));
+    }
+
+    #[test]
+    fn annulus_two_radii() {
+        let f = parse("image\nannulus(32,24,4,8)\n");
+        assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+        assert_eq!(
+            shape_of(&f, 0),
+            &Shape::Annulus { x: 32.0, y: 24.0, rin: 4.0, rout: 8.0 }
+        );
+    }
+
+    #[test]
+    fn annulus_multi_radius_expands_to_pairs() {
+        let f = parse("image\nannulus(32,24,3,5,7,9) # color=red\n");
+        assert_eq!(f.regions.len(), 3);
+        assert_eq!(
+            shape_of(&f, 1),
+            &Shape::Annulus { x: 32.0, y: 24.0, rin: 5.0, rout: 7.0 }
+        );
+        assert!(f.regions.iter().all(|r| r.props.color.as_deref() == Some("red")));
+    }
+
+    #[test]
+    fn annulus_nonincreasing_radii_rejected() {
+        let f = parse("image\nannulus(32,24,8,4)\n");
+        assert!(f.regions.is_empty());
+        assert_eq!(f.warnings.len(), 1);
+        assert!(f.warnings[0].contains("increasing"));
     }
 
     #[test]

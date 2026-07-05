@@ -279,6 +279,32 @@ fn load_region_file(
 }
 
 #[derive(Serialize)]
+struct RegionSaveResult {
+    count: usize,
+    warnings: Vec<String>,
+}
+
+/// Re-write a .reg file in DS10's normalized DS9 dialect (decimal degrees,
+/// arcsec sizes, icrs for sky frames). Shapes the parser can't represent
+/// are dropped with a warning — the caller should surface those.
+#[tauri::command]
+fn save_region_file(region_path: String, out_path: String) -> Result<RegionSaveResult, String> {
+    let text = std::fs::read_to_string(&region_path)
+        .map_err(|e| format!("cannot read {region_path}: {e}"))?;
+    let parsed = regions::parse::parse(&text);
+    std::fs::write(&out_path, regions::write::write_ds9(&parsed.regions))
+        .map_err(|e| format!("cannot write {out_path}: {e}"))?;
+    eprintln!(
+        "[ds10] regions saved {} → {} ({} regions, {} warnings)",
+        region_path,
+        out_path,
+        parsed.regions.len(),
+        parsed.warnings.len()
+    );
+    Ok(RegionSaveResult { count: parsed.regions.len(), warnings: parsed.warnings })
+}
+
+#[derive(Serialize)]
 struct HeaderCard {
     key: String,
     value: Option<fits::Value>,
@@ -353,6 +379,7 @@ pub fn run() {
             resolve_coord,
             get_histogram,
             load_region_file,
+            save_region_file,
             close_fits,
             take_pending_opens,
             list_open_files

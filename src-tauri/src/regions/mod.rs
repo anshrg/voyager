@@ -7,9 +7,9 @@
 //!   regions_expected.json; tests in tests/region_fixtures.rs). The
 //!   sky→pixel math below reproduces regions 0.12's algorithms exactly.
 //!
-//! Scope (M3 first pass):
-//! - Shapes: circle, ellipse, box, polygon, point. Others (annulus, line,
-//!   text, …) are skipped with a warning.
+//! Scope (M3):
+//! - Shapes: circle, annulus, ellipse, box, polygon, point. Others (line,
+//!   text, panda, …) are skipped with a warning.
 //! - Frames: image/physical (pixel coords) and fk5/icrs/j2000 (sky).
 //!   fk5 is treated as an alias of icrs — the ~23 mas frame rotation is
 //!   ignored (well under a pixel for typical imaging; exact frame
@@ -17,6 +17,7 @@
 //!   a warning.
 
 pub mod parse;
+pub mod write;
 
 use crate::wcs::Wcs;
 use serde::Serialize;
@@ -38,6 +39,9 @@ pub enum Frame {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Circle { x: f64, y: f64, r: f64 },
+    /// Circular annulus (a multi-radius DS9 annulus is expanded to one
+    /// region per consecutive radius pair at parse time, like astropy).
+    Annulus { x: f64, y: f64, rin: f64, rout: f64 },
     /// rx/ry are semi-axes (DS9 writes semi-axes for ellipses).
     Ellipse { x: f64, y: f64, rx: f64, ry: f64, angle: f64 },
     /// w/h are full side lengths (DS9 box convention).
@@ -70,7 +74,7 @@ impl Props {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Region {
     pub frame: Frame,
     pub shape: Shape,
@@ -94,6 +98,7 @@ pub struct RegionFile {
 #[serde(tag = "shape", rename_all = "lowercase")]
 pub enum PixelShape {
     Circle { x: f64, y: f64, r: f64 },
+    Annulus { x: f64, y: f64, rin: f64, rout: f64 },
     Ellipse { x: f64, y: f64, rx: f64, ry: f64, angle: f64 },
     Box { x: f64, y: f64, w: f64, h: f64, angle: f64 },
     Polygon { xs: Vec<f64>, ys: Vec<f64> },
@@ -140,6 +145,9 @@ impl Region {
 fn image_to_pixel(shape: &Shape) -> PixelShape {
     match *shape {
         Shape::Circle { x, y, r } => PixelShape::Circle { x: x - 1.0, y: y - 1.0, r },
+        Shape::Annulus { x, y, rin, rout } => {
+            PixelShape::Annulus { x: x - 1.0, y: y - 1.0, rin, rout }
+        }
         Shape::Ellipse { x, y, rx, ry, angle } => PixelShape::Ellipse {
             x: x - 1.0,
             y: y - 1.0,
@@ -171,6 +179,11 @@ fn sky_to_pixel(shape: &Shape, w: &Wcs) -> Result<PixelShape, String> {
         Shape::Circle { x: ra, y: dec, r } => {
             let (x, y) = project(ra, dec)?;
             PixelShape::Circle { x, y, r: r / local_scale_arcsec(w, x, y) }
+        }
+        Shape::Annulus { x: ra, y: dec, rin, rout } => {
+            let (x, y) = project(ra, dec)?;
+            let s = local_scale_arcsec(w, x, y);
+            PixelShape::Annulus { x, y, rin: rin / s, rout: rout / s }
         }
         Shape::Ellipse { x: ra, y: dec, rx, ry, angle } => {
             let (x, y, pw, ph, pa) = shape_via_svd(w, ra, dec, 2.0 * rx, 2.0 * ry, angle)?;

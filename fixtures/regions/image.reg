@@ -2,6 +2,8 @@
 global color=green width=1
 image
 circle(32.0,24.0,10.5) # color=red width=2 text={core}
+annulus(26,15,3,6) # color=magenta
+annulus(45,35,2,4,6.5)
 ellipse(20,30,8,4,25) # dash=1
 box(40,20,12.5,6,75) # color=cyan
 polygon(5,5,20,8,15,20) # text={poly one}

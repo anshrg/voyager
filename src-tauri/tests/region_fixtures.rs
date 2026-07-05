@@ -5,7 +5,7 @@
 //!   scripts/venv/bin/python scripts/gen_region_fixtures.py
 
 use ds10_lib::fits::FitsFile;
-use ds10_lib::regions::{parse, PixelRegion, PixelShape};
+use ds10_lib::regions::{parse, write, PixelRegion, PixelShape};
 use ds10_lib::wcs::Wcs;
 use serde_json::Value as Json;
 use std::path::PathBuf;
@@ -42,6 +42,12 @@ fn check_shape(got: &PixelShape, want: &Json, ctx: &str) {
             approx(*x, f("x"), &format!("{ctx} x"));
             approx(*y, f("y"), &format!("{ctx} y"));
             approx(*r, f("r"), &format!("{ctx} r"));
+        }
+        ("annulus", PixelShape::Annulus { x, y, rin, rout }) => {
+            approx(*x, f("x"), &format!("{ctx} x"));
+            approx(*y, f("y"), &format!("{ctx} y"));
+            approx(*rin, f("rin"), &format!("{ctx} rin"));
+            approx(*rout, f("rout"), &format!("{ctx} rout"));
         }
         ("ellipse", PixelShape::Ellipse { x, y, rx, ry, angle }) => {
             approx(*x, f("x"), &format!("{ctx} x"));
@@ -137,5 +143,15 @@ fn region_files_match_astropy_regions() {
             check_shape(&pix.shape, want, &ctx);
             check_props(&pix, want, &ctx);
         }
+
+        // Writer round-trip: serializing and re-parsing must reproduce the
+        // regions exactly (the writer uses shortest-exact float formatting).
+        let rewritten = parse::parse(&write::write_ds9(&parsed.regions));
+        assert!(
+            rewritten.warnings.is_empty(),
+            "{fname} rewrite warnings: {:?}",
+            rewritten.warnings
+        );
+        assert_eq!(rewritten.regions, parsed.regions, "{fname}: write round-trip");
     }
 }

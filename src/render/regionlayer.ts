@@ -47,6 +47,17 @@ export function drawRegions(
         bbox = [x - r, y - r, x + r, y + r];
         break;
       }
+      case "annulus": {
+        const [x, y] = [sx(reg.x), sy(reg.y)];
+        const [ri, ro] = [reg.rin * view.scale, reg.rout * view.scale];
+        ctx.beginPath();
+        ctx.arc(x, y, ri, 0, 2 * Math.PI);
+        ctx.moveTo(x + ro, y);
+        ctx.arc(x, y, ro, 0, 2 * Math.PI);
+        ctx.stroke();
+        bbox = [x - ro, y - ro, x + ro, y + ro];
+        break;
+      }
       case "ellipse": {
         const [x, y] = [sx(reg.x), sy(reg.y)];
         ctx.beginPath();

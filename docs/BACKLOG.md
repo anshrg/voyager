@@ -53,10 +53,13 @@ anything. Promote items into a milestone deliberately, not casually.
 
 ## From M3 implementation (parked, not blocking)
 
-- Region save: write loaded/modified regions back to .reg (DS9-compatible
-  formatting, preserve frame + units where possible).
-- More shapes: annulus (common in photometry), line, vector, text regions
-  (parser currently warns + skips them).
+- More shapes: line, vector, text regions, panda/epanda (parser currently
+  warns + skips them). Annulus + region save landed 2026-07-05.
+- Region save currently normalizes (decimal degrees, arcsec, icrs, globals
+  baked into each line); preserving the source file's exact units/sexagesimal
+  style would need the parser to keep the original tokens.
+- Elliptical/box annuli (DS9 writes them as ellipse/box with 2n radii pairs)
+  — parser currently treats extra ellipse/box args as an arg-count error.
 - Exact fk5 ↔ icrs frame rotation (~23 mas; currently treated as equal —
   fine for JWST pixel scales, visible on sub-arcsec HST work).
 - Galactic-frame regions (needs coordinate transform).

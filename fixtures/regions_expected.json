@@ -16,6 +16,39 @@
           "text": "core"
         },
         {
+          "shape": "annulus",
+          "x": 25.0,
+          "y": 14.0,
+          "rin": 3.0,
+          "rout": 6.0,
+          "include": true,
+          "color": "magenta",
+          "width": 1.0,
+          "dash": false
+        },
+        {
+          "shape": "annulus",
+          "x": 44.0,
+          "y": 34.0,
+          "rin": 2.0,
+          "rout": 4.0,
+          "include": true,
+          "color": "green",
+          "width": 1.0,
+          "dash": false
+        },
+        {
+          "shape": "annulus",
+          "x": 44.0,
+          "y": 34.0,
+          "rin": 4.0,
+          "rout": 6.5,
+          "include": true,
+          "color": "green",
+          "width": 1.0,
+          "dash": false
+        },
+        {
           "shape": "ellipse",
           "x": 19.0,
           "y": 29.0,
@@ -103,6 +136,17 @@
           "text": "sexagesimal"
         },
         {
+          "shape": "annulus",
+          "x": 27.558551941214528,
+          "y": 30.716000341256297,
+          "rin": 4.00000015941375,
+          "rout": 8.333333665445313,
+          "include": true,
+          "color": "green",
+          "dash": false,
+          "text": "sky annulus"
+        },
+        {
           "shape": "ellipse",
           "x": 45.545214469653246,
           "y": 28.31600080579116,
@@ -181,6 +225,15 @@
           "x": 15.499999999990944,
           "y": 11.249999999985647,
           "r": 4.006827038429645,
+          "include": true,
+          "dash": false
+        },
+        {
+          "shape": "annulus",
+          "x": 14.99220510994818,
+          "y": 12.171061600092786,
+          "rin": 2.671218025706766,
+          "rout": 5.342436051413532,
           "include": true,
           "dash": false
         },

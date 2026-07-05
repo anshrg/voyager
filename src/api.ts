@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 export type HduKind = "image" | "bin_table" | "ascii_table" | "unknown";
 
@@ -164,6 +164,7 @@ export type PixelRegion = {
   point: string | null;
 } & (
   | { shape: "circle"; x: number; y: number; r: number }
+  | { shape: "annulus"; x: number; y: number; rin: number; rout: number }
   | { shape: "ellipse"; x: number; y: number; rx: number; ry: number; angle: number }
   | { shape: "box"; x: number; y: number; w: number; h: number; angle: number }
   | { shape: "polygon"; xs: number[]; ys: number[] }
@@ -182,6 +183,28 @@ export function loadRegionFile(
   regionPath: string,
 ): Promise<RegionLoadResult> {
   return invoke<RegionLoadResult>("load_region_file", { path, hdu, regionPath });
+}
+
+export interface RegionSaveResult {
+  count: number;
+  warnings: string[];
+}
+
+/** Re-write a .reg file in DS10's normalized DS9 dialect (decimal degrees,
+ *  arcsec sizes, icrs). Warnings list content that could not be kept. */
+export function saveRegionFile(
+  regionPath: string,
+  outPath: string,
+): Promise<RegionSaveResult> {
+  return invoke<RegionSaveResult>("save_region_file", { regionPath, outPath });
+}
+
+export async function pickRegionSavePath(defaultPath?: string): Promise<string | null> {
+  const selected = await saveDialog({
+    defaultPath,
+    filters: [{ name: "DS9 regions", extensions: ["reg"] }],
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function pickRegionFile(): Promise<string | null> {

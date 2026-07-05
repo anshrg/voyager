@@ -6,7 +6,9 @@ import {
   openFits,
   pickFitsFile,
   pickRegionFile,
+  pickRegionSavePath,
   resolveCoord,
+  saveRegionFile,
   takePendingOpens,
   type CardValue,
   type FileSummary,
@@ -226,7 +228,9 @@ async function applyRegions(): Promise<void> {
       readout.textContent = `regions: ${String(err)}`;
     }
   }
-  must<HTMLElement>("region-clear-btn").style.display = viewer.hasRegions() ? "" : "none";
+  const showRegionButtons = viewer.hasRegions() ? "" : "none";
+  must<HTMLElement>("region-clear-btn").style.display = showRegionButtons;
+  must<HTMLElement>("region-save-btn").style.display = showRegionButtons;
 }
 
 async function selectHdu(index: number): Promise<void> {
@@ -351,6 +355,28 @@ function buildUi(): void {
     regionPath = null;
     void applyRegions();
   });
+  const regSaveBtn = el("button", "", "Save");
+  regSaveBtn.id = "region-save-btn";
+  regSaveBtn.title = "Save the loaded regions to a .reg file (normalized DS9 format)";
+  regSaveBtn.style.display = "none";
+  regSaveBtn.addEventListener("click", () => {
+    void (async () => {
+      if (!regionPath) return;
+      const out = await pickRegionSavePath(regionPath);
+      if (!out) return;
+      const readout = must<HTMLElement>("readout");
+      try {
+        const result = await saveRegionFile(regionPath, out);
+        readout.textContent =
+          result.warnings.length > 0
+            ? `saved ${result.count} regions (${result.warnings.length} skipped/warned — see console)`
+            : `saved ${result.count} region${result.count === 1 ? "" : "s"} to ${out}`;
+        if (result.warnings.length > 0) console.warn("region save warnings:", result.warnings);
+      } catch (err) {
+        readout.textContent = `region save failed: ${String(err)}`;
+      }
+    })();
+  });
   const gotoBox = el("input", "goto");
   gotoBox.id = "goto-box";
   gotoBox.placeholder = "goto α δ";
@@ -381,6 +407,7 @@ function buildUi(): void {
     fitBtn,
     histBtn,
     regBtn,
+    regSaveBtn,
     regClearBtn,
     gotoBox,
     limitsLabel,

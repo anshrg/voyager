@@ -13,7 +13,7 @@ Notes on scope (mirrors the Rust module):
 - Frames: image + icrs only in fixtures. DS10 treats fk5 as an alias of
   icrs (the ~23 mas frame rotation is ignored); fixtures stick to icrs so
   the ground truth has no frame-conversion component.
-- Shapes: circle, ellipse, box, polygon, point.
+- Shapes: circle, annulus, ellipse, box, polygon, point.
 """
 
 import json
@@ -40,6 +40,8 @@ REG_FILES = [
 global color=green width=1
 image
 circle(32.0,24.0,10.5) # color=red width=2 text={core}
+annulus(26,15,3,6) # color=magenta
+annulus(45,35,2,4,6.5)
 ellipse(20,30,8,4,25) # dash=1
 box(40,20,12.5,6,75) # color=cyan
 polygon(5,5,20,8,15,20) # text={poly one}
@@ -56,6 +58,7 @@ global color=green
 icrs
 circle(150.1163213,2.2058057,0.30")
 circle(10:00:27.9000,+02:12:20.500,0.24") # color=red text={sexagesimal}
+annulus(150.116350,2.205870,0.12",0.25") # text={sky annulus}
 ellipse(150.116200,2.205850,0.30",0.15",30) # width=3
 box(150.116450,2.205900,0.6",0.3",45) # color=blue dash=1
 polygon(150.116400,2.205740,150.116250,2.205950,150.116150,2.205700)
@@ -71,6 +74,7 @@ box(150.1163213,2.2058057,0.0001d,0.00005d,10) # text={degree units}
 # rotated + skewed CD at dec +61: stresses the Jacobian/SVD conversion
 icrs
 circle(83.6331,61.2007,3.0")
+annulus(83.6335,61.2008,2.0",4.0")
 ellipse(83.6340,61.2010,4.0",2.0",25) # color=magenta
 box(83.6320,61.2004,6.0",3.0",60)
 polygon(83.6345,61.2002,83.6338,61.2015,83.6318,61.2010,83.6325,61.2000)
@@ -100,6 +104,9 @@ def region_record(reg) -> dict:
     if name == "CirclePixelRegion":
         rec = {"shape": "circle", "x": reg.center.x, "y": reg.center.y,
                "r": float(reg.radius)}
+    elif name == "CircleAnnulusPixelRegion":
+        rec = {"shape": "annulus", "x": reg.center.x, "y": reg.center.y,
+               "rin": float(reg.inner_radius), "rout": float(reg.outer_radius)}
     elif name == "EllipsePixelRegion":
         # regions stores full width/height; DS10 stores semi-axes.
         rec = {"shape": "ellipse", "x": reg.center.x, "y": reg.center.y,
