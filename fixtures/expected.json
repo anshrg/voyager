@@ -81,6 +81,19 @@
       "header_cards": {
         "CRVAL1": 2.2058057
       }
+    },
+    {
+      "index": 6,
+      "kind": "ascii_table",
+      "name": "ASCIICAT",
+      "bitpix": 8,
+      "shape": [
+        41,
+        5
+      ],
+      "header_cards": {
+        "TFIELDS": 3
+      }
     }
   ],
   "pixel_checks": [
@@ -524,6 +537,165 @@
         192,
         192
       ]
+    }
+  ],
+  "table_checks": [
+    {
+      "hdu": 2,
+      "name": "CATALOG",
+      "nrows": 123,
+      "columns": [
+        {
+          "name": "ID",
+          "kind": "int",
+          "unit": null,
+          "repeat": 1,
+          "sortable": true
+        },
+        {
+          "name": "RA",
+          "kind": "float",
+          "unit": null,
+          "repeat": 1,
+          "sortable": true
+        },
+        {
+          "name": "DEC",
+          "kind": "float",
+          "unit": null,
+          "repeat": 1,
+          "sortable": true
+        },
+        {
+          "name": "FLUX",
+          "kind": "float",
+          "unit": null,
+          "repeat": 1,
+          "sortable": true
+        },
+        {
+          "name": "NAME",
+          "kind": "str",
+          "unit": null,
+          "repeat": 16,
+          "sortable": true
+        }
+      ],
+      "cells": [
+        {
+          "row": 0,
+          "col": 0,
+          "value": 0
+        },
+        {
+          "row": 0,
+          "col": 1,
+          "value": 149.9
+        },
+        {
+          "row": 122,
+          "col": 2,
+          "value": 2.4
+        },
+        {
+          "row": 7,
+          "col": 3,
+          "value": -0.31624260544776917
+        },
+        {
+          "row": 0,
+          "col": 4,
+          "value": "src_0000"
+        },
+        {
+          "row": 122,
+          "col": 4,
+          "value": "src_0122"
+        }
+      ],
+      "sort": {
+        "col": 3,
+        "desc": false,
+        "top": [
+          4,
+          109,
+          94,
+          60,
+          52,
+          95,
+          113,
+          96
+        ]
+      },
+      "filters": [
+        {
+          "col": 4,
+          "query": "src_001",
+          "count": 10
+        },
+        {
+          "col": 1,
+          "query": ">150.1",
+          "count": 62
+        }
+      ]
+    },
+    {
+      "hdu": 6,
+      "name": "ASCIICAT",
+      "nrows": 5,
+      "columns": [
+        {
+          "name": "IDX",
+          "kind": "int",
+          "unit": null,
+          "repeat": 10,
+          "sortable": true
+        },
+        {
+          "name": "MAG",
+          "kind": "float",
+          "unit": null,
+          "repeat": 25,
+          "sortable": true
+        },
+        {
+          "name": "LABEL",
+          "kind": "str",
+          "unit": null,
+          "repeat": 6,
+          "sortable": true
+        }
+      ],
+      "cells": [
+        {
+          "row": 0,
+          "col": 0,
+          "value": 0
+        },
+        {
+          "row": 0,
+          "col": 1,
+          "value": 21.5
+        },
+        {
+          "row": 2,
+          "col": 2,
+          "value": "ccc"
+        }
+      ],
+      "sort": {
+        "col": 1,
+        "desc": false,
+        "top": [
+          3,
+          1,
+          4,
+          0,
+          2
+        ]
+      },
+      "filters": []
     }
   ]
 }

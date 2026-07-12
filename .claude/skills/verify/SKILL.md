@@ -1,20 +1,26 @@
 ---
 name: verify
-description: Launch and drive DS10 (Tauri app) to verify changes end-to-end on macOS — build/launch recipe, UI automation via CGEvent, dialog automation.
+description: Launch and drive Voyager (Tauri app) to verify changes end-to-end on macOS — build/launch recipe, UI automation via CGEvent, dialog automation.
 ---
 
-# Verifying DS10 changes in the running app
+# Verifying Voyager changes in the running app
+
+> **User preference (2026-07-12): do NOT drive the UI with synthetic input
+> (mouse.js / CGEvent / System Events).** Launch the app with the right files
+> (recipe below), then give the user a numbered manual test checklist with
+> expected outcomes — they test and report back. The Drive section is kept for
+> reference in case the user re-enables automation.
 
 ## Launch
 
 ```bash
-ps aux | grep -i ds10 | grep -v grep       # kill stale instances FIRST (incl. bundled /Applications/DS10.app)
+ps aux | grep -i voyager | grep -v grep       # kill stale instances FIRST (incl. bundled /Applications/Voyager.app)
 lsof -ti :1420 | xargs kill                # stale vite
 export PATH="$HOME/.cargo/bin:$PATH"
 npm run tauri dev -- -- /abs/path/to.fits  # argv open needs an ABSOLUTE path
 ```
 
-Run in background, wait for `[ds10] open_fits` in the log (~1–2 min cold compile).
+Run in background, wait for `[voyager] open_fits` in the log (~1–2 min cold compile).
 Good test files: `fixtures/sample.fits` (6 HDUs, WCS on 0 and 3),
 `fixtures/regions/*.reg`, CEERS MIRI i2d at
 `~/research/miri-photometry/egs/data/images/i2d/ceers-miri-pointings/`.
@@ -36,5 +42,5 @@ Good test files: `fixtures/sample.fits` (6 HDUs, WCS on 0 and 3),
 
 ## Teardown
 
-`pkill -f "tauri dev"; pkill -f "target/debug/ds10"` — and tell the user if you quit
+`pkill -f "tauri dev"; pkill -f "target/debug/voyager"` — and tell the user if you quit
 their own running instance.

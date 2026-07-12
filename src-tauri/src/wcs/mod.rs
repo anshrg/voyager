@@ -17,6 +17,7 @@
 pub mod coords;
 
 use crate::fits::Header;
+use serde::Serialize;
 
 const D2R: f64 = std::f64::consts::PI / 180.0;
 const R2D: f64 = 180.0 / std::f64::consts::PI;
@@ -37,6 +38,22 @@ pub struct Wcs {
     swapped: bool,
     /// True when CTYPE carried a -SIP suffix we are ignoring.
     pub sip_ignored: bool,
+}
+
+/// Serializable snapshot of a WCS's linear + TAN parameters, so the frontend
+/// can run pix↔world synchronously — multi-frame WCS-lock broadcasts a camera
+/// on every pan frame, and catalog overlay projects thousands of sources, both
+/// of which would stutter with a per-point IPC round-trip. The TS mirror of
+/// `pix_to_world`/`world_to_pix` (in `src/render/wcs.ts`) reads these fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct WcsParams {
+    pub crpix: [f64; 2],
+    pub lon0: f64,
+    pub lat0: f64,
+    pub cd: [[f64; 2]; 2],
+    pub cd_inv: [[f64; 2]; 2],
+    pub lonpole: f64,
+    pub swapped: bool,
 }
 
 /// Axis classification from the first 4 chars of CTYPEn.
@@ -195,6 +212,20 @@ impl Wcs {
         let dp0 = self.cd_inv[0][0] * u + self.cd_inv[0][1] * v;
         let dp1 = self.cd_inv[1][0] * u + self.cd_inv[1][1] * v;
         Some((dp0 + self.crpix[0] - 1.0, dp1 + self.crpix[1] - 1.0))
+    }
+
+    /// Snapshot the parameters for the frontend TAN mirror (WCS-lock, catalog
+    /// projection). See `WcsParams`.
+    pub fn params(&self) -> WcsParams {
+        WcsParams {
+            crpix: self.crpix,
+            lon0: self.lon0,
+            lat0: self.lat0,
+            cd: self.cd,
+            cd_inv: self.cd_inv,
+            lonpole: self.lonpole,
+            swapped: self.swapped,
+        }
     }
 }
 

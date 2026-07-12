@@ -20,7 +20,7 @@ pub mod parse;
 pub mod write;
 
 use crate::wcs::Wcs;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const ARCSEC_PER_RAD: f64 = 3600.0 * 180.0 / std::f64::consts::PI;
 
@@ -94,7 +94,7 @@ pub struct RegionFile {
 /// A region resolved to image-pixel space (FITS 0-based pixel centers,
 /// matching the viewer and astropy-regions PixelRegion conventions;
 /// angles in degrees CCW from +x).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "lowercase")]
 pub enum PixelShape {
     Circle { x: f64, y: f64, r: f64 },
@@ -105,7 +105,7 @@ pub enum PixelShape {
     Point { x: f64, y: f64 },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PixelRegion {
     #[serde(flatten)]
     pub shape: PixelShape,
@@ -137,6 +137,75 @@ impl Region {
             text: self.props.text.clone(),
             point: self.props.point.clone(),
         })
+    }
+}
+
+impl PixelRegion {
+    fn props(&self) -> Props {
+        Props {
+            color: self.color.clone(),
+            width: self.width,
+            dash: if self.dash { Some(true) } else { None },
+            text: self.text.clone(),
+            point: self.point.clone(),
+        }
+    }
+
+    /// Serialize back to a DS9 image-frame region (1-based pixel centers).
+    /// Exact inverse of `image_to_pixel`.
+    pub fn to_image_region(&self) -> Region {
+        let shape = match self.shape {
+            PixelShape::Circle { x, y, r } => Shape::Circle { x: x + 1.0, y: y + 1.0, r },
+            PixelShape::Annulus { x, y, rin, rout } => {
+                Shape::Annulus { x: x + 1.0, y: y + 1.0, rin, rout }
+            }
+            PixelShape::Ellipse { x, y, rx, ry, angle } => {
+                Shape::Ellipse { x: x + 1.0, y: y + 1.0, rx, ry, angle }
+            }
+            PixelShape::Box { x, y, w, h, angle } => {
+                Shape::Box { x: x + 1.0, y: y + 1.0, w, h, angle }
+            }
+            PixelShape::Polygon { ref xs, ref ys } => Shape::Polygon {
+                pts: xs.iter().zip(ys).map(|(x, y)| (x + 1.0, y + 1.0)).collect(),
+            },
+            PixelShape::Point { x, y } => Shape::Point { x: x + 1.0, y: y + 1.0 },
+        };
+        Region { frame: Frame::Image, shape, include: self.include, props: self.props() }
+    }
+
+    /// Serialize back to a sky (icrs) region through a WCS — the inverse of
+    /// `sky_to_pixel`: positions via `pix_to_world`, circle/annulus radii via
+    /// the local pixel scale, ellipse/box via the pixel→sky SVD. Round-trips
+    /// with `to_pixel` (asserted in tests/region_fixtures.rs).
+    pub fn to_sky_region(&self, w: &Wcs) -> Result<Region, String> {
+        let world = |x: f64, y: f64| w.pix_to_world(x, y);
+        let shape = match self.shape {
+            PixelShape::Circle { x, y, r } => {
+                let (ra, dec) = world(x, y);
+                Shape::Circle { x: ra, y: dec, r: r * local_scale_arcsec(w, x, y) }
+            }
+            PixelShape::Annulus { x, y, rin, rout } => {
+                let (ra, dec) = world(x, y);
+                let s = local_scale_arcsec(w, x, y);
+                Shape::Annulus { x: ra, y: dec, rin: rin * s, rout: rout * s }
+            }
+            PixelShape::Ellipse { x, y, rx, ry, angle } => {
+                let (ra, dec, sw, sh, pa) = sky_shape_via_svd(w, x, y, 2.0 * rx, 2.0 * ry, angle)?;
+                Shape::Ellipse { x: ra, y: dec, rx: sw / 2.0, ry: sh / 2.0, angle: pa }
+            }
+            PixelShape::Box { x, y, w: bw, h: bh, angle } => {
+                let (ra, dec, sw, sh, pa) = sky_shape_via_svd(w, x, y, bw, bh, angle)?;
+                Shape::Box { x: ra, y: dec, w: sw, h: sh, angle: pa }
+            }
+            PixelShape::Polygon { ref xs, ref ys } => Shape::Polygon {
+                pts: xs.iter().zip(ys).map(|(&x, &y)| world(x, y)).collect(),
+            },
+            PixelShape::Point { x, y } => {
+                let (ra, dec) = world(x, y);
+                Shape::Point { x: ra, y: dec }
+            }
+        };
+        Ok(Region { frame: Frame::Sky, shape, include: self.include, props: self.props() })
     }
 }
 
@@ -313,6 +382,61 @@ fn shape_via_svd(
     let circular = (width_asec - height_asec).abs() <= 1e-8 + 1e-5 * height_asec.abs();
     let (pw, ph, angle) = svd_ellipse(m, circular);
     Ok((x, y, pw, ph, angle))
+}
+
+fn invert2x2(m: [[f64; 2]; 2]) -> Result<[[f64; 2]; 2], String> {
+    let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if det == 0.0 || !det.is_finite() {
+        return Err("degenerate WCS at region center".into());
+    }
+    Ok([
+        [m[1][1] / det, -m[0][1] / det],
+        [-m[1][0] / det, m[0][0] / det],
+    ])
+}
+
+fn matmul2(a: [[f64; 2]; 2], b: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [
+        [
+            a[0][0] * b[0][0] + a[0][1] * b[1][0],
+            a[0][0] * b[0][1] + a[0][1] * b[1][1],
+        ],
+        [
+            a[1][0] * b[0][0] + a[1][1] * b[1][0],
+            a[1][0] * b[0][1] + a[1][1] * b[1][1],
+        ],
+    ]
+}
+
+/// Pixel ellipse/box → sky center, full width/height (arcsec) and DS9 angle
+/// (deg). Inverse of `shape_via_svd`: build the pixel semi-axis matrix from
+/// (width, height, angle), map it into the tangent plane with J⁻¹, then take
+/// principal axes via the same SVD. The angle relation is the inverse of the
+/// forward's `angle - 90` position-angle convention (verified by the pixel↔
+/// sky round-trip test).
+fn sky_shape_via_svd(
+    w: &Wcs,
+    x: f64,
+    y: f64,
+    width_pix: f64,
+    height_pix: f64,
+    angle_deg: f64,
+) -> Result<(f64, f64, f64, f64, f64), String> {
+    let (ra, dec) = w.pix_to_world(x, y);
+    let j = jacobian(w, x, y)?; // d(pixel)/d(tangent arcsec)
+    let a = invert2x2(j)?; // d(tangent arcsec)/d(pixel)
+    let (hw, hh) = (width_pix / 2.0, height_pix / 2.0);
+    let (s, c) = angle_deg.to_radians().sin_cos();
+    // Columns: mapped width and height semi-axis vectors in pixel space.
+    let m_pix = [[hw * c, -hh * s], [hw * s, hh * c]];
+    let m_sky = matmul2(a, m_pix);
+    let circular = (width_pix - height_pix).abs() <= 1e-8 + 1e-5 * height_pix.abs();
+    let (sw, sh, ang_t) = svd_ellipse(m_sky, circular);
+    // Forward built the width axis in tangent coords as (sin_pa, cos_pa) with
+    // pa = angle_sky - 90, so ang_t = atan2(cos_pa, sin_pa) = 90 - pa, giving
+    // angle_sky = pa + 90 = 180 - ang_t.
+    let sky_angle = (180.0 - ang_t).rem_euclid(360.0);
+    Ok((ra, dec, sw, sh, sky_angle))
 }
 
 /// Principal axes of the composite 2×2 matrix (columns = mapped width and

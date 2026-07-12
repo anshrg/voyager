@@ -1,4 +1,4 @@
-# DS10 — A fast, modern replacement for DS9 + TOPCAT
+# Voyager — A fast, modern replacement for DS9 + TOPCAT
 
 ## Context
 
@@ -20,7 +20,7 @@ Working directory: `/Users/arg5965/research/ds10` (currently empty; will `git in
 ## Architecture
 
 ```
-ds10/
+voyager/
 ├── src-tauri/          Rust backend (Tauri 2)
 │   ├── fits/           FITS parsing, mmap data access, pyramid builder
 │   ├── wcs/            WCS transforms (pixel ↔ sky)
@@ -49,7 +49,7 @@ ds10/
 A cloud-optimized FITS tile-pyramid WebGL2 renderer with an extensive test suite. **No license file → design reference only, no code copying** (unless the user obtains permission from the author). Lessons we adopt:
 
 - **WebGL2 gotcha**: `R32F` textures support only NEAREST filtering in core WebGL2. Plan: NEAREST is actually DS9-correct when zoomed in (sharp pixels); use pyramid levels for minification; optional manual bilinear in the fragment shader later.
-- **Fixture-based correctness testing**: Python scripts using astropy generate JSON/binary fixtures (stretch values, WCS transforms, decoded tiles); Rust/TS tests compare against them (bit-exact for decode, ULP tolerance for float math). Adopt this as ds10's primary correctness strategy.
+- **Fixture-based correctness testing**: Python scripts using astropy generate JSON/binary fixtures (stretch values, WCS transforms, decoded tiles); Rust/TS tests compare against them (bit-exact for decode, ULP tolerance for float math). Adopt this as voyager's primary correctness strategy.
 - **Tiered tile caching**: GPU textures → RAM LRU of decoded arrays → (for us) Rust-side mmap + on-disk pyramid cache, so reopening a file is instant.
 - **Module separation** that worked for them: tile-source / tile-manager / renderer / view-transform / camera as distinct layers; overlay subsystem (catalog markers) with its own spatial index + hit-testing; auto-stretch as a pure module. Pure logic kept free of GL/DOM so it unit-tests in Node; same principle for our Rust core (no Tauri types in `fits/`/`wcs/` modules).
 - **Strict TypeScript, no `any`** — enforced from day one.
@@ -59,7 +59,7 @@ A cloud-optimized FITS tile-pyramid WebGL2 renderer with an extensive test suite
 
 The user will bring fresh Claude instances to this project over months. Three standing documents, created in M0 and maintained thereafter:
 
-- **`CLAUDE.md`** (project root — auto-loaded each session): what ds10 is, the stack, architecture map, design decisions (with rationale), performance targets, dev commands (build/run/test), testing strategy, and a pointer instructing every session to read `docs/STATE.md` first and update it before finishing.
+- **`CLAUDE.md`** (project root — auto-loaded each session): what voyager is, the stack, architecture map, design decisions (with rationale), performance targets, dev commands (build/run/test), testing strategy, and a pointer instructing every session to read `docs/STATE.md` first and update it before finishing.
 - **`docs/STATE.md`** (living handoff doc): current milestone + status, what was done recently, in-flight work, recent learnings/gotchas (e.g. FITS edge cases discovered in the user's data), and immediate next steps. Each Claude session updates it as part of wrapping up any significant work; keep it current-state-only (history lives in git log), so it never bloats.
 - **`docs/BACKLOG.md`**: the parked feature list — the user's "many various improvements" get captured here as they come up, so scope stays disciplined without losing ideas.
 

@@ -4,9 +4,9 @@
 //! regions in pixel space; we must reproduce them. Regenerate with:
 //!   scripts/venv/bin/python scripts/gen_region_fixtures.py
 
-use ds10_lib::fits::FitsFile;
-use ds10_lib::regions::{parse, write, PixelRegion, PixelShape};
-use ds10_lib::wcs::Wcs;
+use voyager_lib::fits::FitsFile;
+use voyager_lib::regions::{parse, write, PixelRegion, PixelShape};
+use voyager_lib::wcs::Wcs;
 use serde_json::Value as Json;
 use std::path::PathBuf;
 
@@ -153,5 +153,124 @@ fn region_files_match_astropy_regions() {
             rewritten.warnings
         );
         assert_eq!(rewritten.regions, parsed.regions, "{fname}: write round-trip");
+    }
+}
+
+/// A representative set of edited/created pixel regions to round-trip.
+fn sample_pixel_regions() -> Vec<PixelRegion> {
+    let mk = |shape| PixelRegion {
+        shape,
+        include: true,
+        color: Some("green".into()),
+        width: None,
+        dash: false,
+        text: None,
+        point: None,
+    };
+    vec![
+        mk(PixelShape::Circle { x: 30.0, y: 25.0, r: 8.0 }),
+        mk(PixelShape::Annulus { x: 28.0, y: 22.0, rin: 3.0, rout: 6.0 }),
+        mk(PixelShape::Ellipse { x: 32.0, y: 26.0, rx: 9.0, ry: 4.0, angle: 25.0 }),
+        mk(PixelShape::Box { x: 30.0, y: 24.0, w: 12.0, h: 6.0, angle: 40.0 }),
+        // Circular ellipse: SVD direction is arbitrary, angle must carry through.
+        mk(PixelShape::Ellipse { x: 30.0, y: 24.0, rx: 5.0, ry: 5.0, angle: 0.0 }),
+        mk(PixelShape::Polygon { xs: vec![10.0, 20.0, 18.0], ys: vec![10.0, 12.0, 22.0] }),
+        mk(PixelShape::Point { x: 15.0, y: 30.0 }),
+    ]
+}
+
+/// Box/ellipse are symmetric under a 180° flip, so compare angles mod 180.
+fn assert_pixel_close(got: &PixelShape, want: &PixelShape, tol: f64, ctx: &str) {
+    let near = |a: f64, b: f64, what: &str| {
+        assert!((a - b).abs() <= tol, "{ctx} {what}: got {a}, want {b}");
+    };
+    let ang180 = |a: f64, b: f64| {
+        let d = (a - b).rem_euclid(180.0);
+        assert!(d.min(180.0 - d) <= 1e-2, "{ctx} angle: got {a}, want {b}");
+    };
+    match (got, want) {
+        (PixelShape::Circle { x, y, r }, PixelShape::Circle { x: bx, y: by, r: br }) => {
+            near(*x, *bx, "x");
+            near(*y, *by, "y");
+            near(*r, *br, "r");
+        }
+        (
+            PixelShape::Annulus { x, y, rin, rout },
+            PixelShape::Annulus { x: bx, y: by, rin: brin, rout: brout },
+        ) => {
+            near(*x, *bx, "x");
+            near(*y, *by, "y");
+            near(*rin, *brin, "rin");
+            near(*rout, *brout, "rout");
+        }
+        (
+            PixelShape::Ellipse { x, y, rx, ry, angle },
+            PixelShape::Ellipse { x: bx, y: by, rx: brx, ry: bry, angle: ba },
+        ) => {
+            near(*x, *bx, "x");
+            near(*y, *by, "y");
+            near(*rx, *brx, "rx");
+            near(*ry, *bry, "ry");
+            // A circular ellipse has no defined orientation; skip its angle.
+            if (brx - bry).abs() > 1e-3 {
+                ang180(*angle, *ba);
+            }
+        }
+        (
+            PixelShape::Box { x, y, w, h, angle },
+            PixelShape::Box { x: bx, y: by, w: bw, h: bh, angle: ba },
+        ) => {
+            near(*x, *bx, "x");
+            near(*y, *by, "y");
+            near(*w, *bw, "w");
+            near(*h, *bh, "h");
+            if (bw - bh).abs() > 1e-3 {
+                ang180(*angle, *ba);
+            }
+        }
+        (PixelShape::Polygon { xs, ys }, PixelShape::Polygon { xs: bxs, ys: bys }) => {
+            assert_eq!(xs.len(), bxs.len(), "{ctx} vertex count");
+            for (i, (a, b)) in xs.iter().zip(bxs).enumerate() {
+                near(*a, *b, &format!("x[{i}]"));
+            }
+            for (i, (a, b)) in ys.iter().zip(bys).enumerate() {
+                near(*a, *b, &format!("y[{i}]"));
+            }
+        }
+        (PixelShape::Point { x, y }, PixelShape::Point { x: bx, y: by }) => {
+            near(*x, *bx, "x");
+            near(*y, *by, "y");
+        }
+        (g, w) => panic!("{ctx}: shape mismatch {g:?} vs {w:?}"),
+    }
+}
+
+/// Saving edited regions must round-trip: PixelRegion → image/sky Region →
+/// back to pixel space reproduces the original. Image frame is exact; sky
+/// frame goes through the WCS and the same SVD used on load, so it is exact
+/// for conformal WCS (fixture variants) to a tight tolerance.
+#[test]
+fn pixel_region_save_round_trips() {
+    let dir = fixtures_dir();
+    let fits = FitsFile::open(&dir.join("sample.fits")).expect("open sample.fits");
+    let expected: Json = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("regions_expected.json")).unwrap(),
+    )
+    .unwrap();
+    let samples = sample_pixel_regions();
+
+    for file_entry in expected["files"].as_array().unwrap() {
+        let hdu = file_entry["hdu"].as_u64().unwrap() as usize;
+        let wcs = Wcs::from_header(&fits.hdus[hdu].header);
+        for pr in &samples {
+            // Image frame: exact inverse of image_to_pixel.
+            let img = pr.to_image_region().to_pixel(None).unwrap();
+            assert_pixel_close(&img.shape, &pr.shape, 1e-9, "image round-trip");
+            // Sky frame: through the WCS (both directions use the same SVD).
+            if let Some(w) = wcs.as_ref() {
+                let sky = pr.to_sky_region(w).unwrap().to_pixel(Some(w)).unwrap();
+                assert_pixel_close(&sky.shape, &pr.shape, 1e-4, "sky round-trip");
+            }
+        }
     }
 }

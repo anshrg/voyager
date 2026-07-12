@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate DS9 region-file fixtures + ground truth for DS10's Rust tests.
+"""Generate DS9 region-file fixtures + ground truth for Voyager's Rust tests.
 
 The astropy `regions` package is the reference implementation: this script
 writes .reg files into fixtures/regions/ plus regions_expected.json holding
@@ -10,7 +10,7 @@ it through the WCS of a named HDU of fixtures/sample.fits. Rust tests
 Regenerate with:  scripts/venv/bin/python scripts/gen_region_fixtures.py
 
 Notes on scope (mirrors the Rust module):
-- Frames: image + icrs only in fixtures. DS10 treats fk5 as an alias of
+- Frames: image + icrs only in fixtures. Voyager treats fk5 as an alias of
   icrs (the ~23 mas frame rotation is ignored); fixtures stick to icrs so
   the ground truth has no frame-conversion component.
 - Shapes: circle, annulus, ellipse, box, polygon, point.
@@ -108,7 +108,7 @@ def region_record(reg) -> dict:
         rec = {"shape": "annulus", "x": reg.center.x, "y": reg.center.y,
                "rin": float(reg.inner_radius), "rout": float(reg.outer_radius)}
     elif name == "EllipsePixelRegion":
-        # regions stores full width/height; DS10 stores semi-axes.
+        # regions stores full width/height; Voyager stores semi-axes.
         rec = {"shape": "ellipse", "x": reg.center.x, "y": reg.center.y,
                "rx": float(reg.width) / 2, "ry": float(reg.height) / 2,
                "angle": float(np.mod(reg.angle.to_value("deg"), 360.0))}

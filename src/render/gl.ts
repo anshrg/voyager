@@ -22,11 +22,15 @@ uniform vec4 u_rect;        // tile rect in image px: x0, y0, w, h
 uniform vec2 u_center;      // view center in image px
 uniform float u_scale;      // device px per image px
 uniform vec2 u_viewport;    // canvas size in device px
+uniform vec2 u_rot;         // view rotation (cos θ, sin θ), CCW in image y-up
 out vec2 v_uv;
 void main() {
   vec2 img = u_rect.xy + a_pos * u_rect.zw;
   // FITS y+ is up; clip-space y+ is up too, so no flip anywhere.
-  vec2 screen = (img - u_center) * u_scale;
+  vec2 d = img - u_center;
+  // Rotate about the view center (WCS-align lock; identity when u_rot = (1,0)).
+  vec2 rd = vec2(u_rot.x * d.x - u_rot.y * d.y, u_rot.y * d.x + u_rot.x * d.y);
+  vec2 screen = rd * u_scale;
   gl_Position = vec4(screen / (0.5 * u_viewport), 0.0, 1.0);
   v_uv = a_pos;
 }`;
@@ -80,6 +84,7 @@ export interface TileProgram {
     center: WebGLUniformLocation;
     scale: WebGLUniformLocation;
     viewport: WebGLUniformLocation;
+    rot: WebGLUniformLocation;
     tex: WebGLUniformLocation;
     lut: WebGLUniformLocation;
     limits: WebGLUniformLocation;
@@ -159,6 +164,7 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
       center: uniform(gl, program, "u_center"),
       scale: uniform(gl, program, "u_scale"),
       viewport: uniform(gl, program, "u_viewport"),
+      rot: uniform(gl, program, "u_rot"),
       tex: uniform(gl, program, "u_tex"),
       lut: uniform(gl, program, "u_lut"),
       limits: uniform(gl, program, "u_limits"),

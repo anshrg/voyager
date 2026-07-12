@@ -1,7 +1,7 @@
 //! Benchmark FitsFile::open on an arbitrary file.
 //! Usage: cargo run --release --example bench_open -- /path/to/file.fits
 
-use ds10_lib::fits::FitsFile;
+use voyager_lib::fits::FitsFile;
 use std::time::Instant;
 
 fn main() {

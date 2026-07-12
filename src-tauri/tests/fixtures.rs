@@ -3,9 +3,9 @@
 //! and pixel values. Regenerate fixtures with:
 //!   scripts/venv/bin/python scripts/gen_fixtures.py
 
-use ds10_lib::fits::{FitsFile, HduKind};
-use ds10_lib::tiles;
-use ds10_lib::wcs::Wcs;
+use voyager_lib::fits::{FitsFile, HduKind};
+use voyager_lib::tiles;
+use voyager_lib::wcs::Wcs;
 use serde_json::Value as Json;
 use std::path::PathBuf;
 
@@ -40,6 +40,7 @@ fn hdu_structure_matches_astropy() {
         let kind = match exp["kind"].as_str().unwrap() {
             "image" => HduKind::Image,
             "bin_table" => HduKind::BinTable,
+            "ascii_table" => HduKind::AsciiTable,
             other => panic!("unexpected fixture kind {other}"),
         };
         assert_eq!(hdu.kind, kind, "HDU {i} kind");

@@ -1,4 +1,4 @@
-# DS10
+# Voyager
 
 A fast, modern desktop replacement for **DS9** (FITS image viewing, regions) and **TOPCAT** (tables, crossmatching), built for an astronomer who is the sole user and daily tester. Claude does all implementation; the user is the domain expert.
 
@@ -39,7 +39,7 @@ docs/            STATE.md (living handoff), BACKLOG.md (parked features)
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"       # rustup-installed toolchain
 npm run tauri dev                           # run the app (dev)
-npm run tauri build                         # bundle DS10.app (needed to test file associations)
+npm run tauri build                         # bundle Voyager.app (needed to test file associations)
 npx tsc --noEmit                            # typecheck frontend
 cd src-tauri && cargo test                  # Rust unit + fixture tests
 scripts/venv/bin/python scripts/gen_fixtures.py   # regenerate fixtures (venv has astropy)

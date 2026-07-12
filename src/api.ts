@@ -136,6 +136,24 @@ export function resolveCoord(
   return invoke<GotoResult>("resolve_coord", { path, hdu, query });
 }
 
+/** TAN WCS parameters snapshot (mirrors Rust `wcs::WcsParams`). Consumed by
+ *  the frontend `Wcs` class for synchronous pix↔world (WCS-lock, catalog
+ *  overlay). null = the HDU has no supported WCS. */
+export interface WcsParams {
+  crpix: [number, number];
+  lon0: number;
+  lat0: number;
+  cd: [[number, number], [number, number]];
+  cd_inv: [[number, number], [number, number]];
+  lonpole: number;
+  swapped: boolean;
+}
+
+/** Fetch an HDU's WCS parameters, or null when it has no supported TAN WCS. */
+export function getWcs(path: string, hdu: number): Promise<WcsParams | null> {
+  return invoke<WcsParams | null>("get_wcs", { path, hdu });
+}
+
 export interface Histogram {
   lo: number;
   hi: number;
@@ -190,13 +208,17 @@ export interface RegionSaveResult {
   warnings: string[];
 }
 
-/** Re-write a .reg file in DS10's normalized DS9 dialect (decimal degrees,
- *  arcsec sizes, icrs). Warnings list content that could not be kept. */
-export function saveRegionFile(
-  regionPath: string,
+/** Serialize the viewer's current (possibly edited) pixel regions to a .reg
+ *  file. `frame` is "image" (pixels, exact) or "sky" (icrs; needs the HDU's
+ *  WCS). Returns a count + warnings for shapes that couldn't be written. */
+export function savePixelRegions(
+  path: string,
+  hdu: number,
+  regions: PixelRegion[],
+  frame: string,
   outPath: string,
 ): Promise<RegionSaveResult> {
-  return invoke<RegionSaveResult>("save_region_file", { regionPath, outPath });
+  return invoke<RegionSaveResult>("save_pixel_regions", { path, hdu, regions, frame, outPath });
 }
 
 export async function pickRegionSavePath(defaultPath?: string): Promise<string | null> {
@@ -219,6 +241,91 @@ export async function pickRegionFile(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+// ---- tables (M4) ----------------------------------------------------------
+
+export type ColKind = "logical" | "int" | "float" | "str" | "other";
+
+export interface TableColumn {
+  index: number;
+  name: string;
+  unit: string | null;
+  tform: string;
+  kind: ColKind;
+  /** Element count (string length for text columns). */
+  repeat: number;
+  /** Scalar numeric/logical/string columns can drive a sort. */
+  sortable: boolean;
+}
+
+/** One cell: a bare number/string/bool, or null for blank/NaN. */
+export type TableCell = number | string | boolean | null;
+
+export interface TablePage {
+  rows: TableCell[][];
+}
+
+export interface TableSort {
+  col: number;
+  desc: boolean;
+}
+
+export interface TableFilter {
+  col: number;
+  query: string;
+}
+
+export function tableColumns(path: string, hdu: number): Promise<TableColumn[]> {
+  return invoke<TableColumn[]>("table_columns", { path, hdu });
+}
+
+/** Build the sort/filter view; returns the resulting row count. Must be
+ *  called before tableRows whenever the sort/filter (or HDU) changes. */
+export async function tableView(
+  path: string,
+  hdu: number,
+  sort: TableSort | null,
+  filter: TableFilter | null,
+): Promise<number> {
+  const r = await invoke<{ nrows: number }>("table_view", { path, hdu, sort, filter });
+  return r.nrows;
+}
+
+/** A window of rows [start, start+count) in the current view order. */
+export function tableRows(
+  path: string,
+  hdu: number,
+  start: number,
+  count: number,
+): Promise<TablePage> {
+  return invoke<TablePage>("table_rows", { path, hdu, start, count });
+}
+
+/** The current sort/filter view's position for a native row, or null if that
+ *  row isn't present in the view (e.g. filtered out). Lets the image→row
+ *  reverse link scroll to the right row without resetting sort/filter. */
+export async function tableViewPos(
+  path: string,
+  hdu: number,
+  nativeRow: number,
+): Promise<number | null> {
+  const r = await invoke<{ pos: number | null }>("table_view_pos", {
+    path,
+    hdu,
+    nativeRow,
+  });
+  return r.pos;
+}
+
+/** Whole numeric columns as f64 arrays (native row order; NaN for blank /
+ *  non-numeric). Used to bulk-project catalog RA/Dec onto an image frame. */
+export function tableColumnsF64(
+  path: string,
+  hdu: number,
+  cols: number[],
+): Promise<number[][]> {
+  return invoke<number[][]>("table_columns_f64", { path, hdu, cols });
+}
+
 export function takePendingOpens(): Promise<string[]> {
   return invoke<string[]>("take_pending_opens");
 }
@@ -228,7 +335,7 @@ export function listOpenFiles(): Promise<string[]> {
 }
 
 export function onOpenRequest(handler: (path: string) => void): Promise<UnlistenFn> {
-  return listen<string>("ds10://open-request", (e) => handler(e.payload));
+  return listen<string>("voyager://open-request", (e) => handler(e.payload));
 }
 
 export async function pickFitsFile(): Promise<string | null> {

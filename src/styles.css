@@ -34,7 +34,9 @@ body,
 .toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
+  row-gap: 6px;
   padding: 8px 12px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
@@ -157,6 +159,32 @@ button:hover {
   border-bottom: 1px solid var(--border);
 }
 
+.tab-split {
+  margin-left: auto;
+}
+
+/* The image/table/header panes: stacked in single-view (one shown at a time),
+   laid out side by side under .split. */
+.view-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.view-panes.split {
+  flex-direction: row;
+  gap: 2px;
+}
+
+.view-panes.split > .image-pane,
+.view-panes.split > .table-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  min-height: 0;
+}
+
 .tab {
   border: 1px solid var(--border);
   border-bottom: none;
@@ -186,6 +214,118 @@ button:hover {
   height: 100%;
   cursor: crosshair;
   touch-action: none;
+}
+
+/* ---- multi-frame ---- */
+.frame-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px 12px 0;
+  background: var(--bg-panel);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.frame-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  border-bottom: none;
+  background: var(--bg);
+  color: var(--fg-dim);
+  cursor: pointer;
+  max-width: 220px;
+}
+
+.frame-chip.active {
+  background: var(--bg-hover);
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.frame-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-chip-close {
+  padding: 0 5px;
+  line-height: 1.2;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+}
+
+.frame-chip-close:hover {
+  background: var(--border);
+  color: var(--fg);
+  border-color: transparent;
+}
+
+/* Frame cells: only the active one shows in single mode; a CSS grid in tiled
+   mode. Each cell is the offset parent for its Viewer's absolutely-positioned
+   canvas + overlay. */
+#frames-grid {
+  position: absolute;
+  inset: 0;
+}
+
+.frame-cell {
+  position: absolute;
+  inset: 0;
+  display: none;
+  overflow: hidden;
+}
+
+.frame-cell.active {
+  display: block;
+}
+
+#frames-grid.grid {
+  display: grid;
+  gap: 2px;
+}
+
+#frames-grid.grid .frame-cell {
+  position: relative;
+  inset: auto;
+  display: block;
+}
+
+#frames-grid.grid .frame-cell.active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  z-index: 1;
+}
+
+.frame-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  display: none;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--bg-panel) 78%, transparent);
+  border-bottom-right-radius: 6px;
+  pointer-events: none;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#frames-grid.grid .frame-label {
+  display: block;
 }
 
 .header-pane {
@@ -240,59 +380,162 @@ button.active-btn {
   color: var(--accent);
 }
 
-.goto-crosshair {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 44px;
-  height: 44px;
-  margin: -22px 0 0 -22px;
-  pointer-events: none;
-  opacity: 0;
-  z-index: 3;
+/* ---- table viewer (M4) ---- */
+.table-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
 }
 
-.goto-crosshair::before,
-.goto-crosshair::after {
-  content: "";
-  position: absolute;
-  background: #ffbe5a;
+.table-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Also needed on the inline axis: without min-width:0 the flex item's
+     min-width:auto resolves to the (wide) table content, so the whole pane
+     grows past the window edge instead of letting .table-scroll scroll
+     internally — the horizontal scrollbar then has nothing to move. */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-.goto-crosshair::before {
-  left: 50%;
+.table-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.table-bar .filter {
+  width: 240px;
+}
+
+.table-status {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.table-scroll {
+  flex: 1 1 auto;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.table-inner {
+  position: relative;
+  /* Explicit width (= summed column width) is set in JS (buildHeader) so the
+     scroll container reports true horizontal overflow and the rightmost columns
+     are reachable. `min-width: max-content` was unreliable in WKWebView (the
+     absolutely-positioned body collapsed the measured content width). */
+}
+
+.table-header {
+  position: sticky;
   top: 0;
-  width: 1.5px;
-  height: 100%;
-  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
 }
 
-.goto-crosshair::after {
-  top: 50%;
+.th {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-right: 1px solid var(--border);
+  color: var(--fg);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+}
+
+.th.num {
+  text-align: right;
+}
+
+.th.sortable {
+  cursor: pointer;
+}
+
+.th.sortable:hover {
+  background: var(--bg-hover);
+}
+
+.th-unit {
+  color: var(--fg-dim);
+  font-weight: 400;
+  margin-left: 4px;
+}
+
+.th-sort {
+  color: var(--accent);
+}
+
+.table-sizer {
+  position: relative;
+}
+
+.table-body {
+  position: absolute;
+  inset: 0;
+}
+
+.table-row {
+  position: absolute;
   left: 0;
-  height: 1.5px;
-  width: 100%;
-  transform: translateY(-50%);
+  top: 0;
+  display: flex;
+  height: 22px;
+  line-height: 22px;
+  will-change: transform;
 }
 
-.goto-crosshair.flash {
-  animation: crosshair-fade 1.6s ease-out forwards;
+.table-row.odd {
+  background: rgba(255, 255, 255, 0.025);
 }
 
-@keyframes crosshair-fade {
-  0% {
-    opacity: 1;
-    transform: scale(1.6);
-  }
-  25% {
-    transform: scale(1);
-  }
-  70% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-  }
+.table-row.clickable {
+  cursor: pointer;
+}
+
+.table-row.clickable:hover {
+  background: var(--bg-hover);
+}
+
+/* Image→row reverse-link highlight (a source marker was clicked). */
+.table-row.highlight {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.td {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-right: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+
+.td.num {
+  text-align: right;
+}
+
+.td.null {
+  color: var(--fg-dim);
+}
+
+.td.loading {
+  color: transparent;
 }
 
 .hist-panel {
@@ -384,6 +627,13 @@ table.cards td {
 
 .status-file {
   flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.region-info {
+  flex: 0 1 auto;
+  color: var(--accent);
   overflow: hidden;
   text-overflow: ellipsis;
 }

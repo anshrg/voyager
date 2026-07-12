@@ -10,7 +10,36 @@
 //!   shortest exact f64 formatting, so values round-trip bit-identically.
 //! - Properties only when set: color, width, dash, text, point.
 
-use super::{Frame, Props, Region, Shape};
+use super::{Frame, PixelRegion, Props, Region, Shape};
+use crate::wcs::Wcs;
+
+/// Serialize pixel-space regions (as edited/created in the viewer) to a DS9
+/// .reg string in the requested frame. `frame` = "image" (1-based pixels,
+/// exact) or "sky" (icrs; needs the HDU's WCS). Per-region conversion
+/// failures become warnings and the region is skipped.
+pub fn write_pixel_regions(
+    regions: &[PixelRegion],
+    frame: &str,
+    wcs: Option<&Wcs>,
+) -> Result<(String, Vec<String>), String> {
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    for (i, pr) in regions.iter().enumerate() {
+        let region = match frame {
+            "image" => Ok(pr.to_image_region()),
+            "sky" => match wcs {
+                Some(w) => pr.to_sky_region(w),
+                None => Err("this HDU has no supported WCS (TAN); save in image frame".to_string()),
+            },
+            other => return Err(format!("unknown region frame: {other}")),
+        };
+        match region {
+            Ok(r) => out.push(r),
+            Err(e) => warnings.push(format!("region {}: {e}", i + 1)),
+        }
+    }
+    Ok((write_ds9(&out), warnings))
+}
 
 pub fn write_ds9(regions: &[Region]) -> String {
     let mut out = String::from("# Region file format: DS9 version 4.1\n");

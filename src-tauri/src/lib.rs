@@ -1,5 +1,6 @@
 pub mod fits;
 pub mod regions;
+pub mod table;
 pub mod tiles;
 pub mod wcs;
 
@@ -18,6 +19,16 @@ struct AppState {
     /// Paths received (via file association or argv) before the frontend
     /// was ready to handle them.
     pending_opens: Mutex<Vec<String>>,
+    /// Last-built table sort/filter view (see `table_view`/`table_rows`).
+    table_view: Mutex<Option<TableView>>,
+}
+
+/// A cached table row-order permutation, keyed by the file+HDU it belongs to.
+/// `order` is `None` for the identity view (unsorted, unfiltered).
+struct TableView {
+    path: String,
+    hdu: usize,
+    order: Option<Vec<u64>>,
 }
 
 #[derive(Serialize)]
@@ -35,7 +46,7 @@ fn open_fits(path: String, state: State<'_, AppState>) -> Result<FileSummary, St
     let file = FitsFile::open(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
     let open_ms = t0.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "[ds10] open_fits {} — {} HDUs in {:.1} ms",
+        "[voyager] open_fits {} — {} HDUs in {:.1} ms",
         path,
         file.hdus.len(),
         open_ms
@@ -81,7 +92,7 @@ async fn get_tile(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     eprintln!(
-        "[ds10] tile L{level} ({tx},{ty}) {}x{} in {:.1} ms",
+        "[voyager] tile L{level} ({tx},{ty}) {}x{} in {:.1} ms",
         tile.w,
         tile.h,
         t0.elapsed().as_secs_f64() * 1e3
@@ -130,7 +141,7 @@ async fn get_scale_limits(
     .await
     .map_err(|e| e.to_string())??;
     eprintln!(
-        "[ds10] scale_limits {mode_label} = ({:.6}, {:.6}) in {:.1} ms",
+        "[voyager] scale_limits {mode_label} = ({:.6}, {:.6}) in {:.1} ms",
         limits.0,
         limits.1,
         t0.elapsed().as_secs_f64() * 1e3
@@ -205,6 +216,20 @@ fn resolve_coord(
     Ok(GotoResult { x, y, ra, dec })
 }
 
+/// The HDU's TAN WCS parameters for the frontend to run pix↔world locally
+/// (multi-frame WCS-lock, catalog overlay projection). None = no supported
+/// WCS on this HDU (the frontend then falls back to pixel-space behavior).
+#[tauri::command]
+fn get_wcs(
+    path: String,
+    hdu: usize,
+    state: State<'_, AppState>,
+) -> Result<Option<wcs::WcsParams>, String> {
+    let file = lookup(&state, &path)?;
+    let info = file.hdu(hdu).map_err(|e| e.to_string())?;
+    Ok(wcs::Wcs::from_header(&info.header).map(|w| w.params()))
+}
+
 #[derive(Serialize)]
 struct Histogram {
     lo: f64,
@@ -233,7 +258,7 @@ async fn get_histogram(
     .await
     .map_err(|e| e.to_string())??;
     eprintln!(
-        "[ds10] histogram {bins} bins in {:.1} ms",
+        "[voyager] histogram {bins} bins in {:.1} ms",
         t0.elapsed().as_secs_f64() * 1e3
     );
     Ok(hist)
@@ -270,7 +295,7 @@ fn load_region_file(
         }
     }
     eprintln!(
-        "[ds10] regions {} — {} loaded, {} warnings",
+        "[voyager] regions {} — {} loaded, {} warnings",
         region_path,
         out.len(),
         warnings.len()
@@ -284,24 +309,178 @@ struct RegionSaveResult {
     warnings: Vec<String>,
 }
 
-/// Re-write a .reg file in DS10's normalized DS9 dialect (decimal degrees,
-/// arcsec sizes, icrs for sky frames). Shapes the parser can't represent
-/// are dropped with a warning — the caller should surface those.
+/// Serialize the viewer's current (edited/created) pixel regions to a .reg
+/// file in the chosen frame. Unlike `save_region_file` this does not re-parse
+/// the source file — it writes the in-memory regions, so edits are preserved.
+/// Sky frame needs the HDU's WCS; per-region failures come back as warnings.
 #[tauri::command]
-fn save_region_file(region_path: String, out_path: String) -> Result<RegionSaveResult, String> {
-    let text = std::fs::read_to_string(&region_path)
-        .map_err(|e| format!("cannot read {region_path}: {e}"))?;
-    let parsed = regions::parse::parse(&text);
-    std::fs::write(&out_path, regions::write::write_ds9(&parsed.regions))
-        .map_err(|e| format!("cannot write {out_path}: {e}"))?;
+fn save_pixel_regions(
+    path: String,
+    hdu: usize,
+    regions: Vec<regions::PixelRegion>,
+    frame: String,
+    out_path: String,
+    state: State<'_, AppState>,
+) -> Result<RegionSaveResult, String> {
+    let file = lookup(&state, &path)?;
+    let info = file.hdu(hdu).map_err(|e| e.to_string())?;
+    let wcs = wcs::Wcs::from_header(&info.header);
+    let (text, warnings) =
+        regions::write::write_pixel_regions(&regions, &frame, wcs.as_ref())?;
+    std::fs::write(&out_path, text).map_err(|e| format!("cannot write {out_path}: {e}"))?;
+    let count = regions.len() - warnings.len();
     eprintln!(
-        "[ds10] regions saved {} → {} ({} regions, {} warnings)",
-        region_path,
+        "[voyager] regions saved (edited) → {} ({} in {} frame, {} warnings)",
         out_path,
-        parsed.regions.len(),
-        parsed.warnings.len()
+        count,
+        frame,
+        warnings.len()
     );
-    Ok(RegionSaveResult { count: parsed.regions.len(), warnings: parsed.warnings })
+    Ok(RegionSaveResult { count, warnings })
+}
+
+/// Column metadata for a table HDU (names, units, kinds, sortability).
+#[tauri::command]
+fn table_columns(
+    path: String,
+    hdu: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<table::Column>, String> {
+    let file = lookup(&state, &path)?;
+    let t = table::Table::open(&file, hdu)?;
+    Ok(t.columns)
+}
+
+#[derive(serde::Deserialize)]
+struct SortReq {
+    col: usize,
+    desc: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct FilterReq {
+    col: usize,
+    query: String,
+}
+
+#[derive(Serialize)]
+struct ViewResult {
+    /// Number of rows in the resulting view (post-filter).
+    nrows: u64,
+}
+
+/// Build (and cache) a sort/filter view over a table HDU. The row-order
+/// permutation is stored in app state; `table_rows` then reads windows of it.
+/// Runs off-thread since sorting/filtering a large catalog touches the mmap.
+#[tauri::command]
+async fn table_view(
+    path: String,
+    hdu: usize,
+    sort: Option<SortReq>,
+    filter: Option<FilterReq>,
+    state: State<'_, AppState>,
+) -> Result<ViewResult, String> {
+    let file = lookup(&state, &path)?;
+    let sort = sort.map(|s| table::SortSpec { col: s.col, desc: s.desc });
+    let filter = filter
+        .filter(|f| !f.query.trim().is_empty())
+        .map(|f| table::FilterSpec { col: f.col, query: f.query });
+
+    let path2 = path.clone();
+    let t0 = Instant::now();
+    let (order, nrows) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<(Option<Vec<u64>>, u64), String> {
+            let t = table::Table::open(&file, hdu)?;
+            let order = t.build_view(sort, filter);
+            let nrows = order.as_ref().map(|v| v.len() as u64).unwrap_or(t.nrows);
+            Ok((order, nrows))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[voyager] table_view hdu {hdu} → {nrows} rows in {:.1} ms",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+
+    *state.table_view.lock().unwrap() = Some(TableView { path: path2, hdu, order });
+    Ok(ViewResult { nrows })
+}
+
+#[derive(Serialize)]
+struct TablePage {
+    rows: Vec<Vec<table::Cell>>,
+}
+
+/// A window of table rows (`start`..start+count`) mapped through the cached
+/// view. If no matching view is cached, the identity order is used.
+#[tauri::command]
+fn table_rows(
+    path: String,
+    hdu: usize,
+    start: u64,
+    count: u64,
+    state: State<'_, AppState>,
+) -> Result<TablePage, String> {
+    let file = lookup(&state, &path)?;
+    let t = table::Table::open(&file, hdu)?;
+    let guard = state.table_view.lock().unwrap();
+    let view = guard.as_ref().filter(|v| v.path == path && v.hdu == hdu);
+    let order = view.and_then(|v| v.order.as_deref());
+    let rows = t.page(order, start, count);
+    Ok(TablePage { rows })
+}
+
+#[derive(Serialize)]
+struct ViewPos {
+    /// The native row's position in the currently cached sort/filter view, or
+    /// `None` if it isn't present there (e.g. filtered out).
+    pos: Option<u64>,
+}
+
+/// Map a native table row index to its position in the currently cached
+/// sort/filter view (see `table_view`), without disturbing that view. Lets
+/// the image→row reverse link scroll/highlight the right row while keeping
+/// the user's current sort/filter, instead of resetting to identity order.
+#[tauri::command]
+fn table_view_pos(
+    path: String,
+    hdu: usize,
+    native_row: u64,
+    state: State<'_, AppState>,
+) -> Result<ViewPos, String> {
+    let guard = state.table_view.lock().unwrap();
+    let view = guard.as_ref().filter(|v| v.path == path && v.hdu == hdu);
+    let pos = match view.map(|v| &v.order) {
+        None | Some(None) => Some(native_row), // no cached view, or cached identity view
+        Some(Some(order)) => order.iter().position(|&r| r == native_row).map(|p| p as u64),
+    };
+    Ok(ViewPos { pos })
+}
+
+/// Read whole numeric columns as f64 arrays (Null/non-numeric → NaN), in
+/// native row order. Used by the cross-file catalog overlay to bulk-project a
+/// catalog's RA/Dec columns onto an image frame. Off-thread: touches every row.
+#[tauri::command]
+async fn table_columns_f64(
+    path: String,
+    hdu: usize,
+    cols: Vec<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Vec<f64>>, String> {
+    let file = lookup(&state, &path)?;
+    let t0 = Instant::now();
+    let out = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<Vec<f64>>, String> {
+        let t = table::Table::open(&file, hdu)?;
+        Ok(cols.iter().map(|&c| t.column_f64(c)).collect())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[voyager] table_columns_f64 hdu {hdu} × {} cols in {:.1} ms",
+        out.len(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(out)
 }
 
 #[derive(Serialize)]
@@ -361,7 +540,7 @@ fn dispatch_open(app: &tauri::AppHandle, path: String) {
     // The frontend drains the queue exactly once and dedupes.
     let state = app.state::<AppState>();
     state.pending_opens.lock().unwrap().push(path.clone());
-    let _ = app.emit("ds10://open-request", path);
+    let _ = app.emit("voyager://open-request", path);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -377,9 +556,15 @@ pub fn run() {
             get_scale_limits,
             get_readout,
             resolve_coord,
+            get_wcs,
             get_histogram,
             load_region_file,
-            save_region_file,
+            save_pixel_regions,
+            table_columns,
+            table_view,
+            table_rows,
+            table_view_pos,
+            table_columns_f64,
             close_fits,
             take_pending_opens,
             list_open_files
