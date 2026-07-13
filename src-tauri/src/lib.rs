@@ -22,6 +22,11 @@ struct AppState {
     pending_opens: Mutex<Vec<String>>,
     /// Last-built table sort/filter view (see `table_view`/`table_rows`).
     table_view: Mutex<Option<TableView>>,
+    /// Materialized-column LRU (see `table::cache`): extracting a column is
+    /// a full-file scan on row-major FITS, so it must happen once per column,
+    /// not on every sort/filter change. Arc so `table_view`'s blocking task
+    /// can use it without borrowing app state.
+    col_cache: Arc<Mutex<table::cache::ColCache>>,
 }
 
 /// A cached table row-order permutation, keyed by the file+HDU it belongs to.
@@ -388,19 +393,45 @@ async fn table_view(
         .map(|f| table::FilterSpec { col: f.col, query: f.query });
 
     let path2 = path.clone();
+    let cache = state.col_cache.clone();
     let t0 = Instant::now();
-    let (order, nrows) =
-        tauri::async_runtime::spawn_blocking(move || -> Result<(Option<Vec<u64>>, u64), String> {
+    let (order, nrows, hits) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<(Option<Vec<u64>>, u64, String), String> {
             let t = table::Table::open(&file, hdu)?;
-            let order = t.build_view(sort, filter);
+            // Sort/filter keys come from the materialized-column cache; a
+            // miss pays the one-time full-column scan (outside the lock so
+            // concurrent views on other files aren't blocked behind it).
+            let mut hits: Vec<&str> = Vec::new();
+            let mut fetch = |col: usize, hits: &mut Vec<&str>| -> Arc<Vec<table::Cell>> {
+                let key = (path.clone(), hdu, col);
+                if let Some(cells) = cache.lock().unwrap().get(&key) {
+                    hits.push("hit");
+                    return cells;
+                }
+                hits.push("miss");
+                let cells = Arc::new(t.extract_column(col));
+                cache.lock().unwrap().insert(key, cells.clone());
+                cells
+            };
+            let sort_cells = sort.map(|s| fetch(s.col, &mut hits));
+            let filter_cells = filter.as_ref().map(|f| fetch(f.col, &mut hits));
+            let order = table::build_view_from(
+                sort,
+                filter,
+                &t.columns,
+                sort_cells.as_deref().map(|v| v.as_slice()),
+                filter_cells.as_deref().map(|v| v.as_slice()),
+                t.nrows,
+            );
             let nrows = order.as_ref().map(|v| v.len() as u64).unwrap_or(t.nrows);
-            Ok((order, nrows))
+            Ok((order, nrows, hits.join("+")))
         })
         .await
         .map_err(|e| e.to_string())??;
     eprintln!(
-        "[voyager] table_view hdu {hdu} → {nrows} rows in {:.1} ms",
-        t0.elapsed().as_secs_f64() * 1e3
+        "[voyager] table_view hdu {hdu} → {nrows} rows in {:.1} ms (cols: {})",
+        t0.elapsed().as_secs_f64() * 1e3,
+        if hits.is_empty() { "none" } else { &hits },
     );
 
     *state.table_view.lock().unwrap() = Some(TableView { path: path2, hdu, order });
@@ -513,6 +544,7 @@ fn get_header(path: String, hdu: usize, state: State<'_, AppState>) -> Result<Ve
 #[tauri::command]
 fn close_fits(path: String, state: State<'_, AppState>) {
     state.files.lock().unwrap().remove(&path);
+    state.col_cache.lock().unwrap().purge_path(&path);
 }
 
 /// Frontend calls this once on startup to collect files that arrived via

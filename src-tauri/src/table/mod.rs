@@ -11,6 +11,8 @@
 //! - Correctness is gated on fixtures: `scripts/gen_fixtures.py` writes the
 //!   table + expected column/cell/sort JSON, `tests/table_fixtures.rs` checks.
 
+pub mod cache;
+
 use crate::fits::{FitsFile, HduKind};
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -332,56 +334,87 @@ impl<'f> Table<'f> {
         out
     }
 
-    /// Build a row-index view for the given sort/filter. Returns `None` for
-    /// the identity view (no sort, no filter) so huge tables pay nothing.
+    /// One whole column materialized as cells, in native row order. This is
+    /// the "full-file scan" read (row-major layout — see cache.rs); callers
+    /// cache the result so it happens once per column, not per view change.
+    pub fn extract_column(&self, col: usize) -> Vec<Cell> {
+        (0..self.nrows).map(|r| self.cell(col, r)).collect()
+    }
+
+    /// Build a row-index view for the given sort/filter, reading cells
+    /// straight from the mmap. Thin wrapper over `build_view_from` (the
+    /// cached-column path) so the astropy fixtures gate both identically.
     pub fn build_view(
         &self,
         sort: Option<SortSpec>,
         filter: Option<FilterSpec>,
     ) -> Option<Vec<u64>> {
-        if sort.is_none() && filter.is_none() {
-            return None;
-        }
-
-        // Start from the filtered set (or all rows).
-        let mut idx: Vec<u64> = match &filter {
-            Some(f) => {
-                let pred = Predicate::parse(f, self.columns.get(f.col).map(|c| c.kind));
-                (0..self.nrows)
-                    .filter(|&r| pred.matches(&self.cell(f.col, r)))
-                    .collect()
-            }
-            None => (0..self.nrows).collect(),
-        };
-
-        if let Some(s) = sort {
-            let numeric = matches!(
-                self.columns.get(s.col).map(|c| c.kind),
-                Some(ColKind::Int) | Some(ColKind::Float) | Some(ColKind::Logical)
-            );
-            if numeric {
-                let mut keyed: Vec<(f64, u64)> =
-                    idx.iter().map(|&r| (self.cell(s.col, r).as_f64(), r)).collect();
-                keyed.sort_by(|a, b| cmp_f64_nan_last(a.0, b.0).then(a.1.cmp(&b.1)));
-                if s.desc {
-                    keyed.reverse();
-                }
-                idx = keyed.into_iter().map(|(_, r)| r).collect();
-            } else {
-                let mut keyed: Vec<(String, u64)> = idx
-                    .iter()
-                    .map(|&r| (self.cell(s.col, r).as_display(), r))
-                    .collect();
-                keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-                if s.desc {
-                    keyed.reverse();
-                }
-                idx = keyed.into_iter().map(|(_, r)| r).collect();
-            }
-        }
-
-        Some(idx)
+        let sort_cells = sort.map(|s| self.extract_column(s.col));
+        let filter_cells = filter.as_ref().map(|f| self.extract_column(f.col));
+        build_view_from(
+            sort,
+            filter,
+            &self.columns,
+            sort_cells.as_deref(),
+            filter_cells.as_deref(),
+            self.nrows,
+        )
     }
+}
+
+/// Build a row-index view from already-materialized sort/filter columns
+/// (`sort_cells`/`filter_cells` must be full native-order columns when the
+/// corresponding spec is present). Returns `None` for the identity view
+/// (no sort, no filter) so huge tables pay nothing.
+pub fn build_view_from(
+    sort: Option<SortSpec>,
+    filter: Option<FilterSpec>,
+    columns: &[Column],
+    sort_cells: Option<&[Cell]>,
+    filter_cells: Option<&[Cell]>,
+    nrows: u64,
+) -> Option<Vec<u64>> {
+    if sort.is_none() && filter.is_none() {
+        return None;
+    }
+    let null = Cell::Null;
+    // Start from the filtered set (or all rows).
+    let mut idx: Vec<u64> = match (&filter, filter_cells) {
+        (Some(f), Some(cells)) => {
+            let pred = Predicate::parse(f, columns.get(f.col).map(|c| c.kind));
+            (0..nrows)
+                .filter(|&r| pred.matches(cells.get(r as usize).unwrap_or(&null)))
+                .collect()
+        }
+        _ => (0..nrows).collect(),
+    };
+
+    if let (Some(s), Some(cells)) = (sort, sort_cells) {
+        let cell_at = |r: u64| cells.get(r as usize).unwrap_or(&null);
+        let numeric = matches!(
+            columns.get(s.col).map(|c| c.kind),
+            Some(ColKind::Int) | Some(ColKind::Float) | Some(ColKind::Logical)
+        );
+        if numeric {
+            let mut keyed: Vec<(f64, u64)> =
+                idx.iter().map(|&r| (cell_at(r).as_f64(), r)).collect();
+            keyed.sort_by(|a, b| cmp_f64_nan_last(a.0, b.0).then(a.1.cmp(&b.1)));
+            if s.desc {
+                keyed.reverse();
+            }
+            idx = keyed.into_iter().map(|(_, r)| r).collect();
+        } else {
+            let mut keyed: Vec<(String, u64)> =
+                idx.iter().map(|&r| (cell_at(r).as_display(), r)).collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            if s.desc {
+                keyed.reverse();
+            }
+            idx = keyed.into_iter().map(|(_, r)| r).collect();
+        }
+    }
+
+    Some(idx)
 }
 
 /// Sort comparator putting NaN last regardless of direction (reversal of the

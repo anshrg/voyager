@@ -623,9 +623,27 @@ don't flake). **72 tests green** (was 65). A 1M×1M <2 s perf test is in
 `xmatch_fixtures.rs` behind `#[ignore]` — run
 `cargo test --release --test xmatch_fixtures -- --ignored`.
 
-**Not yet done** (build order in CROSSMATCH_PLAN.md): column cache +
-sort/filter speedup (step 1), FITS bintable writer (step 2), derived-table
-abstraction + IPC (step 4), match dialog + probe UI (step 5).
+**Also landed 2026-07-13: column cache (plan step 1, cache part).**
+`table::cache::ColCache` (pure, unit-tested): LRU of materialized columns
+(`Vec<Cell>`) keyed by (path, hdu, col), 512 MB default budget, byte
+accounting incl. string heap, `purge_path` on close. `Table::extract_column`
++ free fn `table::build_view_from` (operates on materialized cells);
+`Table::build_view` is now a thin wrapper over it so the astropy table
+fixtures gate both paths identically. `lib.rs`: `AppState.col_cache`
+(Arc<Mutex>), `table_view` fetches sort/filter columns through the cache
+(extraction outside the lock; log line now shows `cols: hit+miss`),
+`close_fits` purges. Effect: the full-file column scan happens **once per
+column** instead of on every sort/filter change — the fix for the user's
+1M-row/11 GB stress test. Cells (not compacted key arrays) are cached so
+sort/filter semantics are provably unchanged. **Still open in step 1** (perf
+polish, needs the user's Mac per the plan's benchmark section): madvise/
+chunked reads, parallel extraction, multi-column single-pass, typed-array
+compaction. 1M×1M xmatch perf test passed in this session's Linux container:
+**1.07 s** (target < 2 s), single-threaded release.
+
+**Not yet done** (build order in CROSSMATCH_PLAN.md): step-1 perf polish
+(above), FITS bintable writer (step 2), derived-table abstraction + IPC
+(step 4), match dialog + probe UI (step 5).
 
 **Push blocked (2026-07-13)**: commits for this milestone exist only locally
 on the feature branch — pushes 403 because the Claude GitHub App is not
