@@ -402,7 +402,7 @@ async fn table_view(
             // miss pays the one-time full-column scan (outside the lock so
             // concurrent views on other files aren't blocked behind it).
             let mut hits: Vec<&str> = Vec::new();
-            let mut fetch = |col: usize, hits: &mut Vec<&str>| -> Arc<Vec<table::Cell>> {
+            let fetch = |col: usize, hits: &mut Vec<&str>| -> Arc<Vec<table::Cell>> {
                 let key = (path.clone(), hdu, col);
                 if let Some(cells) = cache.lock().unwrap().get(&key) {
                     hits.push("hit");

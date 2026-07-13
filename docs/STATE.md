@@ -641,9 +641,24 @@ chunked reads, parallel extraction, multi-column single-pass, typed-array
 compaction. 1M×1M xmatch perf test passed in this session's Linux container:
 **1.07 s** (target < 2 s), single-threaded release.
 
+**Also landed 2026-07-13: BINTABLE writer (plan step 2).**
+`table::write` (child module of `table`, pure): `write_bintable` (empty
+primary + BINTABLE header + streamed rows + block padding; fixed-format
+cards with quote escaping) and `export_view(table, view, extname, path)` —
+exports a table's rows through a view permutation by **raw row-byte copy**,
+so exported cells are bit-identical to the source by construction (the same
+primitive a derived table will use: A-row bytes ++ B-row bytes ++ f64 sep).
+TTYPE/TFORM/TUNIT/TSCAL/TZERO carried over; ASCII-table sources error
+cleanly (BACKLOG, with TNULL/TDISP carry-over). `tests/table_write.rs`:
+identity / sorted+filtered / empty-view round-trips through our own reader,
+comparing every cell exactly. **astropy gate verified in-session** (same
+pattern as the region writer): `fits.verify('exception')` clean on all
+three exports, all columns bit-identical to the source, and the view export
+matches an independent numpy argsort+mask reproduction. **80 tests green.**
+
 **Not yet done** (build order in CROSSMATCH_PLAN.md): step-1 perf polish
-(above), FITS bintable writer (step 2), derived-table abstraction + IPC
-(step 4), match dialog + probe UI (step 5).
+(above), derived-table abstraction + IPC (step 4) — the next big piece —
+then match dialog + probe UI (step 5).
 
 **Push blocked (2026-07-13)**: commits for this milestone exist only locally
 on the feature branch — pushes 403 because the Claude GitHub App is not

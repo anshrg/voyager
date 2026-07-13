@@ -12,6 +12,7 @@
 //!   table + expected column/cell/sort JSON, `tests/table_fixtures.rs` checks.
 
 pub mod cache;
+pub mod write;
 
 use crate::fits::{FitsFile, HduKind};
 use serde::Serialize;

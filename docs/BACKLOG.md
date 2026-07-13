@@ -129,6 +129,12 @@ anything. Promote items into a milestone deliberately, not casually.
 
 ## From the crossmatch design discussion (2026-07-13, see docs/CROSSMATCH_PLAN.md)
 
+- **Table export gaps** (writer landed 2026-07-13): ASCII-table sources
+  (error cleanly today — re-encode as BINTABLE or copy as TABLE), TNULL/
+  TDISP card carry-over (the reader doesn't parse them either), CSV/VOTable
+  formats, and a header-provenance card (e.g. HISTORY "exported by Voyager,
+  view spec …").
+
 - **Match output modes beyond "Best"**: All-matches-within-radius, 1and2,
   1or2, 1not2, symmetric-best — all cheap follow-ups once the pair-list core
   exists (different consumers of the same `(row_a, row_b, sep)` pairs). v1
