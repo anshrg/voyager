@@ -592,6 +592,23 @@ tree, ready to review.
   :1420 | xargs kill` for stale vite, `pkill -f "tauri dev"; pkill -f
   "target/debug/voyager"`, don't pipe backgrounded output through tail.
 
+### Crossmatch milestone — design agreed 2026-07-13, not started
+
+The next big feature is **catalog crossmatching** (TOPCAT replacement). A
+design discussion with the user produced an agreed blueprint in
+**`docs/CROSSMATCH_PLAN.md`** — read it before starting implementation. Key
+decisions: fix large-table sort/filter first via a **columnar key cache**
+(NOT SQLite conversion; user stress-tested a 1M-row/11 GB catalog and the
+per-cell strided mmap scan in `build_view` is the bottleneck — benchmark the
+extraction path carefully on the user's Mac, see the plan's benchmark
+section); crossmatch core = kd-tree on unit vectors, fixture-gated on
+astropy `match_to_catalog_sky`; results become **derived tables** (pair
+list delegating `cell()` to parent FITS tables — no data copied); export via
+a new FITS bintable writer; v1 match mode is **"Best" only** (others are
+cheap follow-ups, see BACKLOG); plus a single-coordinate cone search box
+("goto for tables"). Work is on branch
+`claude/voyager-catalog-cross-matching-uzlr06`.
+
 ## Immediate next steps (in order)
 
 1. ~~Collect the user's results on the verification hand-off~~ **DONE
