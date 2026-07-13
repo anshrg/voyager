@@ -7,6 +7,7 @@ pub mod xmatch;
 
 use fits::FitsFile;
 use serde::Serialize;
+use table::RowSource;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,6 +28,92 @@ struct AppState {
     /// not on every sort/filter change. Arc so `table_view`'s blocking task
     /// can use it without borrowing app state.
     col_cache: Arc<Mutex<table::cache::ColCache>>,
+    /// Derived (crossmatch) tables, keyed by their synthetic
+    /// `voyager-derived://N` path. Parents are pinned by Arc so a derived
+    /// table keeps working even if its source file is closed.
+    derived: Mutex<HashMap<String, Arc<DerivedDef>>>,
+    derived_seq: std::sync::atomic::AtomicU64,
+}
+
+/// A crossmatch result: the two parent tables plus the join row list —
+/// ~24 bytes per matched row, never the data (cells are answered through the
+/// parents' mmaps by `table::join::Joined`).
+struct DerivedDef {
+    name: String,
+    left: (Arc<FitsFile>, usize),
+    right: (Arc<FitsFile>, usize),
+    rows: Vec<table::join::JoinRow>,
+}
+
+const DERIVED_SCHEME: &str = "voyager-derived://";
+
+/// Address a table by (path, hdu): a real FITS HDU, or a derived table by
+/// its synthetic path (hdu ignored). Send-able into blocking tasks.
+enum TableHandle {
+    Fits(Arc<FitsFile>, usize),
+    Derived(Arc<DerivedDef>),
+}
+
+impl TableHandle {
+    fn open(&self) -> Result<OpenTable<'_>, String> {
+        match self {
+            TableHandle::Fits(file, hdu) => Ok(OpenTable::Fits(table::Table::open(file, *hdu)?)),
+            TableHandle::Derived(d) => {
+                let left = table::Table::open(&d.left.0, d.left.1)?;
+                let right = table::Table::open(&d.right.0, d.right.1)?;
+                Ok(OpenTable::Joined(table::join::Joined::new(left, right, &d.rows)))
+            }
+        }
+    }
+}
+
+/// A live table view borrowing from its handle; commands use it uniformly
+/// through the `RowSource` trait.
+enum OpenTable<'h> {
+    Fits(table::Table<'h>),
+    Joined(table::join::Joined<'h, 'h, 'h>),
+}
+
+impl<'h> RowSource for OpenTable<'h> {
+    fn columns(&self) -> &[table::Column] {
+        match self {
+            OpenTable::Fits(t) => t.columns(),
+            OpenTable::Joined(j) => j.columns(),
+        }
+    }
+
+    fn nrows(&self) -> u64 {
+        match self {
+            OpenTable::Fits(t) => RowSource::nrows(t),
+            OpenTable::Joined(j) => RowSource::nrows(j),
+        }
+    }
+
+    fn cell(&self, col: usize, row: u64) -> table::Cell {
+        match self {
+            OpenTable::Fits(t) => RowSource::cell(t, col, row),
+            OpenTable::Joined(j) => RowSource::cell(j, col, row),
+        }
+    }
+}
+
+fn resolve_table(
+    state: &State<'_, AppState>,
+    path: &str,
+    hdu: usize,
+) -> Result<TableHandle, String> {
+    if path.starts_with(DERIVED_SCHEME) {
+        let d = state
+            .derived
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or("derived table not open")?;
+        Ok(TableHandle::Derived(d))
+    } else {
+        Ok(TableHandle::Fits(lookup(state, path)?, hdu))
+    }
 }
 
 /// A cached table row-order permutation, keyed by the file+HDU it belongs to.
@@ -346,15 +433,16 @@ fn save_pixel_regions(
 }
 
 /// Column metadata for a table HDU (names, units, kinds, sortability).
+/// Serves derived (crossmatch) tables too, like every table command.
 #[tauri::command]
 fn table_columns(
     path: String,
     hdu: usize,
     state: State<'_, AppState>,
 ) -> Result<Vec<table::Column>, String> {
-    let file = lookup(&state, &path)?;
-    let t = table::Table::open(&file, hdu)?;
-    Ok(t.columns)
+    let handle = resolve_table(&state, &path, hdu)?;
+    let t = handle.open()?;
+    Ok(t.columns().to_vec())
 }
 
 #[derive(serde::Deserialize)]
@@ -386,7 +474,7 @@ async fn table_view(
     filter: Option<FilterReq>,
     state: State<'_, AppState>,
 ) -> Result<ViewResult, String> {
-    let file = lookup(&state, &path)?;
+    let handle = resolve_table(&state, &path, hdu)?;
     let sort = sort.map(|s| table::SortSpec { col: s.col, desc: s.desc });
     let filter = filter
         .filter(|f| !f.query.trim().is_empty())
@@ -397,7 +485,7 @@ async fn table_view(
     let t0 = Instant::now();
     let (order, nrows, hits) =
         tauri::async_runtime::spawn_blocking(move || -> Result<(Option<Vec<u64>>, u64, String), String> {
-            let t = table::Table::open(&file, hdu)?;
+            let t = handle.open()?;
             // Sort/filter keys come from the materialized-column cache; a
             // miss pays the one-time full-column scan (outside the lock so
             // concurrent views on other files aren't blocked behind it).
@@ -418,12 +506,12 @@ async fn table_view(
             let order = table::build_view_from(
                 sort,
                 filter,
-                &t.columns,
+                t.columns(),
                 sort_cells.as_deref().map(|v| v.as_slice()),
                 filter_cells.as_deref().map(|v| v.as_slice()),
-                t.nrows,
+                t.nrows(),
             );
-            let nrows = order.as_ref().map(|v| v.len() as u64).unwrap_or(t.nrows);
+            let nrows = order.as_ref().map(|v| v.len() as u64).unwrap_or_else(|| t.nrows());
             Ok((order, nrows, hits.join("+")))
         })
         .await
@@ -453,8 +541,8 @@ fn table_rows(
     count: u64,
     state: State<'_, AppState>,
 ) -> Result<TablePage, String> {
-    let file = lookup(&state, &path)?;
-    let t = table::Table::open(&file, hdu)?;
+    let handle = resolve_table(&state, &path, hdu)?;
+    let t = handle.open()?;
     let guard = state.table_view.lock().unwrap();
     let view = guard.as_ref().filter(|v| v.path == path && v.hdu == hdu);
     let order = view.and_then(|v| v.order.as_deref());
@@ -499,10 +587,10 @@ async fn table_columns_f64(
     cols: Vec<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Vec<f64>>, String> {
-    let file = lookup(&state, &path)?;
+    let handle = resolve_table(&state, &path, hdu)?;
     let t0 = Instant::now();
     let out = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<Vec<f64>>, String> {
-        let t = table::Table::open(&file, hdu)?;
+        let t = handle.open()?;
         Ok(cols.iter().map(|&c| t.column_f64(c)).collect())
     })
     .await
@@ -516,6 +604,202 @@ async fn table_columns_f64(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct XmatchSummary {
+    /// Synthetic path addressing the result in every table command.
+    path: String,
+    name: String,
+    /// Rows in the result (matched pairs, plus unmatched A rows for all1).
+    nrows: u64,
+    matched: u64,
+    total_a: u64,
+    skipped_a: u64,
+    skipped_b: u64,
+    median_sep_arcsec: Option<f64>,
+    columns: Vec<table::Column>,
+}
+
+/// Crossmatch two open catalogs by sky position (issue #10 mode 1): Best
+/// match within `radius_arcsec`, joined as `1and2` (matched pairs only) or
+/// `all1` (every A row, unmatched right sides null). The result is a derived
+/// table addressed by the returned synthetic path; all table commands serve
+/// it. Off-thread: reads two whole position columns per side + builds the
+/// k-d tree.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn xmatch_tables(
+    path_a: String,
+    hdu_a: usize,
+    ra_col_a: usize,
+    dec_col_a: usize,
+    path_b: String,
+    hdu_b: usize,
+    ra_col_b: usize,
+    dec_col_b: usize,
+    radius_arcsec: f64,
+    join: String,
+    state: State<'_, AppState>,
+) -> Result<XmatchSummary, String> {
+    if path_a.starts_with(DERIVED_SCHEME) || path_b.starts_with(DERIVED_SCHEME) {
+        return Err("crossmatching a derived table isn't supported yet — export it first".into());
+    }
+    if !(radius_arcsec.is_finite() && radius_arcsec > 0.0) {
+        return Err("match radius must be a positive number of arcsec".into());
+    }
+    let all1 = match join.as_str() {
+        "1and2" => false,
+        "all1" => true,
+        other => return Err(format!("unknown join type {other:?} (use 1and2 or all1)")),
+    };
+    let file_a = lookup(&state, &path_a)?;
+    let file_b = lookup(&state, &path_b)?;
+    // Pin the parents for the DerivedDef (the closure consumes the others).
+    let (parent_a, parent_b) = (file_a.clone(), file_b.clone());
+    let cache = state.col_cache.clone();
+
+    let t0 = Instant::now();
+    let (rows, matched, total_a, skipped_a, skipped_b, median) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let ta = table::Table::open(&file_a, hdu_a)?;
+            let tb = table::Table::open(&file_b, hdu_b)?;
+            // Positions through the column cache: warm for later sorts and
+            // overlays, and re-runs with a different radius are instant.
+            let fetch = |t: &table::Table, path: &str, hdu: usize, col: usize| -> Vec<f64> {
+                let key = (path.to_string(), hdu, col);
+                let cells = match cache.lock().unwrap().get(&key) {
+                    Some(c) => c,
+                    None => {
+                        let c = Arc::new(t.extract_column(col));
+                        cache.lock().unwrap().insert(key, c.clone());
+                        c
+                    }
+                };
+                cells.iter().map(|c| c.as_f64()).collect()
+            };
+            let ra_a = fetch(&ta, &path_a, hdu_a, ra_col_a);
+            let dec_a = fetch(&ta, &path_a, hdu_a, dec_col_a);
+            let ra_b = fetch(&tb, &path_b, hdu_b, ra_col_b);
+            let dec_b = fetch(&tb, &path_b, hdu_b, dec_col_b);
+
+            let result = xmatch::crossmatch(
+                &ra_a,
+                &dec_a,
+                &ra_b,
+                &dec_b,
+                radius_arcsec / 3600.0,
+                xmatch::MatchMode::Best,
+            );
+            let matched = result.pairs.len() as u64;
+            let mut seps: Vec<f64> = result.pairs.iter().map(|p| p.sep_deg).collect();
+            seps.sort_by(f64::total_cmp);
+            let median = (!seps.is_empty()).then(|| seps[seps.len() / 2] * 3600.0);
+
+            let rows: Vec<table::join::JoinRow> = if all1 {
+                // Every A row in native order; Best gives ≤1 pair per A row.
+                let mut by_a: Vec<Option<(u64, f64)>> = vec![None; ta.nrows as usize];
+                for p in &result.pairs {
+                    by_a[p.a as usize] = Some((p.b, p.sep_deg));
+                }
+                (0..ta.nrows)
+                    .map(|a| match by_a[a as usize] {
+                        Some((b, s)) => table::join::JoinRow { a, b: Some(b), sep_deg: Some(s) },
+                        None => table::join::JoinRow { a, b: None, sep_deg: None },
+                    })
+                    .collect()
+            } else {
+                result
+                    .pairs
+                    .iter()
+                    .map(|p| table::join::JoinRow { a: p.a, b: Some(p.b), sep_deg: Some(p.sep_deg) })
+                    .collect()
+            };
+            Ok((rows, matched, ta.nrows, result.skipped_a as u64, result.skipped_b as u64, median))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let seq = state
+        .derived_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let path = format!("{DERIVED_SCHEME}{seq}");
+    let name = format!("XMATCH_{seq}");
+    let def = Arc::new(DerivedDef {
+        name: name.clone(),
+        left: (parent_a, hdu_a),
+        right: (parent_b, hdu_b),
+        rows,
+    });
+    let nrows = def.rows.len() as u64;
+    let columns = TableHandle::Derived(def.clone()).open()?.columns().to_vec();
+    state.derived.lock().unwrap().insert(path.clone(), def);
+    eprintln!(
+        "[voyager] xmatch {} rows ({} matched of {}) in {:.1} ms → {}",
+        nrows,
+        matched,
+        total_a,
+        t0.elapsed().as_secs_f64() * 1e3,
+        path
+    );
+    Ok(XmatchSummary {
+        path,
+        name,
+        nrows,
+        matched,
+        total_a,
+        skipped_a,
+        skipped_b,
+        median_sep_arcsec: median,
+        columns,
+    })
+}
+
+/// Export a table — real or derived, mapped through the currently cached
+/// sort/filter view when `use_view` — as a standalone FITS BINTABLE.
+#[tauri::command]
+async fn export_table(
+    path: String,
+    hdu: usize,
+    out_path: String,
+    use_view: bool,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    let handle = resolve_table(&state, &path, hdu)?;
+    let extname = match &handle {
+        TableHandle::Derived(d) => Some(d.name.clone()),
+        TableHandle::Fits(f, h) => f.hdu(*h).ok().and_then(|i| i.name.clone()),
+    };
+    let view: Option<Vec<u64>> = if use_view {
+        let guard = state.table_view.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|v| v.path == path && v.hdu == hdu)
+            .and_then(|v| v.order.clone())
+    } else {
+        None
+    };
+
+    let t0 = Instant::now();
+    let out2 = out_path.clone();
+    let written = tauri::async_runtime::spawn_blocking(move || -> Result<u64, String> {
+        let out = std::path::Path::new(&out_path);
+        match handle.open()? {
+            OpenTable::Fits(t) => table::write::export_view(&t, view.as_deref(), extname.as_deref(), out),
+            OpenTable::Joined(j) => j.export(view.as_deref(), extname.as_deref(), out),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[voyager] export_table → {} ({} rows in {:.1} ms)",
+        out2,
+        written,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(written)
+}
+
+#[derive(Serialize)]
 struct HeaderCard {
     key: String,
     value: Option<fits::Value>,
@@ -525,6 +809,9 @@ struct HeaderCard {
 
 #[tauri::command]
 fn get_header(path: String, hdu: usize, state: State<'_, AppState>) -> Result<Vec<HeaderCard>, String> {
+    if path.starts_with(DERIVED_SCHEME) {
+        return derived_header(&state, &path);
+    }
     let files = state.files.lock().unwrap();
     let file = files.get(&path).ok_or("file not open")?;
     let info = file.hdu(hdu).map_err(|e| e.to_string())?;
@@ -541,9 +828,54 @@ fn get_header(path: String, hdu: usize, state: State<'_, AppState>) -> Result<Ve
         .collect())
 }
 
+/// Synthesized header cards for a derived (crossmatch) table — the essential
+/// BINTABLE-shaped facts plus provenance, so the header tab shows something
+/// truthful rather than erroring.
+fn derived_header(state: &State<'_, AppState>, path: &str) -> Result<Vec<HeaderCard>, String> {
+    let handle = resolve_table(state, path, 0)?;
+    let TableHandle::Derived(def) = &handle else {
+        return Err("not a derived table".to_string());
+    };
+    let t = handle.open()?;
+    let mut cards: Vec<HeaderCard> = Vec::new();
+    let mut push = |key: &str, value: fits::Value, comment: &str| {
+        cards.push(HeaderCard {
+            key: key.to_string(),
+            value: Some(value),
+            comment: (!comment.is_empty()).then(|| comment.to_string()),
+            raw: String::new(),
+        });
+    };
+    use fits::Value as V;
+    push("XTENSION", V::Str("BINTABLE".into()), "derived (crossmatch) table");
+    push("EXTNAME", V::Str(def.name.clone()), "");
+    push("NAXIS2", V::Int(t.nrows() as i64), "number of rows");
+    push("TFIELDS", V::Int(t.columns().len() as i64), "");
+    push(
+        "XMATCHA",
+        V::Str(format!("{}[{}]", def.left.0.path.display(), def.left.1)),
+        "left input table",
+    );
+    push(
+        "XMATCHB",
+        V::Str(format!("{}[{}]", def.right.0.path.display(), def.right.1)),
+        "right input table",
+    );
+    for (i, c) in t.columns().iter().enumerate() {
+        let j = i + 1;
+        push(&format!("TTYPE{j}"), V::Str(c.name.clone()), "");
+        push(&format!("TFORM{j}"), V::Str(c.tform.clone()), "");
+        if let Some(u) = &c.unit {
+            push(&format!("TUNIT{j}"), V::Str(u.clone()), "");
+        }
+    }
+    Ok(cards)
+}
+
 #[tauri::command]
 fn close_fits(path: String, state: State<'_, AppState>) {
     state.files.lock().unwrap().remove(&path);
+    state.derived.lock().unwrap().remove(&path);
     state.col_cache.lock().unwrap().purge_path(&path);
 }
 
@@ -598,6 +930,8 @@ pub fn run() {
             table_rows,
             table_view_pos,
             table_columns_f64,
+            xmatch_tables,
+            export_table,
             close_fits,
             take_pending_opens,
             list_open_files

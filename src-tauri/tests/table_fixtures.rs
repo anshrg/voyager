@@ -5,7 +5,7 @@
 //!   scripts/venv/bin/python scripts/gen_fixtures.py
 
 use voyager_lib::fits::FitsFile;
-use voyager_lib::table::{Cell, FilterSpec, SortSpec, Table};
+use voyager_lib::table::{Cell, FilterSpec, RowSource, SortSpec, Table};
 use serde_json::Value as Json;
 use std::path::PathBuf;
 

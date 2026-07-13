@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use voyager_lib::fits::FitsFile;
-use voyager_lib::table::{write::export_view, FilterSpec, SortSpec, Table};
+use voyager_lib::table::{write::export_view, FilterSpec, RowSource, SortSpec, Table};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("fixtures")

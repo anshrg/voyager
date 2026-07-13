@@ -12,6 +12,7 @@
 //!   table + expected column/cell/sort JSON, `tests/table_fixtures.rs` checks.
 
 pub mod cache;
+pub mod join;
 pub mod write;
 
 use crate::fits::{FitsFile, HduKind};
@@ -33,7 +34,7 @@ pub enum Cell {
 
 impl Cell {
     /// Numeric key for sorting/filtering; non-numeric → NaN (sorts last).
-    fn as_f64(&self) -> f64 {
+    pub fn as_f64(&self) -> f64 {
         match self {
             Cell::Int(v) => *v as f64,
             Cell::Float(v) => *v,
@@ -224,13 +225,7 @@ impl<'f> Table<'f> {
             } else {
                 let (repeat, elem) = parse_bin_tform(&tform)
                     .ok_or_else(|| format!("column {j}: bad TFORM {tform:?}"))?;
-                let field_bytes = match elem {
-                    // X is a bit array: repeat bits packed into ceil/8 bytes.
-                    Elem::Opaque(_) if tform.to_ascii_uppercase().contains('X') => {
-                        repeat.div_ceil(8)
-                    }
-                    _ => repeat * elem.bytes(),
-                };
+                let field_bytes = bin_field_bytes(&tform, elem, repeat);
                 let offset = bin_offset;
                 bin_offset += field_bytes;
                 let is_text = elem == Elem::Char;
@@ -301,17 +296,23 @@ impl<'f> Table<'f> {
         }
     }
 
-    /// Every row of one column as f64 (Null/non-numeric → NaN), in native row
-    /// order. Used to bulk-project a catalog's RA/Dec onto an image frame
-    /// (cross-file source overlay) without boxing every column through JSON.
-    pub fn column_f64(&self, col: usize) -> Vec<f64> {
-        (0..self.nrows).map(|r| self.cell(col, r).as_f64()).collect()
-    }
+}
+
+/// Anything that can serve table cells: a FITS-backed [`Table`] or a derived
+/// (joined) table. Paging, column extraction, and view building are provided
+/// on top of `cell()`, so every consumer (IPC commands, export, crossmatch)
+/// works identically for both.
+pub trait RowSource {
+    fn columns(&self) -> &[Column];
+    fn nrows(&self) -> u64;
+    /// One cell (bounds-checked; out-of-range → `Cell::Null`).
+    fn cell(&self, col: usize, row: u64) -> Cell;
 
     /// A window of rows (`start`..start+count`) as cell rows, mapped through
     /// `view` (a row-index permutation) when present.
-    pub fn page(&self, view: Option<&[u64]>, start: u64, count: u64) -> Vec<Vec<Cell>> {
-        let ncol = self.columns.len();
+    fn page(&self, view: Option<&[u64]>, start: u64, count: u64) -> Vec<Vec<Cell>> {
+        let ncol = self.columns().len();
+        let nrows = self.nrows();
         let mut out = Vec::new();
         for i in start..start.saturating_add(count) {
             let row = match view {
@@ -320,7 +321,7 @@ impl<'f> Table<'f> {
                     None => break,
                 },
                 None => {
-                    if i >= self.nrows {
+                    if i >= nrows {
                         break;
                     }
                     i
@@ -335,31 +336,49 @@ impl<'f> Table<'f> {
         out
     }
 
-    /// One whole column materialized as cells, in native row order. This is
-    /// the "full-file scan" read (row-major layout — see cache.rs); callers
-    /// cache the result so it happens once per column, not per view change.
-    pub fn extract_column(&self, col: usize) -> Vec<Cell> {
-        (0..self.nrows).map(|r| self.cell(col, r)).collect()
+    /// One whole column materialized as cells, in native row order. For a
+    /// FITS table this is the "full-file scan" read (row-major layout — see
+    /// cache.rs); callers cache the result so it happens once per column,
+    /// not per view change.
+    fn extract_column(&self, col: usize) -> Vec<Cell> {
+        (0..self.nrows()).map(|r| self.cell(col, r)).collect()
+    }
+
+    /// Every row of one column as f64 (Null/non-numeric → NaN), in native row
+    /// order. Used to bulk-project a catalog's RA/Dec onto an image frame and
+    /// to feed crossmatch positions, without boxing every column through JSON.
+    fn column_f64(&self, col: usize) -> Vec<f64> {
+        (0..self.nrows()).map(|r| self.cell(col, r).as_f64()).collect()
     }
 
     /// Build a row-index view for the given sort/filter, reading cells
-    /// straight from the mmap. Thin wrapper over `build_view_from` (the
+    /// straight from the source. Thin wrapper over `build_view_from` (the
     /// cached-column path) so the astropy fixtures gate both identically.
-    pub fn build_view(
-        &self,
-        sort: Option<SortSpec>,
-        filter: Option<FilterSpec>,
-    ) -> Option<Vec<u64>> {
+    fn build_view(&self, sort: Option<SortSpec>, filter: Option<FilterSpec>) -> Option<Vec<u64>> {
         let sort_cells = sort.map(|s| self.extract_column(s.col));
         let filter_cells = filter.as_ref().map(|f| self.extract_column(f.col));
         build_view_from(
             sort,
             filter,
-            &self.columns,
+            self.columns(),
             sort_cells.as_deref(),
             filter_cells.as_deref(),
-            self.nrows,
+            self.nrows(),
         )
+    }
+}
+
+impl<'f> RowSource for Table<'f> {
+    fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    fn nrows(&self) -> u64 {
+        self.nrows
+    }
+
+    fn cell(&self, col: usize, row: u64) -> Cell {
+        Table::cell(self, col, row)
     }
 }
 
@@ -577,6 +596,15 @@ fn read_ascii(bytes: &[u8], start: usize, width: usize, fmt: AsciiFmt, scale: f6
             Ok(v) => scaled_float(v, scale, zero),
             Err(_) => Cell::Null,
         },
+    }
+}
+
+/// Bytes a BINTABLE field occupies in the row.
+fn bin_field_bytes(tform: &str, elem: Elem, repeat: usize) -> usize {
+    match elem {
+        // X is a bit array: repeat bits packed into ceil/8 bytes.
+        Elem::Opaque(_) if tform.to_ascii_uppercase().contains('X') => repeat.div_ceil(8),
+        _ => repeat * elem.bytes(),
     }
 }
 

@@ -656,9 +656,42 @@ pattern as the region writer): `fits.verify('exception')` clean on all
 three exports, all columns bit-identical to the source, and the view export
 matches an independent numpy argsort+mask reproduction. **80 tests green.**
 
-**Not yet done** (build order in CROSSMATCH_PLAN.md): step-1 perf polish
-(above), derived-table abstraction + IPC (step 4) — the next big piece —
-then match dialog + probe UI (step 5).
+**Also landed 2026-07-13: derived tables + xmatch IPC (plan step 4).**
+- `table::RowSource` trait (columns/nrows/cell required; page/extract_column/
+  column_f64/build_view provided) — every table consumer now works for both
+  FITS-backed and derived tables. `Table` implements it; inherent
+  page/extract/build_view moved into the trait (callers import `RowSource`).
+- `table::join` (pure): `JoinRow { a, b: Option, sep_deg: Option }` +
+  `Joined::new(left, right, &rows)` — merged columns (case-insensitive name
+  collisions suffixed `_1`/`_2`), appended `Separation` column (arcsec),
+  cells delegate to parent mmaps (~24 B/row materialized, design decision
+  #1 holds for 1M×1M joins). `Joined::export` streams raw A-row ++ B-row ++
+  f64 separation bytes; unmatched right sides = null template (NaN floats,
+  zero ints, blank strings — no TNULL yet, BACKLOG).
+- `lib.rs`: `DerivedDef` in `AppState.derived` keyed by synthetic
+  `voyager-derived://N` paths; parents pinned by Arc (derived table survives
+  closing its source file). `resolve_table` + `TableHandle`/`OpenTable`
+  (impls RowSource) route **all** table commands (columns/view/rows/
+  view_pos/columns_f64) for both kinds. `get_header` synthesizes BINTABLE-
+  shaped cards + XMATCHA/XMATCHB provenance for derived paths. New commands:
+  **`xmatch_tables`** (Best match within radius; join `1and2` | `all1`;
+  positions fetched through the column cache so re-runs and later sorts are
+  warm; returns summary incl. median sep + columns) and **`export_table`**
+  (real or derived, honors the current sort/filter view).
+- Tests: `tests/join_fixtures.rs` (self-match via the real kd-tree path,
+  cell routing, null right sides, sort-by-Separation, export round-trip
+  through our reader with a reversing view). **astropy gate verified
+  in-session**: `verify('exception')` clean on the joined export, suffixed
+  names + arcsec unit + NaN nulls + reversed view all confirmed. **86 tests
+  green**, tsc clean (no frontend changes yet).
+
+**Not yet done** (build order in CROSSMATCH_PLAN.md): step-1 perf polish,
+**step 5 UI**: api.ts wrappers for xmatch_tables/export_table, frame
+creation for `voyager-derived://` paths (needs a synthetic HduInfo or a
+table-only frame mode in main.ts), the Match… dialog (table pickers,
+position-column pickers seeded from heuristics/posOverride, radius, join),
+Export… button, and the single-coordinate probe box. Crossmatching a
+derived table directly is rejected (export first) — BACKLOG.
 
 **Push blocked (2026-07-13)**: commits for this milestone exist only locally
 on the feature branch — pushes 403 because the Claude GitHub App is not
