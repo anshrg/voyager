@@ -309,6 +309,21 @@ fn resolve_coord(
     Ok(GotoResult { x, y, ra, dec })
 }
 
+#[derive(Serialize)]
+struct ParsedCoord {
+    ra: f64,
+    dec: f64,
+}
+
+/// Parse a coordinate string (sexagesimal or decimal degrees) without
+/// touching any WCS — the table probe box works on catalogs that have no
+/// image, where `resolve_coord`'s pixel mapping is impossible.
+#[tauri::command]
+fn parse_coord(query: String) -> Result<ParsedCoord, String> {
+    let (ra, dec) = wcs::coords::parse_coord(&query)?;
+    Ok(ParsedCoord { ra, dec })
+}
+
 /// The HDU's TAN WCS parameters for the frontend to run pix↔world locally
 /// (multi-frame WCS-lock, catalog overlay projection). None = no supported
 /// WCS on this HDU (the frontend then falls back to pixel-space behavior).
@@ -932,6 +947,7 @@ pub fn run() {
             table_columns_f64,
             xmatch_tables,
             export_table,
+            parse_coord,
             close_fits,
             take_pending_opens,
             list_open_files

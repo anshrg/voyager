@@ -685,13 +685,61 @@ matches an independent numpy argsort+mask reproduction. **80 tests green.**
   names + arcsec unit + NaN nulls + reversed view all confirmed. **86 tests
   green**, tsc clean (no frontend changes yet).
 
-**Not yet done** (build order in CROSSMATCH_PLAN.md): step-1 perf polish,
-**step 5 UI**: api.ts wrappers for xmatch_tables/export_table, frame
-creation for `voyager-derived://` paths (needs a synthetic HduInfo or a
-table-only frame mode in main.ts), the Match… dialog (table pickers,
-position-column pickers seeded from heuristics/posOverride, radius, join),
-Export… button, and the single-coordinate probe box. Crossmatching a
-derived table directly is rejected (export first) — BACKLOG.
+**Also landed 2026-07-13: crossmatch UI (plan step 5) — NOT yet user-verified.**
+Frontend only (`main.ts`/`api.ts`/`styles.css`), tsc clean:
+- **Match… button** (table tab) opens a floating panel (`#match-panel`,
+  fixed top-right): Table A = active frame's table (label), Table B = any
+  open frame with a table (self-match allowed), RA/Dec column selects per
+  side (numeric columns only, pre-seeded from `posOverride` or the name
+  heuristics), radius (arcsec, default 1), join select (matched pairs only /
+  all rows from A), Run. On success the panel closes, the result opens as a
+  **new frame** and the readout shows "matched N of M (median sep …″)".
+- **Derived frames**: `openDerivedFrame` builds a synthetic single-HDU
+  `FileSummary` for the `voyager-derived://N` path (`addFrame` extracted
+  from `openPath` for reuse); `derivedNames` map + `displayName()` give
+  chips/labels/status the match name (XMATCH_N); status line shows
+  "crossmatch result — N rows (in memory; Export… to save)". Everything
+  else (table view, sort/filter, header tab, overlay, close) rides the
+  existing frame machinery against the backend's derived path support.
+- **Export… button** (table tab): save panel (`pickFitsSavePath`) →
+  `export_table` with the current sort/filter view; works for real and
+  derived tables.
+- **Probe box + radius** (table tab, "Find coord…", default 5″): backend
+  `parse_coord` (new command — coordinate parsing without a WCS, so it
+  works on image-less catalogs) + `table_columns_f64` + a frontend linear
+  cone scan (single query needs no index); reveals the nearest row
+  (respecting sort/filter via revealRow), drops the goto crosshair when the
+  frame shows an image with WCS, readout shows count + nearest separation.
+- **Heuristics learned `_1`/`_2`**: `heurName()` strips crossmatch suffixes
+  so RA_1/DEC_1 auto-detect in joined tables (locate/overlay/probe/match).
+
+### Manual verification checklist for the user (crossmatch milestone)
+
+Run with two overlapping catalogs (e.g. cross_catalog.fits + a second
+catalog or a self-match), plus an image frame for overlay checks:
+1. Open a catalog → Table tab → **Match…** — panel appears, RA/Dec selects
+   pre-filled sensibly for both tables; radius 1″.
+2. **Run match** — new frame chip named XMATCH_1 appears and activates; its
+   table shows `*_1`, `*_2`, and `Separation` columns; readout shows
+   matched count + median sep (sanity-check both against TOPCAT).
+3. Sort the result by Separation (click header) and filter it — both work.
+4. **Export…** the result → open the written file in TOPCAT/astropy —
+   columns + values correct, Separation in arcsec.
+5. On the XMATCH frame: **Overlay ▸ image** onto an open image frame —
+   markers land (RA_1/DEC_1 auto-detected); click a marker → row reveals.
+6. Probe box: type a coordinate inside the field (sexagesimal + decimal
+   both) with radius ~5″ — nearest row highlights; on a frame showing an
+   image, the crosshair drops at the probed spot. A far-away coordinate
+   reports "no rows within …″".
+7. `all rows from A` join: unmatched rows show blank right-side cells and
+   blank Separation; sort by Separation puts them last.
+8. Close the source catalog frame, then keep using the XMATCH frame
+   (parents are pinned) — table still scrolls/sorts.
+
+**Remaining after verification** (build order in CROSSMATCH_PLAN.md):
+step-1 perf polish (madvise/parallel/multi-column extraction — benchmark on
+the Mac first), then BACKLOG follow-ups (other match modes, xmatch-of-xmatch
+via export, TNULL/TDISP, CSV/VOTable export, probe-by-image-click).
 
 **Push blocked (2026-07-13)**: commits for this milestone exist only locally
 on the feature branch — pushes 403 because the Claude GitHub App is not

@@ -326,6 +326,67 @@ export function tableColumnsF64(
   return invoke<number[][]>("table_columns_f64", { path, hdu, cols });
 }
 
+// ---- crossmatch (M5+) ------------------------------------------------------
+
+/** Result of `xmatchTables`: the derived table's synthetic path (usable with
+ *  every table API), its display name, and match statistics. */
+export interface XmatchSummary {
+  path: string;
+  name: string;
+  /** Result row count (matched pairs, plus unmatched A rows for "all1"). */
+  nrows: number;
+  matched: number;
+  totalA: number;
+  skippedA: number;
+  skippedB: number;
+  medianSepArcsec: number | null;
+  columns: TableColumn[];
+}
+
+/** Crossmatch two open catalogs by sky position: Best match within
+ *  `radiusArcsec`, joined as "1and2" (matched pairs only) or "all1" (every
+ *  A row, unmatched right sides null). The result is a derived in-memory
+ *  table served by all the table_* commands under the returned path. */
+export function xmatchTables(args: {
+  pathA: string;
+  hduA: number;
+  raColA: number;
+  decColA: number;
+  pathB: string;
+  hduB: number;
+  raColB: number;
+  decColB: number;
+  radiusArcsec: number;
+  join: "1and2" | "all1";
+}): Promise<XmatchSummary> {
+  return invoke<XmatchSummary>("xmatch_tables", { ...args });
+}
+
+/** Export a table — real or derived, through the current sort/filter view
+ *  when `useView` — as a standalone FITS BINTABLE. Returns rows written. */
+export function exportTable(
+  path: string,
+  hdu: number,
+  outPath: string,
+  useView: boolean,
+): Promise<number> {
+  return invoke<number>("export_table", { path, hdu, outPath, useView });
+}
+
+/** Parse a coordinate string (sexagesimal or decimal degrees) into RA/Dec,
+ *  with no WCS involved — for the table probe box on image-less catalogs. */
+export function parseCoord(query: string): Promise<{ ra: number; dec: number }> {
+  return invoke<{ ra: number; dec: number }>("parse_coord", { query });
+}
+
+export async function pickFitsSavePath(defaultPath?: string): Promise<string | null> {
+  const selected = await saveDialog({
+    defaultPath,
+    filters: [{ name: "FITS", extensions: ["fits"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
 export function takePendingOpens(): Promise<string[]> {
   return invoke<string[]>("take_pending_opens");
 }
