@@ -592,22 +592,45 @@ tree, ready to review.
   :1420 | xargs kill` for stale vite, `pkill -f "tauri dev"; pkill -f
   "target/debug/voyager"`, don't pipe backgrounded output through tail.
 
-### Crossmatch milestone — design agreed 2026-07-13, not started
+### Crossmatch milestone — design agreed 2026-07-13, core landed (this session)
 
-The next big feature is **catalog crossmatching** (TOPCAT replacement). A
-design discussion with the user produced an agreed blueprint in
-**`docs/CROSSMATCH_PLAN.md`** — read it before starting implementation. Key
-decisions: fix large-table sort/filter first via a **columnar key cache**
-(NOT SQLite conversion; user stress-tested a 1M-row/11 GB catalog and the
-per-cell strided mmap scan in `build_view` is the bottleneck — benchmark the
-extraction path carefully on the user's Mac, see the plan's benchmark
-section); crossmatch core = kd-tree on unit vectors, fixture-gated on
-astropy `match_to_catalog_sky`; results become **derived tables** (pair
-list delegating `cell()` to parent FITS tables — no data copied); export via
-a new FITS bintable writer; v1 match mode is **"Best" only** (others are
-cheap follow-ups, see BACKLOG); plus a single-coordinate cone search box
-("goto for tables"). Work is on branch
+The next big feature is **catalog crossmatching** (TOPCAT replacement),
+specced by the repo owner in **issue #10** and reconciled with the user
+discussion in **`docs/CROSSMATCH_PLAN.md`** — read both before continuing.
+Key decisions: fix large-table sort/filter first via a **columnar key
+cache** (NOT SQLite conversion; user stress-tested a 1M-row/11 GB catalog
+and the per-cell strided mmap scan in `build_view` is the bottleneck —
+benchmark the extraction path on the user's Mac per the plan's benchmark
+section); results become **derived tables** (pair list delegating `cell()`
+to parent FITS tables — no data copied); export via a new FITS bintable
+writer; v1 = **Best match** with `1 and 2` + `all from 1` joins; plus a
+single-coordinate cone-search box ("goto for tables"). Work is on branch
 `claude/voyager-catalog-cross-matching-uzlr06`.
+
+**Landed 2026-07-13 (this session): `src-tauri/src/xmatch/` core.** Pure
+module (no Tauri types): hand-rolled 3-D k-d tree over unit vectors
+(`SkyIndex::build/nearest_within/within`), chord-radius queries (inclusive
+`sep <= r`, matching `search_around_sky`), `crossmatch(ra_a, dec_a, ra_b,
+dec_b, radius_deg, MatchMode::Best|All)` returning `(a, b, sep_deg)` pairs +
+skipped-NaN counts per side. Best ties break to the lowest B row. Fixtures:
+`scripts/gen_xmatch_fixtures.py` (new; needs scipy in the venv) writes
+`fixtures/xmatch_expected.json` from astropy `match_to_catalog_sky` +
+`search_around_sky` over 6 scenarios (random field, RA wrap, pole,
+exact-radius boundary ±1e-6″, duplicate positions incl. sep-0, NaN rows);
+`tests/xmatch_fixtures.rs` compares pair sets exactly + separations to 1 µas
+(best-pair B compared by *coordinates* so duplicate-position nearest ties
+don't flake). **72 tests green** (was 65). A 1M×1M <2 s perf test is in
+`xmatch_fixtures.rs` behind `#[ignore]` — run
+`cargo test --release --test xmatch_fixtures -- --ignored`.
+
+**Not yet done** (build order in CROSSMATCH_PLAN.md): column cache +
+sort/filter speedup (step 1), FITS bintable writer (step 2), derived-table
+abstraction + IPC (step 4), match dialog + probe UI (step 5).
+
+**Push blocked (2026-07-13)**: commits for this milestone exist only locally
+on the feature branch — pushes 403 because the Claude GitHub App is not
+installed on `anshrg/voyager` (the user has write permission; the owner was
+asked to install the app at github.com/apps/claude). Push as soon as it works.
 
 ## Immediate next steps (in order)
 

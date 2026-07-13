@@ -1,10 +1,36 @@
 # Crossmatch + large-table foundation — agreed design (2026-07-13)
 
-Outcome of a design discussion with the user (no code yet). This is the
-blueprint for the next milestone of work: TOPCAT-replacement catalog
-crossmatching, gated on fixing large-table sort/filter performance first.
-Decisions here were explicitly agreed by the user; implementation sessions
-should follow this order and update STATE.md as pieces land.
+Outcome of a design discussion with the user. This is the blueprint for the
+next milestone of work: TOPCAT-replacement catalog crossmatching, gated on
+fixing large-table sort/filter performance first. Decisions here were
+explicitly agreed by the user; implementation sessions should follow this
+order and update STATE.md as pieces land.
+
+**Reconciled with issue #10 (anshrg's spec, 2026-07-13)** — the two agree on
+architecture (kd-tree on unit vectors, lazy derived table over the pair
+list, astropy ground truth, `column_f64`-style bulk position reads). Deltas
+adopted from #10:
+- Module lives at `src-tauri/src/xmatch/` (pure, no Tauri types).
+- v1 join scope: match mode **Best** with join types **`1 and 2`** and
+  **`all from 1`** (left join) — the latter is a trivial filter over the
+  same pair set. Best-symmetric / All-matches / remaining join types stay
+  cheap follow-ups (BACKLOG). The *core* still implements All-matches (it
+  falls out of the same query path and `search_around_sky` fixtures test it).
+- Perf target: 1M×1M match **< 2 s end-to-end (index build + query)** — this
+  assumes positions already extracted (warm column cache); cold first-touch
+  of a multi-GB file is governed by the column-cache benchmark above.
+- Fixture edge cases (non-negotiable): RA wrap at 0/360, pole proximity,
+  exact-radius boundary, duplicate positions, NaN rows; separations to ~1 µas
+  in `tests/xmatch_fixtures.rs`.
+- NaN/null positions are skipped, counted, surfaced as warnings (like region
+  parse warnings).
+- Result table: name collisions suffixed `_1`/`_2`, `Separation` column in
+  arcsec, status line "matched N of M rows (median sep …)".
+- Probe extras: nearest row gets `revealRow`; if the catalog is overlaid on
+  an image, also drop the goto crosshair at the probed coordinate.
+- Out of scope, parked (per #10): value/string key joins, N-d Cartesian and
+  pixel-coordinate matching, multi-catalog and self-match dedup, CDS X-Match
+  / VizieR, proper-motion/epoch-aware matching.
 
 ## Motivating findings
 

@@ -3,6 +3,7 @@ pub mod regions;
 pub mod table;
 pub mod tiles;
 pub mod wcs;
+pub mod xmatch;
 
 use fits::FitsFile;
 use serde::Serialize;
