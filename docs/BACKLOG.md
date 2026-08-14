@@ -127,6 +127,25 @@ anything. Promote items into a milestone deliberately, not casually.
     frame (per-source, not all); a target-frame picker (today it hits *all*
     other WCS image frames); manual RA/Dec column picker.
 
+## From the crossmatch design discussion (2026-07-13, see docs/CROSSMATCH_PLAN.md)
+
+- **Table export gaps** (writer landed 2026-07-13): ASCII-table sources
+  (error cleanly today — re-encode as BINTABLE or copy as TABLE), TNULL/
+  TDISP card carry-over (the reader doesn't parse them either), CSV/VOTable
+  formats, and a header-provenance card (e.g. HISTORY "exported by Voyager,
+  view spec …").
+
+- **Match output modes beyond "Best"**: All-matches-within-radius, 1and2,
+  1or2, 1not2, symmetric-best — all cheap follow-ups once the pair-list core
+  exists (different consumers of the same `(row_a, row_b, sep)` pairs). v1
+  ships Best + inner join only (user decision).
+- **Persistent sidecar column cache**: extracted sort/coord columns (~8 MB
+  each) written to a cache dir keyed by (path, mtime, size) so re-opening a
+  multi-GB catalog across sessions skips the cold full-file scan.
+- **Expression filters / derived columns** (TOPCAT-style `mag_a - mag_b <
+  0.5`): a small expression evaluator over cached columns — the natural
+  extension of the column cache, still no SQL engine.
+
 ## User ideas (add here as they come up)
 
 - ~~**Multi-frame (2026-07-04)**~~ **first cut DONE 2026-07-05**: multiple

@@ -5,7 +5,7 @@
 //!   scripts/venv/bin/python scripts/gen_fixtures.py
 
 use voyager_lib::fits::FitsFile;
-use voyager_lib::table::{Cell, FilterSpec, SortSpec, Table};
+use voyager_lib::table::{Cell, FilterSpec, RowSource, SortSpec, Table};
 use serde_json::Value as Json;
 use std::path::PathBuf;
 
@@ -100,6 +100,27 @@ fn table_columns_cells_sort_filter_match_astropy() {
                 "hdu {hdu} filter {:?} count",
                 f["query"]
             );
+        }
+    }
+}
+
+/// The streaming multi-column extractor (`Table::extract_columns`, the cold
+/// sort/crossmatch fast path) must be cell-for-cell identical to the
+/// bounds-checked per-cell mmap path on every fixture table.
+#[test]
+fn streamed_extraction_matches_per_cell_path() {
+    let (file, expected) = load();
+    for chk in expected["table_checks"].as_array().unwrap() {
+        let hdu = chk["hdu"].as_u64().unwrap() as usize;
+        let table = Table::open(&file, hdu).expect("open table HDU");
+        let cols: Vec<usize> = (0..table.columns.len()).collect();
+        let streamed = table.extract_columns(&cols);
+        assert_eq!(streamed.len(), cols.len());
+        for (c, col_cells) in streamed.iter().enumerate() {
+            assert_eq!(col_cells.len() as u64, table.nrows, "hdu {hdu} col {c} len");
+            for (r, got) in col_cells.iter().enumerate() {
+                assert_eq!(*got, table.cell(c, r as u64), "hdu {hdu} col {c} row {r}");
+            }
         }
     }
 }

@@ -1,11 +1,14 @@
 import {
   closeFits,
+  exportTable,
   getHeader,
   listOpenFiles,
   loadRegionFile,
   onOpenRequest,
   openFits,
+  parseCoord,
   pickFitsFile,
+  pickFitsSavePath,
   pickRegionFile,
   pickRegionSavePath,
   getWcs,
@@ -14,6 +17,7 @@ import {
   tableColumns,
   tableColumnsF64,
   takePendingOpens,
+  xmatchTables,
   type CardValue,
   type FileSummary,
   type HduInfo,
@@ -21,6 +25,7 @@ import {
   type ScaleMode,
   type TableCell,
   type TableColumn,
+  type XmatchSummary,
 } from "./api";
 import type { CreatableShape } from "./render/regionlayer";
 import { HistogramPanel } from "./render/histogram";
@@ -126,6 +131,19 @@ function must<T extends HTMLElement>(id: string): T {
 function basename(path: string): string {
   const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return i >= 0 ? path.slice(i + 1) : path;
+}
+
+/** Display names for derived (crossmatch) tables, keyed by their synthetic
+ *  `voyager-derived://N` backend path. */
+const derivedNames = new Map<string, string>();
+
+function isDerivedPath(path: string): boolean {
+  return path.startsWith("voyager-derived://");
+}
+
+/** User-facing name for a frame's path (match name for derived tables). */
+function displayName(path: string): string {
+  return derivedNames.get(path) ?? basename(path);
 }
 
 function formatBytes(n: number): string {
@@ -288,6 +306,11 @@ function renderStatus(): void {
     return;
   }
   const f = frame.file;
+  if (isDerivedPath(f.path)) {
+    const rows = f.hdus[0]?.nrows ?? 0;
+    status.textContent = `${displayName(f.path)} — crossmatch result — ${rows.toLocaleString()} rows (in memory; Export… to save)`;
+    return;
+  }
   const plural = f.hdus.length === 1 ? "" : "s";
   status.textContent = `${f.path} — ${formatBytes(f.size)} — ${f.hdus.length} HDU${plural} — opened in ${f.open_ms.toFixed(1)} ms`;
 }
@@ -300,7 +323,7 @@ function renderFrameBar(): void {
   frames.forEach((frame, i) => {
     const chip = el("div", "frame-chip");
     if (i === active) chip.classList.add("active");
-    const name = el("span", "frame-chip-name", basename(frame.file.path));
+    const name = el("span", "frame-chip-name", displayName(frame.file.path));
     name.title = frame.file.path;
     name.addEventListener("click", () => void setActive(i));
     const close = el("button", "frame-chip-close", "×");
@@ -824,6 +847,13 @@ const Y_NAMES = new Set(["y", "ycentroid", "y_image", "ywin_image", "ycen", "y_p
 
 type RowPosition = { kind: "sky"; ra: number; dec: number } | { kind: "pixel"; x: number; y: number };
 
+/** Heuristic name key: lowercased, with a crossmatch `_1`/`_2` suffix
+ *  stripped so joined tables (RA_1, DEC_2, …) still auto-detect. */
+function heurName(name: string): string {
+  const n = name.toLowerCase();
+  return n.endsWith("_1") || n.endsWith("_2") ? n.slice(0, -2) : n;
+}
+
 /** First column (by index) whose lowercased name is in `names` and whose cell
  *  value is a finite number, or null. */
 function findNumericCol(
@@ -832,7 +862,7 @@ function findNumericCol(
   names: Set<string>,
 ): number | null {
   for (const c of columns) {
-    if (!names.has(c.name.toLowerCase())) continue;
+    if (!names.has(heurName(c.name))) continue;
     const v = cells[c.index];
     if (typeof v === "number" && Number.isFinite(v)) return v;
   }
@@ -917,9 +947,10 @@ async function locateRow(cells: TableCell[], columns: TableColumn[]): Promise<vo
 
 // ---- cross-file catalog → image overlay ----------------------------------
 
-/** Index of the first column whose (lowercased) name is in `names`, or null. */
+/** Index of the first column whose (lowercased, `_1`/`_2`-stripped) name is
+ *  in `names`, or null. */
 function findColIndex(columns: TableColumn[], names: Set<string>): number | null {
-  const c = columns.find((col) => names.has(col.name.toLowerCase()));
+  const c = columns.find((col) => names.has(heurName(col.name)));
   return c ? c.index : null;
 }
 
@@ -1165,6 +1196,245 @@ function syncPosColumnPicker(): void {
 
 // ---- open / close ---------------------------------------------------------
 
+// ---- crossmatch UI (M5+: Match dialog, export, coordinate probe) ----------
+
+/** Frames offering a table HDU, for the Match panel's pickers. */
+function matchCandidates(): { frame: Frame; hdu: number }[] {
+  const out: { frame: Frame; hdu: number }[] = [];
+  for (const frame of frames) {
+    const hdu = frameTableHdu(frame);
+    if (hdu !== null) out.push({ frame, hdu });
+  }
+  return out;
+}
+
+/** Table A (fixed = active frame) and the current Table B candidates. */
+let matchA: { frame: Frame; hdu: number } | null = null;
+let matchBList: { frame: Frame; hdu: number }[] = [];
+
+function matchSelsA(): { ra: HTMLSelectElement; dec: HTMLSelectElement } {
+  return { ra: must<HTMLSelectElement>("match-a-ra"), dec: must<HTMLSelectElement>("match-a-dec") };
+}
+
+function matchSelsB(): { ra: HTMLSelectElement; dec: HTMLSelectElement } {
+  return { ra: must<HTMLSelectElement>("match-b-ra"), dec: must<HTMLSelectElement>("match-b-dec") };
+}
+
+/** Fill RA/Dec column selects with a table's numeric columns, pre-seeded
+ *  from its position override (sky) or the name heuristics. */
+function fillMatchColSelects(
+  sels: { ra: HTMLSelectElement; dec: HTMLSelectElement },
+  columns: TableColumn[],
+  override: PosOverride | null,
+): void {
+  const numeric = columns.filter((c) => (c.kind === "int" || c.kind === "float") && c.sortable);
+  for (const s of [sels.ra, sels.dec]) {
+    s.replaceChildren();
+    for (const c of numeric) {
+      const opt = el("option", "", c.name);
+      opt.value = String(c.index);
+      s.append(opt);
+    }
+  }
+  const ra = override?.kind === "sky" ? override.raCol : findColIndex(columns, RA_NAMES);
+  const dec = override?.kind === "sky" ? override.decCol : findColIndex(columns, DEC_NAMES);
+  if (ra !== null) sels.ra.value = String(ra);
+  if (dec !== null) sels.dec.value = String(dec);
+}
+
+async function openMatchPanel(): Promise<void> {
+  const frame = activeFrame();
+  const readout = must<HTMLElement>("readout");
+  if (!frame) return;
+  const aHdu = frameTableHdu(frame);
+  if (aHdu === null) {
+    readout.textContent = "select a table HDU to crossmatch";
+    return;
+  }
+  matchA = { frame, hdu: aHdu };
+  must<HTMLElement>("match-a-label").textContent = `${displayName(frame.file.path)} [${aHdu}]`;
+  matchBList = matchCandidates();
+  const bSel = must<HTMLSelectElement>("match-b-select");
+  bSel.replaceChildren();
+  matchBList.forEach((c, i) => {
+    const opt = el("option", "", `${displayName(c.frame.file.path)} [${c.hdu}]`);
+    opt.value = String(i);
+    bSel.append(opt);
+  });
+  // Default B: the first other frame's catalog (self-match stays possible).
+  const other = matchBList.findIndex((c) => c.frame !== frame);
+  bSel.value = String(other >= 0 ? other : 0);
+  must<HTMLElement>("match-status").textContent = "";
+  must<HTMLElement>("match-panel").style.display = "";
+  try {
+    fillMatchColSelects(matchSelsA(), await tableColumns(frame.file.path, aHdu), frame.posOverride);
+    await refreshMatchB();
+  } catch (err) {
+    must<HTMLElement>("match-status").textContent = String(err);
+  }
+}
+
+/** Reload Table B's column selects after the B table changes. */
+async function refreshMatchB(): Promise<void> {
+  const c = matchBList[Number(must<HTMLSelectElement>("match-b-select").value)];
+  if (!c) return;
+  fillMatchColSelects(matchSelsB(), await tableColumns(c.frame.file.path, c.hdu), c.frame.posOverride);
+}
+
+async function runMatch(): Promise<void> {
+  const statusEl = must<HTMLElement>("match-status");
+  const a = matchA;
+  const b = matchBList[Number(must<HTMLSelectElement>("match-b-select").value)];
+  if (!a || !b) return;
+  const radius = Number(must<HTMLInputElement>("match-radius").value);
+  if (!Number.isFinite(radius) || radius <= 0) {
+    statusEl.textContent = "radius must be a positive number of arcsec";
+    return;
+  }
+  const selsA = matchSelsA();
+  const selsB = matchSelsB();
+  if (!selsA.ra.value || !selsA.dec.value || !selsB.ra.value || !selsB.dec.value) {
+    statusEl.textContent = "pick RA and Dec columns for both tables";
+    return;
+  }
+  const runBtn = must<HTMLButtonElement>("match-run-btn");
+  runBtn.disabled = true;
+  statusEl.textContent = "matching…";
+  try {
+    const sum = await xmatchTables({
+      pathA: a.frame.file.path,
+      hduA: a.hdu,
+      raColA: Number(selsA.ra.value),
+      decColA: Number(selsA.dec.value),
+      pathB: b.frame.file.path,
+      hduB: b.hdu,
+      raColB: Number(selsB.ra.value),
+      decColB: Number(selsB.dec.value),
+      radiusArcsec: radius,
+      join: must<HTMLSelectElement>("match-join").value === "all1" ? "all1" : "1and2",
+    });
+    must<HTMLElement>("match-panel").style.display = "none";
+    await openDerivedFrame(sum);
+    const skipped = sum.skippedA + sum.skippedB;
+    must<HTMLElement>("readout").textContent =
+      `matched ${sum.matched.toLocaleString()} of ${sum.totalA.toLocaleString()} rows` +
+      (sum.medianSepArcsec !== null ? ` (median sep ${sum.medianSepArcsec.toFixed(3)}″)` : "") +
+      (skipped > 0 ? ` — skipped ${skipped} row${skipped === 1 ? "" : "s"} with invalid coordinates` : "");
+  } catch (err) {
+    statusEl.textContent = `match failed: ${String(err)}`;
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+/** Save the active table (through its current sort/filter) as a FITS file. */
+async function exportActiveTable(): Promise<void> {
+  const frame = activeFrame();
+  const readout = must<HTMLElement>("readout");
+  if (!frame) return;
+  const tblHdu = frameTableHdu(frame);
+  if (tblHdu === null) {
+    readout.textContent = "select a table HDU to export";
+    return;
+  }
+  const name = displayName(frame.file.path);
+  const suggested = isDerivedPath(frame.file.path)
+    ? `${name}.fits`
+    : `${name.replace(/\.fits?$/i, "")}_table.fits`;
+  const out = await pickFitsSavePath(suggested);
+  if (!out) return;
+  readout.textContent = "exporting…";
+  try {
+    const n = await exportTable(frame.file.path, tblHdu, out, true);
+    readout.textContent = `exported ${n.toLocaleString()} rows → ${out}`;
+  } catch (err) {
+    readout.textContent = `export failed: ${String(err)}`;
+  }
+}
+
+/** Coordinate probe ("goto" for tables): find catalog rows near a typed
+ *  coordinate, reveal the nearest in the table, mark it on a shown image. */
+async function probeCoordinate(query: string): Promise<void> {
+  const frame = activeFrame();
+  const readout = must<HTMLElement>("readout");
+  const box = must<HTMLInputElement>("probe-box");
+  if (!frame || !query.trim()) return;
+  const tblHdu = frameTableHdu(frame);
+  if (tblHdu === null) {
+    readout.textContent = "select a table HDU to search";
+    return;
+  }
+  const radius = Number(must<HTMLInputElement>("probe-radius").value);
+  if (!Number.isFinite(radius) || radius <= 0) {
+    readout.textContent = "probe radius must be a positive number of arcsec";
+    return;
+  }
+  try {
+    const { ra, dec } = await parseCoord(query);
+    const columns = await tableColumns(frame.file.path, tblHdu);
+    let raCol: number | null;
+    let decCol: number | null;
+    if (frame.posOverride?.kind === "sky") {
+      raCol = frame.posOverride.raCol;
+      decCol = frame.posOverride.decCol;
+    } else {
+      raCol = findColIndex(columns, RA_NAMES);
+      decCol = findColIndex(columns, DEC_NAMES);
+    }
+    if (raCol === null || decCol === null) {
+      readout.textContent = "no RA/Dec columns found (pick them with the position-column selector)";
+      return;
+    }
+    const [ras, decs] = await tableColumnsF64(frame.file.path, tblHdu, [raCol, decCol]);
+    // One cone query is a linear scan over unit-vector chord distances —
+    // even 1M rows is milliseconds, no index needed for a single probe.
+    const d2r = Math.PI / 180;
+    const qx = Math.cos(dec * d2r) * Math.cos(ra * d2r);
+    const qy = Math.cos(dec * d2r) * Math.sin(ra * d2r);
+    const qz = Math.sin(dec * d2r);
+    const chord = 2 * Math.sin(((radius / 3600) * d2r) / 2);
+    const chord2 = chord * chord;
+    let bestRow = -1;
+    let bestD2 = Infinity;
+    let count = 0;
+    for (let i = 0; i < ras.length; i++) {
+      const r = ras[i];
+      const d = decs[i];
+      if (!Number.isFinite(r) || !Number.isFinite(d)) continue;
+      const cx = Math.cos(d * d2r) * Math.cos(r * d2r) - qx;
+      const cy = Math.cos(d * d2r) * Math.sin(r * d2r) - qy;
+      const cz = Math.sin(d * d2r) - qz;
+      const d2 = cx * cx + cy * cy + cz * cz;
+      if (d2 <= chord2) {
+        count++;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestRow = i;
+        }
+      }
+    }
+    if (bestRow < 0) {
+      readout.textContent = `no rows within ${radius}″ of ${query.trim()}`;
+      box.classList.add("goto-error");
+      return;
+    }
+    box.classList.remove("goto-error");
+    const sep = ((2 * Math.asin(Math.min(1, Math.sqrt(bestD2) / 2))) / d2r) * 3600;
+    await tableView?.revealRow(bestRow);
+    // Drop the goto crosshair at the probed coordinate on a shown image.
+    if (frame.viewer && frame.wcs) {
+      const p = frame.wcs.worldToPix(ra, dec);
+      if (p) frame.viewer.setMarker(p[0], p[1]);
+    }
+    readout.textContent =
+      `${count.toLocaleString()} row${count === 1 ? "" : "s"} within ${radius}″ — ` +
+      `nearest is row ${bestRow} at ${sep.toFixed(3)}″`;
+  } catch (err) {
+    readout.textContent = `probe failed: ${String(err)}`;
+    box.classList.add("goto-error");
+  }
+}
+
 async function openPath(path: string): Promise<void> {
   const status = must<HTMLElement>("status-file");
   // Already open? Just activate its frame (backend dedupes by path anyway).
@@ -1176,35 +1446,60 @@ async function openPath(path: string): Promise<void> {
   try {
     status.textContent = `Opening ${path}…`;
     const file = await openFits(path);
-    const cell = el("div", "frame-cell");
-    cell.append(el("div", "frame-label", basename(path)));
-    must<HTMLElement>("frames-grid").append(cell);
-    // JWST-style files have an empty primary HDU; jump to the first image HDU
-    // that actually has pixels (usually SCI).
-    const firstImg = file.hdus.find(isViewableImage);
-    const selectedHdu = firstImg ? firstImg.index : 0;
-    const hdu = file.hdus[selectedHdu];
-    const tab: ViewTab = isViewableImage(hdu) ? "image" : isTableHdu(hdu) ? "table" : "header";
-    const frame: Frame = {
-      file, selectedHdu, tab, cards: [], regionPath: null, cell,
-      viewer: null, viewerHdu: null, wcs: null, sourceFrom: null, posOverride: null,
-    };
-    // Clicking a cell (tiled mode) makes it the active frame.
-    cell.addEventListener(
-      "pointerdown",
-      () => {
-        const idx = frames.indexOf(frame);
-        if (idx >= 0 && idx !== active) void setActive(idx);
-      },
-      true,
-    );
-    frames.push(frame);
-    must<HTMLElement>("empty-state").style.display = "none";
-    must<HTMLElement>("content").style.display = "";
-    await setActive(frames.length - 1);
+    await addFrame(file);
   } catch (err) {
     status.textContent = `Failed to open ${path}: ${String(err)}`;
   }
+}
+
+/** Create + activate a frame for an already-open file (real or derived). */
+async function addFrame(file: FileSummary): Promise<void> {
+  const cell = el("div", "frame-cell");
+  cell.append(el("div", "frame-label", displayName(file.path)));
+  must<HTMLElement>("frames-grid").append(cell);
+  // JWST-style files have an empty primary HDU; jump to the first image HDU
+  // that actually has pixels (usually SCI).
+  const firstImg = file.hdus.find(isViewableImage);
+  const selectedHdu = firstImg ? firstImg.index : 0;
+  const hdu = file.hdus[selectedHdu];
+  const tab: ViewTab = isViewableImage(hdu) ? "image" : isTableHdu(hdu) ? "table" : "header";
+  const frame: Frame = {
+    file, selectedHdu, tab, cards: [], regionPath: null, cell,
+    viewer: null, viewerHdu: null, wcs: null, sourceFrom: null, posOverride: null,
+  };
+  // Clicking a cell (tiled mode) makes it the active frame.
+  cell.addEventListener(
+    "pointerdown",
+    () => {
+      const idx = frames.indexOf(frame);
+      if (idx >= 0 && idx !== active) void setActive(idx);
+    },
+    true,
+  );
+  frames.push(frame);
+  must<HTMLElement>("empty-state").style.display = "none";
+  must<HTMLElement>("content").style.display = "";
+  await setActive(frames.length - 1);
+}
+
+/** Open a crossmatch result as a new frame: a synthetic single-HDU file
+ *  whose table commands the backend serves under the derived path. */
+async function openDerivedFrame(sum: XmatchSummary): Promise<void> {
+  derivedNames.set(sum.path, sum.name);
+  const hdu: HduInfo = {
+    index: 0,
+    kind: "bin_table",
+    name: sum.name,
+    bitpix: 8,
+    shape: [],
+    header_offset: 0,
+    data_offset: 0,
+    data_len: 0,
+    ncards: 0,
+    nrows: sum.nrows,
+    ncols: sum.columns.length,
+  };
+  await addFrame({ path: sum.path, size: 0, hdus: [hdu], open_ms: 0 });
 }
 
 async function closeFrame(i: number): Promise<void> {
@@ -1486,7 +1781,97 @@ function buildUi(): void {
   posColBSel.style.display = "none";
   posColBSel.title = "Dec (sky) or Y (pixel) column";
   posColBSel.addEventListener("change", () => applyPosOverrideFromPicker());
-  tableControls.append(overlayBtn, clearOverlayBtn, posKindSel, posColASel, posColBSel);
+  // Crossmatch, export, and coordinate-probe controls (table tab).
+  const matchBtn = el("button", "", "Match…");
+  matchBtn.id = "match-btn";
+  matchBtn.title = "Crossmatch this catalog against another open catalog by sky position (TOPCAT pair match)";
+  matchBtn.addEventListener("click", () => void openMatchPanel());
+  const exportBtn = el("button", "", "Export…");
+  exportBtn.id = "export-table-btn";
+  exportBtn.title = "Save this table (with the current sort/filter applied) as a FITS file";
+  exportBtn.addEventListener("click", () => void exportActiveTable());
+  const probeBox = el("input", "goto");
+  probeBox.id = "probe-box";
+  probeBox.placeholder = "Find coord…";
+  probeBox.title =
+    "Find catalog rows near a coordinate (sexagesimal or decimal degrees) — like goto, for tables. Enter to search.";
+  probeBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") void probeCoordinate(probeBox.value);
+  });
+  probeBox.addEventListener("input", () => probeBox.classList.remove("goto-error"));
+  const probeRadius = el("input", "probe-radius");
+  probeRadius.id = "probe-radius";
+  probeRadius.value = "5";
+  probeRadius.title = "Probe search radius (arcsec)";
+  tableControls.append(
+    overlayBtn,
+    clearOverlayBtn,
+    posKindSel,
+    posColASel,
+    posColBSel,
+    matchBtn,
+    exportBtn,
+    probeBox,
+    probeRadius,
+  );
+
+  // Crossmatch panel (floating; opened by the Match… button).
+  const matchPanel = el("div", "match-panel");
+  matchPanel.id = "match-panel";
+  matchPanel.style.display = "none";
+  const mpTitle = el("div", "match-title", "Crossmatch — best match within radius");
+  const mpClose = el("button", "match-close", "×");
+  mpClose.title = "Close";
+  mpClose.addEventListener("click", () => {
+    matchPanel.style.display = "none";
+  });
+  mpTitle.append(mpClose);
+  const mpRowA = el("div", "match-row");
+  const aLabel = el("span", "match-a-name");
+  aLabel.id = "match-a-label";
+  const aRa = el("select", "control-select");
+  aRa.id = "match-a-ra";
+  aRa.title = "Table A RA column (deg)";
+  const aDec = el("select", "control-select");
+  aDec.id = "match-a-dec";
+  aDec.title = "Table A Dec column (deg)";
+  mpRowA.append(el("span", "match-label", "A:"), aLabel, aRa, aDec);
+  const mpRowB = el("div", "match-row");
+  const bTableSel = el("select", "control-select");
+  bTableSel.id = "match-b-select";
+  bTableSel.title = "Table B: another open catalog (or this one, for a self-match)";
+  bTableSel.addEventListener("change", () => void refreshMatchB());
+  const bRa = el("select", "control-select");
+  bRa.id = "match-b-ra";
+  bRa.title = "Table B RA column (deg)";
+  const bDec = el("select", "control-select");
+  bDec.id = "match-b-dec";
+  bDec.title = "Table B Dec column (deg)";
+  mpRowB.append(el("span", "match-label", "B:"), bTableSel, bRa, bDec);
+  const mpRowOpts = el("div", "match-row");
+  const radiusIn = el("input", "match-radius-input");
+  radiusIn.id = "match-radius";
+  radiusIn.value = "1";
+  radiusIn.title = "Match radius (arcsec)";
+  const joinSel = el("select", "control-select");
+  joinSel.id = "match-join";
+  for (const [v, label] of [
+    ["1and2", "matched pairs only"],
+    ["all1", "all rows from A"],
+  ] as const) {
+    const opt = el("option", "", label);
+    opt.value = v;
+    joinSel.append(opt);
+  }
+  joinSel.title = "Join type: keep only matched pairs (1 and 2), or every A row (all from 1)";
+  const mpRun = el("button", "", "Run match");
+  mpRun.id = "match-run-btn";
+  mpRun.addEventListener("click", () => void runMatch());
+  mpRowOpts.append(el("span", "match-label", "r″:"), radiusIn, joinSel, mpRun);
+  const mpStatus = el("div", "match-status");
+  mpStatus.id = "match-status";
+  matchPanel.append(mpTitle, mpRowA, mpRowB, mpRowOpts, mpStatus);
+  document.body.append(matchPanel);
 
   toolbar.append(
     title,

@@ -5,6 +5,51 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## PR #11 closed 2026-08-14 — cold-scan hang diagnosed and fixed; needs re-test on the Mac
+
+Ansh (owner, M2 MacBook Air) tested the M5 crossmatch build from PR #11 and
+closed it: *"cross-match functionality does not work - enters indefinite
+loop."* That build predates the cold-scan fix, which had been diagnosed
+during live testing (first sort on the 1M-row/11 GB catalog hung) but never
+made it to GitHub — pushes were blocked by the repo ruleset ("changes must
+be made through a pull request", scoped to **all** branches; Ansh needs to
+re-scope it to `main` in Settings → Rules), and the container holding the
+unpushed commit was recycled, so the fix was **re-implemented from scratch**
+(this working tree; commit "cold column scans: stream…").
+
+**Root cause** (two layers):
+1. A cold full-column materialization looped `cell()` row by row,
+   demand-faulting the whole multi-GB file through the mmap one 4 KB page at
+   a time — minutes of synchronous fault latency on macOS, which presents as
+   an app-wide hang. A crossmatch needs RA/Dec cold from *both* catalogs
+   (plus the overlay's `table_columns_f64`), hence "cross-match enters
+   indefinite loop".
+2. Dispatch trap: `OpenTable` (lib.rs) implements `RowSource` but didn't
+   forward the extraction methods, so they resolved to the trait *defaults*
+   (per-cell loops) — any `Table`-level fast path was silently bypassed.
+
+**Fix**: `Table::extract_columns` streams whole rows in ~8 MB buffered
+`pread` chunks (sequential SSD-bandwidth I/O, no mmap faulting; mmap
+fallback if the file can't be re-read; Null tail past EOF identical to the
+bounds-checked path) and pulls **all requested columns in one scan** —
+`table_view` (sort+filter), `xmatch_tables` (RA+Dec per side), and
+`table_columns_f64` now pay one scan per file. `OpenTable` forwards every
+extraction method (comment in lib.rs warns about the default-method trap).
+Gated by: per-cell-identity test over the astropy fixtures, plus
+`tests/table_stream.rs` (multi-chunk 1.2M-row synthetic table + truncated
+file). 89 tests green, tsc clean.
+
+**Mac re-test needed** (then the PR #11 checklist): cold first sort on the
+11 GB catalog, and a crossmatch of two large catalogs — watch for
+`(cols: miss+miss…)` then `hit` on re-runs in the log. Container Linux
+timing: 1.2M×2-col scan ≈ 0.5 s debug.
+
+Status 2026-08-14: push of this fix rejected by the ruleset (git **and**
+GitHub API both `GH013`); patch re-sent to the user's chat as backup
+(`git am` on top of `277d5a5`); diagnosis + ruleset ask posted as a comment
+on closed PR #11. Reopening the PR is Ansh/Hollis's call — do not reopen
+unilaterally.
+
 ## Current milestone: everything implemented through M5 depth is now **user-verified working (2026-07-12)** — including zoom-flash fix, table horizontal scroll, the full M5-depth + multi-region-select surface, the overnight-2026-07-12 batch (region undo/redo, reverse-link-keeps-sort, new-polygon creation, position-column picker), cross-file marker→row, and real-data confirmation (row-locate on a wide JWST catalog + region save round-trip through DS9). Next work comes from BACKLOG (M6 packaging/polish, M4 polish, overlay follow-ups).
 
 > **Verification protocol change (2026-07-12, user request): do NOT verify by
@@ -591,6 +636,160 @@ tree, ready to review.
   compound commands (use absolute paths / --manifest-path), `lsof -ti
   :1420 | xargs kill` for stale vite, `pkill -f "tauri dev"; pkill -f
   "target/debug/voyager"`, don't pipe backgrounded output through tail.
+
+### Crossmatch milestone — design agreed 2026-07-13, core landed (this session)
+
+The next big feature is **catalog crossmatching** (TOPCAT replacement),
+specced by the repo owner in **issue #10** and reconciled with the user
+discussion in **`docs/CROSSMATCH_PLAN.md`** — read both before continuing.
+Key decisions: fix large-table sort/filter first via a **columnar key
+cache** (NOT SQLite conversion; user stress-tested a 1M-row/11 GB catalog
+and the per-cell strided mmap scan in `build_view` is the bottleneck —
+benchmark the extraction path on the user's Mac per the plan's benchmark
+section); results become **derived tables** (pair list delegating `cell()`
+to parent FITS tables — no data copied); export via a new FITS bintable
+writer; v1 = **Best match** with `1 and 2` + `all from 1` joins; plus a
+single-coordinate cone-search box ("goto for tables"). Work is on branch
+`claude/voyager-catalog-cross-matching-uzlr06`.
+
+**Landed 2026-07-13 (this session): `src-tauri/src/xmatch/` core.** Pure
+module (no Tauri types): hand-rolled 3-D k-d tree over unit vectors
+(`SkyIndex::build/nearest_within/within`), chord-radius queries (inclusive
+`sep <= r`, matching `search_around_sky`), `crossmatch(ra_a, dec_a, ra_b,
+dec_b, radius_deg, MatchMode::Best|All)` returning `(a, b, sep_deg)` pairs +
+skipped-NaN counts per side. Best ties break to the lowest B row. Fixtures:
+`scripts/gen_xmatch_fixtures.py` (new; needs scipy in the venv) writes
+`fixtures/xmatch_expected.json` from astropy `match_to_catalog_sky` +
+`search_around_sky` over 6 scenarios (random field, RA wrap, pole,
+exact-radius boundary ±1e-6″, duplicate positions incl. sep-0, NaN rows);
+`tests/xmatch_fixtures.rs` compares pair sets exactly + separations to 1 µas
+(best-pair B compared by *coordinates* so duplicate-position nearest ties
+don't flake). **72 tests green** (was 65). A 1M×1M <2 s perf test is in
+`xmatch_fixtures.rs` behind `#[ignore]` — run
+`cargo test --release --test xmatch_fixtures -- --ignored`.
+
+**Also landed 2026-07-13: column cache (plan step 1, cache part).**
+`table::cache::ColCache` (pure, unit-tested): LRU of materialized columns
+(`Vec<Cell>`) keyed by (path, hdu, col), 512 MB default budget, byte
+accounting incl. string heap, `purge_path` on close. `Table::extract_column`
++ free fn `table::build_view_from` (operates on materialized cells);
+`Table::build_view` is now a thin wrapper over it so the astropy table
+fixtures gate both paths identically. `lib.rs`: `AppState.col_cache`
+(Arc<Mutex>), `table_view` fetches sort/filter columns through the cache
+(extraction outside the lock; log line now shows `cols: hit+miss`),
+`close_fits` purges. Effect: the full-file column scan happens **once per
+column** instead of on every sort/filter change — the fix for the user's
+1M-row/11 GB stress test. Cells (not compacted key arrays) are cached so
+sort/filter semantics are provably unchanged. **Still open in step 1** (perf
+polish, needs the user's Mac per the plan's benchmark section): madvise/
+chunked reads, parallel extraction, multi-column single-pass, typed-array
+compaction. 1M×1M xmatch perf test passed in this session's Linux container:
+**1.07 s** (target < 2 s), single-threaded release.
+
+**Also landed 2026-07-13: BINTABLE writer (plan step 2).**
+`table::write` (child module of `table`, pure): `write_bintable` (empty
+primary + BINTABLE header + streamed rows + block padding; fixed-format
+cards with quote escaping) and `export_view(table, view, extname, path)` —
+exports a table's rows through a view permutation by **raw row-byte copy**,
+so exported cells are bit-identical to the source by construction (the same
+primitive a derived table will use: A-row bytes ++ B-row bytes ++ f64 sep).
+TTYPE/TFORM/TUNIT/TSCAL/TZERO carried over; ASCII-table sources error
+cleanly (BACKLOG, with TNULL/TDISP carry-over). `tests/table_write.rs`:
+identity / sorted+filtered / empty-view round-trips through our own reader,
+comparing every cell exactly. **astropy gate verified in-session** (same
+pattern as the region writer): `fits.verify('exception')` clean on all
+three exports, all columns bit-identical to the source, and the view export
+matches an independent numpy argsort+mask reproduction. **80 tests green.**
+
+**Also landed 2026-07-13: derived tables + xmatch IPC (plan step 4).**
+- `table::RowSource` trait (columns/nrows/cell required; page/extract_column/
+  column_f64/build_view provided) — every table consumer now works for both
+  FITS-backed and derived tables. `Table` implements it; inherent
+  page/extract/build_view moved into the trait (callers import `RowSource`).
+- `table::join` (pure): `JoinRow { a, b: Option, sep_deg: Option }` +
+  `Joined::new(left, right, &rows)` — merged columns (case-insensitive name
+  collisions suffixed `_1`/`_2`), appended `Separation` column (arcsec),
+  cells delegate to parent mmaps (~24 B/row materialized, design decision
+  #1 holds for 1M×1M joins). `Joined::export` streams raw A-row ++ B-row ++
+  f64 separation bytes; unmatched right sides = null template (NaN floats,
+  zero ints, blank strings — no TNULL yet, BACKLOG).
+- `lib.rs`: `DerivedDef` in `AppState.derived` keyed by synthetic
+  `voyager-derived://N` paths; parents pinned by Arc (derived table survives
+  closing its source file). `resolve_table` + `TableHandle`/`OpenTable`
+  (impls RowSource) route **all** table commands (columns/view/rows/
+  view_pos/columns_f64) for both kinds. `get_header` synthesizes BINTABLE-
+  shaped cards + XMATCHA/XMATCHB provenance for derived paths. New commands:
+  **`xmatch_tables`** (Best match within radius; join `1and2` | `all1`;
+  positions fetched through the column cache so re-runs and later sorts are
+  warm; returns summary incl. median sep + columns) and **`export_table`**
+  (real or derived, honors the current sort/filter view).
+- Tests: `tests/join_fixtures.rs` (self-match via the real kd-tree path,
+  cell routing, null right sides, sort-by-Separation, export round-trip
+  through our reader with a reversing view). **astropy gate verified
+  in-session**: `verify('exception')` clean on the joined export, suffixed
+  names + arcsec unit + NaN nulls + reversed view all confirmed. **86 tests
+  green**, tsc clean (no frontend changes yet).
+
+**Also landed 2026-07-13: crossmatch UI (plan step 5) — NOT yet user-verified.**
+Frontend only (`main.ts`/`api.ts`/`styles.css`), tsc clean:
+- **Match… button** (table tab) opens a floating panel (`#match-panel`,
+  fixed top-right): Table A = active frame's table (label), Table B = any
+  open frame with a table (self-match allowed), RA/Dec column selects per
+  side (numeric columns only, pre-seeded from `posOverride` or the name
+  heuristics), radius (arcsec, default 1), join select (matched pairs only /
+  all rows from A), Run. On success the panel closes, the result opens as a
+  **new frame** and the readout shows "matched N of M (median sep …″)".
+- **Derived frames**: `openDerivedFrame` builds a synthetic single-HDU
+  `FileSummary` for the `voyager-derived://N` path (`addFrame` extracted
+  from `openPath` for reuse); `derivedNames` map + `displayName()` give
+  chips/labels/status the match name (XMATCH_N); status line shows
+  "crossmatch result — N rows (in memory; Export… to save)". Everything
+  else (table view, sort/filter, header tab, overlay, close) rides the
+  existing frame machinery against the backend's derived path support.
+- **Export… button** (table tab): save panel (`pickFitsSavePath`) →
+  `export_table` with the current sort/filter view; works for real and
+  derived tables.
+- **Probe box + radius** (table tab, "Find coord…", default 5″): backend
+  `parse_coord` (new command — coordinate parsing without a WCS, so it
+  works on image-less catalogs) + `table_columns_f64` + a frontend linear
+  cone scan (single query needs no index); reveals the nearest row
+  (respecting sort/filter via revealRow), drops the goto crosshair when the
+  frame shows an image with WCS, readout shows count + nearest separation.
+- **Heuristics learned `_1`/`_2`**: `heurName()` strips crossmatch suffixes
+  so RA_1/DEC_1 auto-detect in joined tables (locate/overlay/probe/match).
+
+### Manual verification checklist for the user (crossmatch milestone)
+
+Run with two overlapping catalogs (e.g. cross_catalog.fits + a second
+catalog or a self-match), plus an image frame for overlay checks:
+1. Open a catalog → Table tab → **Match…** — panel appears, RA/Dec selects
+   pre-filled sensibly for both tables; radius 1″.
+2. **Run match** — new frame chip named XMATCH_1 appears and activates; its
+   table shows `*_1`, `*_2`, and `Separation` columns; readout shows
+   matched count + median sep (sanity-check both against TOPCAT).
+3. Sort the result by Separation (click header) and filter it — both work.
+4. **Export…** the result → open the written file in TOPCAT/astropy —
+   columns + values correct, Separation in arcsec.
+5. On the XMATCH frame: **Overlay ▸ image** onto an open image frame —
+   markers land (RA_1/DEC_1 auto-detected); click a marker → row reveals.
+6. Probe box: type a coordinate inside the field (sexagesimal + decimal
+   both) with radius ~5″ — nearest row highlights; on a frame showing an
+   image, the crosshair drops at the probed spot. A far-away coordinate
+   reports "no rows within …″".
+7. `all rows from A` join: unmatched rows show blank right-side cells and
+   blank Separation; sort by Separation puts them last.
+8. Close the source catalog frame, then keep using the XMATCH frame
+   (parents are pinned) — table still scrolls/sorts.
+
+**Remaining after verification** (build order in CROSSMATCH_PLAN.md):
+step-1 perf polish (madvise/parallel/multi-column extraction — benchmark on
+the Mac first), then BACKLOG follow-ups (other match modes, xmatch-of-xmatch
+via export, TNULL/TDISP, CSV/VOTable export, probe-by-image-click).
+
+**Push blocked (2026-07-13)**: commits for this milestone exist only locally
+on the feature branch — pushes 403 because the Claude GitHub App is not
+installed on `anshrg/voyager` (the user has write permission; the owner was
+asked to install the app at github.com/apps/claude). Push as soon as it works.
 
 ## Immediate next steps (in order)
 

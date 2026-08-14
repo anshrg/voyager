@@ -652,3 +652,88 @@ table.cards td {
   height: 100%;
   pointer-events: none;
 }
+
+/* ---- crossmatch panel + table probe (M5+) -------------------------------- */
+
+#probe-box {
+  width: 130px;
+}
+
+.probe-radius,
+.match-radius-input {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  width: 44px;
+}
+
+.match-panel {
+  position: fixed;
+  top: 90px;
+  right: 16px;
+  width: 400px;
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+
+.match-title {
+  font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.match-close {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 15px;
+  padding: 0 2px;
+}
+
+.match-close:hover {
+  color: var(--fg);
+}
+
+.match-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.match-label {
+  color: var(--fg-dim);
+  min-width: 20px;
+}
+
+.match-a-name {
+  font-family: var(--mono);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.match-row select {
+  max-width: 150px;
+}
+
+.match-status {
+  color: var(--fg-dim);
+  min-height: 14px;
+}
