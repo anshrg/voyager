@@ -280,10 +280,17 @@ impl<'f> Table<'f> {
 
     /// One cell (bounds-checked; out-of-range or unparseable → `Cell::Null`).
     pub fn cell(&self, col: usize, row: u64) -> Cell {
-        let Some(column) = self.columns.get(col) else {
+        let Some(bytes) = self.row_bytes(row) else {
             return Cell::Null;
         };
-        let Some(bytes) = self.row_bytes(row) else {
+        self.cell_in(col, bytes)
+    }
+
+    /// One cell out of an already-fetched row's bytes (shared by the mmap
+    /// path above and the streaming path in `extract_columns`, so both
+    /// produce identical values by construction).
+    fn cell_in(&self, col: usize, bytes: &[u8]) -> Cell {
+        let Some(column) = self.columns.get(col) else {
             return Cell::Null;
         };
         match &column.layout {
@@ -296,6 +303,22 @@ impl<'f> Table<'f> {
         }
     }
 
+}
+
+/// Positioned read that doesn't move the file cursor (the extraction scan
+/// must not race other readers of the same handle). Non-unix builds fall
+/// back to the mmap path in `extract_columns` by reporting failure.
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, off)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (f, buf, off);
+        Err(std::io::Error::other("positioned reads unsupported here"))
+    }
 }
 
 /// Anything that can serve table cells: a FITS-backed [`Table`] or a derived
@@ -344,11 +367,26 @@ pub trait RowSource {
         (0..self.nrows()).map(|r| self.cell(col, r)).collect()
     }
 
+    /// Several whole columns materialized in native row order. FITS-backed
+    /// tables override this to pull all requested columns from **one**
+    /// sequential pass over the row data; wrappers must forward it (a
+    /// non-forwarding wrapper silently falls back to this per-cell default —
+    /// see `OpenTable` in lib.rs).
+    fn extract_columns(&self, cols: &[usize]) -> Vec<Vec<Cell>> {
+        cols.iter().map(|&c| self.extract_column(c)).collect()
+    }
+
     /// Every row of one column as f64 (Null/non-numeric → NaN), in native row
     /// order. Used to bulk-project a catalog's RA/Dec onto an image frame and
     /// to feed crossmatch positions, without boxing every column through JSON.
     fn column_f64(&self, col: usize) -> Vec<f64> {
         (0..self.nrows()).map(|r| self.cell(col, r).as_f64()).collect()
+    }
+
+    /// Several columns as f64 arrays. FITS-backed tables override this to
+    /// share one sequential scan across all requested columns.
+    fn columns_f64(&self, cols: &[usize]) -> Vec<Vec<f64>> {
+        cols.iter().map(|&c| self.column_f64(c)).collect()
     }
 
     /// Build a row-index view for the given sort/filter, reading cells
@@ -379,6 +417,98 @@ impl<'f> RowSource for Table<'f> {
 
     fn cell(&self, col: usize, row: u64) -> Cell {
         Table::cell(self, col, row)
+    }
+
+    // Cold full-column scans go through the streaming reader instead of
+    // per-cell mmap faulting (see `extract_columns` for why).
+    fn extract_column(&self, col: usize) -> Vec<Cell> {
+        self.extract_columns(&[col]).pop().unwrap()
+    }
+
+    fn column_f64(&self, col: usize) -> Vec<f64> {
+        self.columns_f64(&[col]).pop().unwrap()
+    }
+
+    fn columns_f64(&self, cols: &[usize]) -> Vec<Vec<f64>> {
+        self.extract_columns(cols)
+            .into_iter()
+            .map(|cells| cells.iter().map(Cell::as_f64).collect())
+            .collect()
+    }
+
+    /// Materialize whole columns in **one sequential pass** over the row
+    /// data, reading through the file (buffered pread) instead of the mmap.
+    ///
+    /// Why not just loop `cell()`: a cold full-column scan through the mmap
+    /// demand-faults the file one 4 KB page at a time — a synchronous fault
+    /// per page with no useful readahead (macOS especially), so on an 11 GB
+    /// catalog the first sort — or a crossmatch, which needs RA/Dec cold —
+    /// spends minutes in the kernel and looks like a hang. Chunked
+    /// sequential reads stream at SSD bandwidth instead, and extracting all
+    /// wanted columns in the same pass means a crossmatch pays one scan per
+    /// file, not one per column. Values are identical to the per-cell path
+    /// (`cell_in` parses the same row bytes; the astropy fixtures gate both).
+    ///
+    /// Rows past EOF (truncated file) yield `Cell::Null`, exactly like the
+    /// bounds-checked `cell()` path. If the file can't be re-opened or read
+    /// (moved since open?), the affected chunk falls back to the mmap —
+    /// slower, never wrong.
+    fn extract_columns(&self, cols: &[usize]) -> Vec<Vec<Cell>> {
+        let nrows = self.nrows as usize;
+        let mut out: Vec<Vec<Cell>> = cols.iter().map(|_| Vec::with_capacity(nrows)).collect();
+        if nrows == 0 || cols.is_empty() {
+            return out;
+        }
+        if self.row_width == 0 {
+            // Degenerate zero-width rows: every cell is Null/empty either way.
+            for r in 0..nrows as u64 {
+                for (o, &c) in out.iter_mut().zip(cols) {
+                    o.push(Table::cell(self, c, r));
+                }
+            }
+            return out;
+        }
+
+        // Rows lying wholly inside the mapped file; the mmap length is the
+        // file length at open time, which is what `row_bytes` checks against.
+        let full_rows = self
+            .file
+            .data()
+            .len()
+            .saturating_sub(self.data_offset)
+            .div_euclid(self.row_width)
+            .min(nrows);
+
+        // ~8 MB of whole rows per read (at least one row for very wide rows).
+        let rows_per_chunk = ((8 << 20) / self.row_width).max(1);
+        let mut buf = vec![0u8; rows_per_chunk * self.row_width];
+        let file = std::fs::File::open(&self.file.path).ok();
+
+        let mut row = 0usize;
+        while row < full_rows {
+            let count = rows_per_chunk.min(full_rows - row);
+            let byte_off = self.data_offset + row * self.row_width;
+            let nbytes = count * self.row_width;
+            let bytes: &[u8] = match &file {
+                Some(f) if read_exact_at(f, &mut buf[..nbytes], byte_off as u64).is_ok() => {
+                    &buf[..nbytes]
+                }
+                _ => &self.file.data()[byte_off..byte_off + nbytes],
+            };
+            for r in 0..count {
+                let row_bytes = &bytes[r * self.row_width..(r + 1) * self.row_width];
+                for (o, &c) in out.iter_mut().zip(cols) {
+                    o.push(self.cell_in(c, row_bytes));
+                }
+            }
+            row += count;
+        }
+        for _ in full_rows..nrows {
+            for o in out.iter_mut() {
+                o.push(Cell::Null);
+            }
+        }
+        out
     }
 }
 

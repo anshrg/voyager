@@ -95,6 +95,38 @@ impl<'h> RowSource for OpenTable<'h> {
             OpenTable::Joined(j) => RowSource::cell(j, col, row),
         }
     }
+
+    // The extraction methods MUST be forwarded, not left to trait defaults:
+    // the defaults loop `cell()` per row, which silently bypasses `Table`'s
+    // streaming scan and demand-faults the whole file through the mmap — the
+    // cold-sort/crossmatch "hang" on multi-GB catalogs.
+    fn extract_column(&self, col: usize) -> Vec<table::Cell> {
+        match self {
+            OpenTable::Fits(t) => RowSource::extract_column(t, col),
+            OpenTable::Joined(j) => RowSource::extract_column(j, col),
+        }
+    }
+
+    fn extract_columns(&self, cols: &[usize]) -> Vec<Vec<table::Cell>> {
+        match self {
+            OpenTable::Fits(t) => RowSource::extract_columns(t, cols),
+            OpenTable::Joined(j) => RowSource::extract_columns(j, cols),
+        }
+    }
+
+    fn column_f64(&self, col: usize) -> Vec<f64> {
+        match self {
+            OpenTable::Fits(t) => RowSource::column_f64(t, col),
+            OpenTable::Joined(j) => RowSource::column_f64(j, col),
+        }
+    }
+
+    fn columns_f64(&self, cols: &[usize]) -> Vec<Vec<f64>> {
+        match self {
+            OpenTable::Fits(t) => RowSource::columns_f64(t, cols),
+            OpenTable::Joined(j) => RowSource::columns_f64(j, cols),
+        }
+    }
 }
 
 fn resolve_table(
@@ -478,6 +510,52 @@ struct ViewResult {
     nrows: u64,
 }
 
+/// Fetch columns as cached cell arrays, extracting every cache miss in a
+/// single sequential scan (see `Table::extract_columns` — never per-cell
+/// mmap faulting). Returns the columns in request order; `hits` records
+/// "hit"/"miss" per column for the perf log. The cache lock is never held
+/// across a scan, so concurrent views on other files aren't blocked.
+fn cached_columns<T: RowSource>(
+    cache: &Mutex<table::cache::ColCache>,
+    t: &T,
+    path: &str,
+    hdu: usize,
+    cols: &[usize],
+    hits: &mut Vec<&'static str>,
+) -> Vec<Arc<Vec<table::Cell>>> {
+    let mut out: Vec<Option<Arc<Vec<table::Cell>>>> = vec![None; cols.len()];
+    let mut misses: Vec<usize> = Vec::new();
+    {
+        let mut c = cache.lock().unwrap();
+        for (i, &col) in cols.iter().enumerate() {
+            match c.get(&(path.to_string(), hdu, col)) {
+                Some(cells) => {
+                    out[i] = Some(cells);
+                    hits.push("hit");
+                }
+                None => {
+                    misses.push(col);
+                    hits.push("miss");
+                }
+            }
+        }
+    }
+    if !misses.is_empty() {
+        let extracted = t.extract_columns(&misses);
+        let mut c = cache.lock().unwrap();
+        for (col, cells) in misses.iter().zip(extracted) {
+            let cells = Arc::new(cells);
+            c.insert((path.to_string(), hdu, *col), cells.clone());
+            for (i, &want) in cols.iter().enumerate() {
+                if want == *col && out[i].is_none() {
+                    out[i] = Some(cells.clone());
+                }
+            }
+        }
+    }
+    out.into_iter().map(Option::unwrap).collect()
+}
+
 /// Build (and cache) a sort/filter view over a table HDU. The row-order
 /// permutation is stored in app state; `table_rows` then reads windows of it.
 /// Runs off-thread since sorting/filtering a large catalog touches the mmap.
@@ -501,23 +579,24 @@ async fn table_view(
     let (order, nrows, hits) =
         tauri::async_runtime::spawn_blocking(move || -> Result<(Option<Vec<u64>>, u64, String), String> {
             let t = handle.open()?;
-            // Sort/filter keys come from the materialized-column cache; a
-            // miss pays the one-time full-column scan (outside the lock so
-            // concurrent views on other files aren't blocked behind it).
-            let mut hits: Vec<&str> = Vec::new();
-            let fetch = |col: usize, hits: &mut Vec<&str>| -> Arc<Vec<table::Cell>> {
-                let key = (path.clone(), hdu, col);
-                if let Some(cells) = cache.lock().unwrap().get(&key) {
-                    hits.push("hit");
-                    return cells;
+            // Sort/filter keys come from the materialized-column cache; all
+            // misses are paid together with one sequential scan of the file
+            // (see `cached_columns`).
+            let mut hits: Vec<&'static str> = Vec::new();
+            let mut want: Vec<usize> = Vec::new();
+            if let Some(s) = sort {
+                want.push(s.col);
+            }
+            if let Some(f) = &filter {
+                if !want.contains(&f.col) {
+                    want.push(f.col);
                 }
-                hits.push("miss");
-                let cells = Arc::new(t.extract_column(col));
-                cache.lock().unwrap().insert(key, cells.clone());
-                cells
-            };
-            let sort_cells = sort.map(|s| fetch(s.col, &mut hits));
-            let filter_cells = filter.as_ref().map(|f| fetch(f.col, &mut hits));
+            }
+            let got = cached_columns(&cache, &t, &path, hdu, &want, &mut hits);
+            let col_cells =
+                |col: usize| got[want.iter().position(|&c| c == col).unwrap()].clone();
+            let sort_cells = sort.map(|s| col_cells(s.col));
+            let filter_cells = filter.as_ref().map(|f| col_cells(f.col));
             let order = table::build_view_from(
                 sort,
                 filter,
@@ -606,7 +685,8 @@ async fn table_columns_f64(
     let t0 = Instant::now();
     let out = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<Vec<f64>>, String> {
         let t = handle.open()?;
-        Ok(cols.iter().map(|&c| t.column_f64(c)).collect())
+        // One sequential scan for all requested columns (see Table::extract_columns).
+        Ok(t.columns_f64(&cols))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -673,28 +753,23 @@ async fn xmatch_tables(
     let cache = state.col_cache.clone();
 
     let t0 = Instant::now();
-    let (rows, matched, total_a, skipped_a, skipped_b, median) =
+    let (rows, matched, total_a, skipped_a, skipped_b, median, col_hits) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
             let ta = table::Table::open(&file_a, hdu_a)?;
             let tb = table::Table::open(&file_b, hdu_b)?;
             // Positions through the column cache: warm for later sorts and
-            // overlays, and re-runs with a different radius are instant.
-            let fetch = |t: &table::Table, path: &str, hdu: usize, col: usize| -> Vec<f64> {
-                let key = (path.to_string(), hdu, col);
-                let cells = match cache.lock().unwrap().get(&key) {
-                    Some(c) => c,
-                    None => {
-                        let c = Arc::new(t.extract_column(col));
-                        cache.lock().unwrap().insert(key, c.clone());
-                        c
-                    }
-                };
+            // overlays, re-runs with a different radius are instant, and each
+            // side's RA+Dec misses share one sequential scan of that file.
+            let mut hits: Vec<&'static str> = Vec::new();
+            let f64s = |cells: &Arc<Vec<table::Cell>>| -> Vec<f64> {
                 cells.iter().map(|c| c.as_f64()).collect()
             };
-            let ra_a = fetch(&ta, &path_a, hdu_a, ra_col_a);
-            let dec_a = fetch(&ta, &path_a, hdu_a, dec_col_a);
-            let ra_b = fetch(&tb, &path_b, hdu_b, ra_col_b);
-            let dec_b = fetch(&tb, &path_b, hdu_b, dec_col_b);
+            let got_a =
+                cached_columns(&cache, &ta, &path_a, hdu_a, &[ra_col_a, dec_col_a], &mut hits);
+            let got_b =
+                cached_columns(&cache, &tb, &path_b, hdu_b, &[ra_col_b, dec_col_b], &mut hits);
+            let (ra_a, dec_a) = (f64s(&got_a[0]), f64s(&got_a[1]));
+            let (ra_b, dec_b) = (f64s(&got_b[0]), f64s(&got_b[1]));
 
             let result = xmatch::crossmatch(
                 &ra_a,
@@ -728,7 +803,7 @@ async fn xmatch_tables(
                     .map(|p| table::join::JoinRow { a: p.a, b: Some(p.b), sep_deg: Some(p.sep_deg) })
                     .collect()
             };
-            Ok((rows, matched, ta.nrows, result.skipped_a as u64, result.skipped_b as u64, median))
+            Ok((rows, matched, ta.nrows, result.skipped_a as u64, result.skipped_b as u64, median, hits.join("+")))
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -749,12 +824,13 @@ async fn xmatch_tables(
     let columns = TableHandle::Derived(def.clone()).open()?.columns().to_vec();
     state.derived.lock().unwrap().insert(path.clone(), def);
     eprintln!(
-        "[voyager] xmatch {} rows ({} matched of {}) in {:.1} ms → {}",
+        "[voyager] xmatch {} rows ({} matched of {}) in {:.1} ms → {} (cols: {})",
         nrows,
         matched,
         total_a,
         t0.elapsed().as_secs_f64() * 1e3,
-        path
+        path,
+        col_hits
     );
     Ok(XmatchSummary {
         path,

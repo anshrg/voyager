@@ -5,6 +5,51 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## PR #11 closed 2026-08-14 — cold-scan hang diagnosed and fixed; needs re-test on the Mac
+
+Ansh (owner, M2 MacBook Air) tested the M5 crossmatch build from PR #11 and
+closed it: *"cross-match functionality does not work - enters indefinite
+loop."* That build predates the cold-scan fix, which had been diagnosed
+during live testing (first sort on the 1M-row/11 GB catalog hung) but never
+made it to GitHub — pushes were blocked by the repo ruleset ("changes must
+be made through a pull request", scoped to **all** branches; Ansh needs to
+re-scope it to `main` in Settings → Rules), and the container holding the
+unpushed commit was recycled, so the fix was **re-implemented from scratch**
+(this working tree; commit "cold column scans: stream…").
+
+**Root cause** (two layers):
+1. A cold full-column materialization looped `cell()` row by row,
+   demand-faulting the whole multi-GB file through the mmap one 4 KB page at
+   a time — minutes of synchronous fault latency on macOS, which presents as
+   an app-wide hang. A crossmatch needs RA/Dec cold from *both* catalogs
+   (plus the overlay's `table_columns_f64`), hence "cross-match enters
+   indefinite loop".
+2. Dispatch trap: `OpenTable` (lib.rs) implements `RowSource` but didn't
+   forward the extraction methods, so they resolved to the trait *defaults*
+   (per-cell loops) — any `Table`-level fast path was silently bypassed.
+
+**Fix**: `Table::extract_columns` streams whole rows in ~8 MB buffered
+`pread` chunks (sequential SSD-bandwidth I/O, no mmap faulting; mmap
+fallback if the file can't be re-read; Null tail past EOF identical to the
+bounds-checked path) and pulls **all requested columns in one scan** —
+`table_view` (sort+filter), `xmatch_tables` (RA+Dec per side), and
+`table_columns_f64` now pay one scan per file. `OpenTable` forwards every
+extraction method (comment in lib.rs warns about the default-method trap).
+Gated by: per-cell-identity test over the astropy fixtures, plus
+`tests/table_stream.rs` (multi-chunk 1.2M-row synthetic table + truncated
+file). 89 tests green, tsc clean.
+
+**Mac re-test needed** (then the PR #11 checklist): cold first sort on the
+11 GB catalog, and a crossmatch of two large catalogs — watch for
+`(cols: miss+miss…)` then `hit` on re-runs in the log. Container Linux
+timing: 1.2M×2-col scan ≈ 0.5 s debug.
+
+Status 2026-08-14: push of this fix rejected by the ruleset (git **and**
+GitHub API both `GH013`); patch re-sent to the user's chat as backup
+(`git am` on top of `277d5a5`); diagnosis + ruleset ask posted as a comment
+on closed PR #11. Reopening the PR is Ansh/Hollis's call — do not reopen
+unilaterally.
+
 ## Current milestone: everything implemented through M5 depth is now **user-verified working (2026-07-12)** — including zoom-flash fix, table horizontal scroll, the full M5-depth + multi-region-select surface, the overnight-2026-07-12 batch (region undo/redo, reverse-link-keeps-sort, new-polygon creation, position-column picker), cross-file marker→row, and real-data confirmation (row-locate on a wide JWST catalog + region save round-trip through DS9). Next work comes from BACKLOG (M6 packaging/polish, M4 polish, overlay follow-ups).
 
 > **Verification protocol change (2026-07-12, user request): do NOT verify by
