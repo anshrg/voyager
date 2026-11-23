@@ -2185,7 +2185,7 @@ function buildUi(): void {
   const editBtn = el("button", "", "Edit");
   editBtn.id = "region-edit-btn";
   editBtn.title =
-    "Region edit mode: drag empty space to draw the chosen shape; click a region to select, then drag its body to move or a handle to resize. ⌥-drag or right-drag pans. Delete removes the selected region. ⌘Z/⌘⇧Z undo/redo.";
+    "Region edit mode: drag empty space to draw the chosen shape; click a region to select, then drag its body to move or a handle to resize. ⌥-drag or right-drag pans. Delete removes the selected region. Selected polygon: double-click an edge to add a vertex, a vertex to remove it. ⌘Z/⌘⇧Z undo/redo.";
   const shapeSel = makeSelect(
     "region-shape-select",
     ["circle", "box", "ellipse", "annulus", "point", "polygon"],

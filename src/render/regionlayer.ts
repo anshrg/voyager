@@ -653,6 +653,44 @@ export function handlesFor(reg: PixelRegion, view: RegionView): Handle[] {
   return out;
 }
 
+/** Nearest polygon edge within `tol` screen px of (mx, my): the vertex index
+ *  to insert after and the image-pixel point on the edge, or null. Used to
+ *  insert a vertex (double-click an edge, issue #6). */
+export function hitTestPolygonEdge(
+  reg: PixelRegion,
+  view: RegionView,
+  mx: number,
+  my: number,
+  tol = 6,
+): { after: number; x: number; y: number } | null {
+  if (reg.shape !== "polygon" || reg.xs.length < 2) return null;
+  const project = screenMap(view);
+  const n = reg.xs.length;
+  let best: { after: number; x: number; y: number } | null = null;
+  let bestD = tol * view.dpr;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const [ax, ay] = project(reg.xs[i], reg.ys[i]);
+    const [bx, by] = project(reg.xs[j], reg.ys[j]);
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) continue;
+    const t = Math.min(1, Math.max(0, ((mx - ax) * dx + (my - ay) * dy) / len2));
+    const d = Math.hypot(mx - (ax + t * dx), my - (ay + t * dy));
+    if (d < bestD) {
+      bestD = d;
+      // Projection is affine, so t carries over to image space.
+      best = {
+        after: i,
+        x: reg.xs[i] + t * (reg.xs[j] - reg.xs[i]),
+        y: reg.ys[i] + t * (reg.ys[j] - reg.ys[i]),
+      };
+    }
+  }
+  return best;
+}
+
 /** Nearest handle within `tol` screen px of (mx, my), or null. */
 export function hitTestHandle(
   reg: PixelRegion,

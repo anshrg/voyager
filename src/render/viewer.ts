@@ -16,6 +16,7 @@ import {
   drawRubberBand,
   drawSourceMarkers,
   hitTestHandle,
+  hitTestPolygonEdge,
   hitTestRegion,
   hitTestSourceMarkers,
   makeRegion,
@@ -88,8 +89,8 @@ export interface ViewerCallbacks {
 
 /** In-progress region edit gesture (edit mode, left-drag). */
 type EditDrag =
-  | { mode: "move"; index: number; last: [number, number] }
-  | { mode: "resize"; index: number; role: HandleRole; nodeIndex: number }
+  | { mode: "move"; index: number; last: [number, number]; moved: boolean }
+  | { mode: "resize"; index: number; role: HandleRole; nodeIndex: number; moved: boolean }
   | { mode: "create"; index: number; anchor: [number, number]; moved: boolean };
 
 interface ImageRef {
@@ -940,13 +941,16 @@ export class Viewer {
       { passive: false },
     );
 
-    this.canvas.addEventListener("dblclick", () => {
+    this.canvas.addEventListener("dblclick", (e) => {
       // A dblclick's two pointerdowns already each added a vertex (via the
       // polygonDraft branch above); dedupe the accidental extra and close.
       if (this.polygonDraft) {
         this.closePolygonDraft(true);
         return;
       }
+      // Edit mode, selected polygon: dblclick a vertex deletes it, an edge
+      // inserts one (#6). Otherwise dblclick fits the view.
+      if (this.editMode && this.editPolygonTopology(e)) return;
       this.fit();
     });
   }
@@ -1145,6 +1149,7 @@ export class Viewer {
           index: this.selectedIndex,
           role: hd.role,
           nodeIndex: hd.index,
+          moved: false,
         };
         return;
       }
@@ -1156,7 +1161,7 @@ export class Viewer {
       if (this.selection.has(hit)) {
         this.snapshotForUndo();
         this.selectedIndex = hit;
-        this.editDrag = { mode: "move", index: hit, last: [ix, iy] };
+        this.editDrag = { mode: "move", index: hit, last: [ix, iy], moved: false };
       } else {
         this.selectRegion(hit);
         this.editDrag = null;
@@ -1255,6 +1260,7 @@ export class Viewer {
     const regs = this.regions;
     const d = this.editDrag;
     if (!regs || !d) return;
+    if (d.mode !== "create") d.moved = true;
     switch (d.mode) {
       case "move": {
         const dx = ix - d.last[0];
@@ -1280,6 +1286,36 @@ export class Viewer {
     this.requestDraw();
   }
 
+  /** Insert/delete a vertex of the selected polygon under a dblclick.
+   *  Returns true if the dblclick was consumed (even when refused). */
+  private editPolygonTopology(e: MouseEvent): boolean {
+    const regs = this.regions;
+    if (!regs || this.selectedIndex < 0) return false;
+    const reg = regs[this.selectedIndex];
+    if (reg.shape !== "polygon") return false;
+    const view = this.regionView();
+    const [mx, my] = this.toCanvasPx(e);
+    const hd = hitTestHandle(reg, view, mx, my);
+    if (hd && hd.role === "node") {
+      if (reg.xs.length <= 3) {
+        this.callbacks.onRegionPick("a polygon needs at least 3 vertices");
+        return true;
+      }
+      this.snapshotForUndo();
+      reg.xs.splice(hd.index, 1);
+      reg.ys.splice(hd.index, 1);
+    } else {
+      const edge = hitTestPolygonEdge(reg, view, mx, my);
+      if (!edge) return false;
+      this.snapshotForUndo();
+      reg.xs.splice(edge.after + 1, 0, edge.x);
+      reg.ys.splice(edge.after + 1, 0, edge.y);
+    }
+    this.emitSelectionPick();
+    this.requestDraw();
+    return true;
+  }
+
   private endEditGesture(): void {
     const d = this.editDrag;
     this.editDrag = null;
@@ -1293,6 +1329,9 @@ export class Viewer {
       this.selectRegion(-1);
       return;
     }
+    // A press on a handle/body that never moved changed nothing: drop its
+    // undo snapshot so ⌘Z undoes real edits, not clicks (and dblclicks).
+    if (d.mode !== "create" && !d.moved) this.undoStack.pop();
     // Report the finished region and refresh toolbar (create adds to the set).
     this.selectRegion(d.index);
     if (d.mode === "create") this.callbacks.onRegionsChanged();
