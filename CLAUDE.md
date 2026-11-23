@@ -31,7 +31,7 @@ docs/            STATE.md (living handoff), BACKLOG.md (parked features)
 2. **Correctness is gated on astropy fixtures.** Python scripts in `scripts/` generate FITS files + expected-value JSON into `fixtures/`; Rust tests compare against them. Any new parsing/math feature gets a fixture test (pattern borrowed from the fitsgl project).
 3. **GPU does the visual math** (M1+): stretch, scale limits, colormaps are shader uniforms/LUTs so re-stretching is one frame, never a CPU re-render. Note: `R32F` textures are NEAREST-filter-only in core WebGL2.
 4. **Match DS9/astropy semantics** where they exist (zscale algorithm, region formats, WCS conventions) — the user will compare side-by-side.
-5. **fitsgl (github.com/hollisakins/fitsgl) is a design reference only** — it has no license; do not copy code from it.
+5. **fitsgl and CAMPFIRE code may be reused.** Hollis Akins gave the user explicit permission (2026-11) to copy/replicate any code from CAMPFIRE (github.com/hollisakins/campfire, MIT) and fitsgl (`@fitsgl/core` on npm, declared MIT; the GitHub repo itself has no LICENSE file). Prefer porting his code over re-deriving it when it's equal or better; credit the source in a comment (`// Ported from fitsgl <path> (MIT, H. Akins)`). Still gate ported math on astropy fixtures.
 6. **File-open paths**: dialog, macOS Apple Events (`RunEvent::Opened`), CLI args. All funnel through `dispatch_open` in `lib.rs` (queue + event, frontend drains queue once at startup).
 
 ## Dev commands

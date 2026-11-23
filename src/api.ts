@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import type { TrilogyStats } from "./render/trilogy";
 
 export type HduKind = "image" | "bin_table" | "ascii_table" | "unknown";
 
@@ -152,6 +153,31 @@ export interface WcsParams {
 /** Fetch an HDU's WCS parameters, or null when it has no supported TAN WCS. */
 export function getWcs(path: string, hdu: number): Promise<WcsParams | null> {
   return invoke<WcsParams | null>("get_wcs", { path, hdu });
+}
+
+/** A band's filter identity (fitsgl-style detection; header, else filename). */
+export interface DetectedBand {
+  filter: string;
+  instrument: string;
+  telescope: string;
+  pivot_um: number;
+  is_broadband: boolean;
+}
+
+export interface BandInfo {
+  /** Trilogy stats (null for an empty/constant band, or when not requested). */
+  stats: TrilogyStats | null;
+  /** zscale limits over the same sample (simple-RGB defaults). */
+  zscale: [number, number] | null;
+  band: DetectedBand | null;
+  bunit: string | null;
+}
+
+/** Band identity + (optionally) trilogy stats for RGB compositing. With
+ *  stats, ~1M native pixels are grid-sampled (sparse rows, never the full
+ *  array); without, it reads headers only. */
+export function getBandInfo(path: string, hdu: number, withStats: boolean): Promise<BandInfo> {
+  return invoke<BandInfo>("get_band_info", { path, hdu, withStats });
 }
 
 export interface Histogram {

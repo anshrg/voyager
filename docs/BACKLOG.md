@@ -146,6 +146,19 @@ anything. Promote items into a milestone deliberately, not casually.
   0.5`): a small expression evaluator over cached columns — the natural
   extension of the column cache, still no SQL engine.
 
+## RGB composites v2 (from #14, shipped 2026-11-23)
+
+- **Mismatched pixel grids**: GPU reprojection so bands on different grids
+  composite (NIRCam 0.03″ + MIRI 0.11″, HST + JWST). Today the dialog greys
+  them out with the reason (`gridMismatch` in src/render/trilogy.ts).
+- **Save the composite to a file** (optional): PNG of the current view and/or
+  a full-resolution render.
+- Wavelength-proportional rainbow option (hues spaced by log λ, not rank) —
+  matters for mixed NIRCam+MIRI sets.
+- Per-pixel weight renormalization at coverage edges (CAMPFIRE pipeline
+  style) as an option; current shader follows fitsgl (missing band adds 0,
+  so edges dim instead of shifting color).
+
 ## User ideas (add here as they come up)
 
 - ~~**Multi-frame (2026-07-04)**~~ **first cut DONE 2026-07-05**: multiple
