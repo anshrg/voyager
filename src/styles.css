@@ -1086,3 +1086,76 @@ table.cards td {
   color: var(--fg-dim);
   font-size: 11px;
 }
+
+/* ---- selected-region properties (#7) ---- */
+.rp-box {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+.rp-section {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+
+.rp-hint,
+.rp-dim {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.rp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.rp-grid {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 3px 8px;
+  align-items: center;
+}
+
+.rp-label {
+  color: var(--fg-dim);
+}
+
+.rp-num,
+.rp-text,
+.rp-width {
+  padding: 2px 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.rp-width {
+  width: 44px;
+}
+
+.rp-style {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.rp-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--fg-dim);
+}

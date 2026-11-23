@@ -43,6 +43,7 @@ import {
   type RegionLayer,
   type RegionPanelHost,
 } from "./regionpanel";
+import { RegionProps } from "./regionprops";
 import { compositeDraw, distinctUnits, initialRgbState, moveRgbBand, renderRgbPanel, type RgbState } from "./rgb";
 
 type ViewTab = "image" | "table" | "header";
@@ -746,6 +747,8 @@ async function saveRegionLayer(frame: Frame, id: number): Promise<void> {
 
 /** Region panel body + save-frame select (built in buildUi). */
 let regionPanelBody: HTMLElement | null = null;
+/** Selected-region properties section of the panel (#7). */
+let regionProps: RegionProps | null = null;
 let regionSaveFrame: HTMLSelectElement | null = null;
 
 function showRegionPanel(show: boolean): void {
@@ -822,6 +825,7 @@ function renderRegionPanel(): void {
   if (!regionPanelBody || !panel || panel.style.display === "none") return;
   const f = activeFrame();
   renderRegionLayers(regionPanelBody, f?.regionLayers ?? [], f?.activeLayer ?? null, regionHost);
+  regionProps?.sync();
 }
 
 // ---- frame Viewer lifecycle ----------------------------------------------
@@ -853,6 +857,7 @@ function makeViewer(frame: Frame): Viewer {
     onRegionPick: (desc) => {
       if (frame !== activeFrame()) return;
       must<HTMLElement>("region-info").textContent = desc ?? "";
+      if (must<HTMLElement>("region-panel").style.display !== "none") regionProps?.sync();
     },
     onRegionsChanged: () => {
       if (frame === activeFrame()) renderRegionPanel();
@@ -2565,6 +2570,14 @@ function buildUi(): void {
   imagePane.append(rp.root);
   regionPanelBody = rp.body;
   regionSaveFrame = rp.frameSelect;
+  const propsBox = el("div", "rp-box");
+  propsBox.append(el("div", "rp-section", "Selected region"));
+  rp.root.append(propsBox);
+  regionProps = new RegionProps(propsBox, {
+    viewer: () => activeFrame()?.viewer ?? null,
+    wcs: () => activeFrame()?.wcs ?? null,
+    layerName: (id) => activeFrame()?.regionLayers.find((l) => l.id === id)?.name ?? "no layer",
+  });
 }
 
 async function init(): Promise<void> {

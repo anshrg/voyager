@@ -290,7 +290,8 @@ export function drawSourceMarkers(
 }
 
 /** Center pixel (0-based) of a region; polygon uses its vertex centroid. */
-function regionCenterPx(reg: PixelRegion): [number, number] {
+/** Region center in image px (polygon: vertex centroid). */
+export function regionCenterPx(reg: PixelRegion): [number, number] {
   if (reg.shape === "polygon") {
     const n = reg.xs.length || 1;
     return [reg.xs.reduce((a, b) => a + b, 0) / n, reg.ys.reduce((a, b) => a + b, 0) / n];
@@ -795,6 +796,87 @@ export function resizeRegion(
     case "point":
       break;
   }
+}
+
+/** CSS cursor for hovering a handle (#7): rotate → grab, polygon vertex →
+ *  move, size handles → the resize arrow along the handle's direction from
+ *  the region center on screen. */
+export function handleCursor(reg: PixelRegion, hd: Handle, view: RegionView): string {
+  if (hd.role === "rot") return "grab";
+  if (hd.role === "node") return "move";
+  const [px, py] = regionCenterPx(reg);
+  const [cx, cy] = screenMap(view)(px, py);
+  const deg = (((Math.atan2(hd.sy - cy, hd.sx - cx) * 180) / Math.PI) % 180 + 180) % 180;
+  // Screen y grows down: 45° points down-right (nwse), 135° down-left (nesw).
+  if (deg < 22.5 || deg >= 157.5) return "ew-resize";
+  if (deg < 67.5) return "nwse-resize";
+  if (deg < 112.5) return "ns-resize";
+  return "nesw-resize";
+}
+
+/** The size a handle role controls (for group-scale ratios), or null. */
+export function handleSize(reg: PixelRegion, role: HandleRole): number | null {
+  switch (reg.shape) {
+    case "circle":
+      return role === "r" ? reg.r : null;
+    case "annulus":
+      return role === "rin" ? reg.rin : role === "rout" ? reg.rout : null;
+    case "ellipse":
+      return role === "rx" ? reg.rx : role === "ry" ? reg.ry : null;
+    case "box":
+      return role === "w" ? reg.w : role === "h" ? reg.h : null;
+    default:
+      return null;
+  }
+}
+
+/** Scale a region about image point (cx, cy) by `s` (center + sizes). */
+export function scaleRegionAbout(reg: PixelRegion, cx: number, cy: number, s: number): void {
+  if (reg.shape === "polygon") {
+    for (let i = 0; i < reg.xs.length; i++) {
+      reg.xs[i] = cx + s * (reg.xs[i] - cx);
+      reg.ys[i] = cy + s * (reg.ys[i] - cy);
+    }
+    return;
+  }
+  reg.x = cx + s * (reg.x - cx);
+  reg.y = cy + s * (reg.y - cy);
+  switch (reg.shape) {
+    case "circle":
+      reg.r = Math.max(0.5, reg.r * s);
+      break;
+    case "annulus":
+      reg.rin = Math.max(0.5, reg.rin * s);
+      reg.rout = Math.max(reg.rin + 0.5, reg.rout * s);
+      break;
+    case "ellipse":
+      reg.rx = Math.max(0.5, reg.rx * s);
+      reg.ry = Math.max(0.5, reg.ry * s);
+      break;
+    case "box":
+      reg.w = Math.max(1, reg.w * s);
+      reg.h = Math.max(1, reg.h * s);
+      break;
+    case "point":
+      break;
+  }
+}
+
+/** Rotate a region about image point (cx, cy) by `deg` (CCW, image y up). */
+export function rotateRegionAbout(reg: PixelRegion, cx: number, cy: number, deg: number): void {
+  const a = (deg * Math.PI) / 180;
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  const rot = (x: number, y: number): [number, number] => [
+    cx + c * (x - cx) - s * (y - cy),
+    cy + s * (x - cx) + c * (y - cy),
+  ];
+  if (reg.shape === "polygon") {
+    for (let i = 0; i < reg.xs.length; i++) [reg.xs[i], reg.ys[i]] = rot(reg.xs[i], reg.ys[i]);
+    return;
+  }
+  [reg.x, reg.y] = rot(reg.x, reg.y);
+  if (reg.shape === "ellipse" || reg.shape === "box") reg.angle = normDeg(reg.angle + deg);
 }
 
 /** Shapes the create tool can draw. Polygon is click-to-add-vertices

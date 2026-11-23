@@ -15,8 +15,13 @@ import {
   drawRegions,
   drawRubberBand,
   drawSourceMarkers,
+  handleCursor,
+  handleSize,
   hitTestHandle,
   hitTestPolygonEdge,
+  regionCenterPx,
+  rotateRegionAbout,
+  scaleRegionAbout,
   hitTestRegion,
   hitTestSourceMarkers,
   makeRegion,
@@ -90,7 +95,16 @@ export interface ViewerCallbacks {
 /** In-progress region edit gesture (edit mode, left-drag). */
 type EditDrag =
   | { mode: "move"; index: number; last: [number, number]; moved: boolean }
-  | { mode: "resize"; index: number; role: HandleRole; nodeIndex: number; moved: boolean }
+  | {
+      mode: "resize";
+      index: number;
+      role: HandleRole;
+      nodeIndex: number;
+      moved: boolean;
+      /** Multi-select: originals of every selected region + their centroid;
+       *  the primary's handle sets a scale (or rotation) applied to all. */
+      group: { orig: Map<number, PixelRegion>; cx: number; cy: number } | null;
+    }
   | { mode: "create"; index: number; anchor: [number, number]; moved: boolean };
 
 interface ImageRef {
@@ -1007,11 +1021,10 @@ export class Viewer {
     const idx = this.regions ? hitTestRegion(this.regions, view, mx, my, 6, this.layerStyle) : -1;
     if (this.editMode) {
       // Cursor hints the gesture: resize a handle, move a body, or draw.
-      const onHandle =
-        this.regions !== null &&
-        this.selectedIndex >= 0 &&
-        hitTestHandle(this.regions[this.selectedIndex], view, mx, my) !== null;
-      this.canvas.style.cursor = onHandle ? "pointer" : idx >= 0 ? "move" : "crosshair";
+      const sel = this.regions !== null && this.selectedIndex >= 0 ? this.regions[this.selectedIndex] : null;
+      const hd = sel ? hitTestHandle(sel, view, mx, my) : null;
+      this.canvas.style.cursor =
+        sel && hd ? handleCursor(sel, hd, view) : idx >= 0 ? "move" : "crosshair";
     } else {
       this.canvas.style.cursor = idx >= 0 ? "pointer" : "";
     }
@@ -1150,6 +1163,7 @@ export class Viewer {
           role: hd.role,
           nodeIndex: hd.index,
           moved: false,
+          group: this.groupFor(hd.role),
         };
         return;
       }
@@ -1273,7 +1287,8 @@ export class Viewer {
         break;
       }
       case "resize":
-        resizeRegion(regs[d.index], d.role, d.nodeIndex, ix, iy);
+        if (d.group) this.resizeGroup(d.group, d.index, d.role, d.nodeIndex, ix, iy);
+        else resizeRegion(regs[d.index], d.role, d.nodeIndex, ix, iy);
         break;
       case "create": {
         d.moved = true;
@@ -1284,6 +1299,81 @@ export class Viewer {
       }
     }
     this.requestDraw();
+  }
+
+  /** Group-resize setup when several regions are selected and the handle is
+   *  a size/rotate handle (polygon vertices stay single-region edits). */
+  private groupFor(role: HandleRole): { orig: Map<number, PixelRegion>; cx: number; cy: number } | null {
+    if (!this.regions || this.selection.size < 2 || role === "node") return null;
+    const orig = new Map<number, PixelRegion>();
+    let sx = 0;
+    let sy = 0;
+    for (const i of this.selection) {
+      const r = this.regions[i];
+      orig.set(i, structuredClone(r));
+      const [x, y] = regionCenterPx(r);
+      sx += x;
+      sy += y;
+    }
+    return { orig, cx: sx / orig.size, cy: sy / orig.size };
+  }
+
+  /** Multi-select resize (#7): measure what the primary's handle drag does to
+   *  the primary alone (size ratio, or angle change for a rotate handle), then
+   *  apply that as one scale/rotation of every selected region about the
+   *  group centroid, always from the originals (no drift). */
+  private resizeGroup(
+    g: { orig: Map<number, PixelRegion>; cx: number; cy: number },
+    primary: number,
+    role: HandleRole,
+    nodeIndex: number,
+    ix: number,
+    iy: number,
+  ): void {
+    const regs = this.regions;
+    const p0 = g.orig.get(primary);
+    if (!regs || !p0) return;
+    const probe = structuredClone(p0);
+    resizeRegion(probe, role, nodeIndex, ix, iy);
+    let apply: (r: PixelRegion) => void;
+    if (role === "rot" && (probe.shape === "ellipse" || probe.shape === "box") && (p0.shape === "ellipse" || p0.shape === "box")) {
+      const delta = probe.angle - p0.angle;
+      apply = (r) => rotateRegionAbout(r, g.cx, g.cy, delta);
+    } else {
+      const before = handleSize(p0, role);
+      const after = handleSize(probe, role);
+      if (!before || !after) return;
+      const s = after / before;
+      apply = (r) => scaleRegionAbout(r, g.cx, g.cy, s);
+    }
+    for (const [i, o] of g.orig) {
+      const r = structuredClone(o);
+      apply(r);
+      regs[i] = r;
+    }
+  }
+
+  /** The selected regions (primary first), for the properties panel. */
+  selectedIndices(): number[] {
+    if (this.selectedIndex < 0) return [...this.selection];
+    return [this.selectedIndex, ...[...this.selection].filter((i) => i !== this.selectedIndex)];
+  }
+
+  regionAt(i: number): PixelRegion | null {
+    return this.regions?.[i] ?? null;
+  }
+
+  /** Apply a property edit to regions (numeric entry, color, label): one
+   *  undo step, redraw, and re-report the selection. */
+  editRegions(indices: number[], fn: (r: PixelRegion) => void): void {
+    if (!this.regions || indices.length === 0) return;
+    this.snapshotForUndo();
+    for (const i of indices) {
+      const r = this.regions[i];
+      if (r) fn(r);
+    }
+    this.requestDraw();
+    this.emitSelectionPick();
   }
 
   /** Insert/delete a vertex of the selected polygon under a dblclick.
