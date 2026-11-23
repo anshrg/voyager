@@ -20,11 +20,11 @@ export interface RegionView {
 const DEFAULT_COLOR = "#00ff00"; // DS9 default green; .reg names are CSS-valid
 
 /** Per-layer display state (multiple region files on one image). Regions in
- *  a hidden layer are neither drawn nor hit-tested; a layer color overrides
- *  each region's own DS9 color. */
+ *  a hidden layer are neither drawn nor hit-tested. (Layer colors are not an
+ *  override: the panel's layer swatch writes each region's own color, so it
+ *  is undoable and saved with the layer.) */
 export interface LayerStyle {
   hidden: ReadonlySet<number>;
-  colors: ReadonlyMap<number, string>;
 }
 
 /** Whether a region is in a visible layer (untagged regions always are). */
@@ -32,9 +32,8 @@ export function regionShown(reg: PixelRegion, layers?: LayerStyle): boolean {
   return !layers || reg.layer === undefined || !layers.hidden.has(reg.layer);
 }
 
-function regionColor(reg: PixelRegion, layers?: LayerStyle): string {
-  const over = reg.layer !== undefined ? layers?.colors.get(reg.layer) : undefined;
-  return over ?? reg.color ?? DEFAULT_COLOR;
+function regionColor(reg: PixelRegion): string {
+  return reg.color ?? DEFAULT_COLOR;
 }
 
 /** Which regions to draw emphasized (indices into the region array, -1 =
@@ -83,7 +82,7 @@ export function drawRegions(
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
     if (!regionShown(reg, layers)) continue;
-    const color = regionColor(reg, layers);
+    const color = regionColor(reg);
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =

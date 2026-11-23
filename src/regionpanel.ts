@@ -15,8 +15,6 @@ export interface RegionLayer {
   /** Source/last-saved .reg path; null = drawn in Voyager, never saved. */
   path: string | null;
   visible: boolean;
-  /** Color override for every region in the layer (null = file's colors). */
-  color: string | null;
   /** Parser warnings from the last load (unsupported shapes etc.). */
   warnings: string[];
 }
@@ -24,20 +22,41 @@ export interface RegionLayer {
 let nextLayerId = 1;
 
 export function newLayer(name: string, path: string | null): RegionLayer {
-  return { id: nextLayerId++, name, path, visible: true, color: null, warnings: [] };
+  return { id: nextLayerId++, name, path, visible: true, warnings: [] };
 }
 
 export interface RegionPanelHost {
   /** Region count per layer id (from the viewer). */
   counts(): Map<number, number>;
+  /** Each layer's region color (shared, or the first one + `mixed`). */
+  colors(): Map<number, { color: string; mixed: boolean }>;
   toggleVisible(id: number): void;
   setActive(id: number): void;
-  setColor(id: number, color: string | null): void;
+  /** Recolor every region of a layer (one undo step per picker session,
+   *  identified by `session`). */
+  setColor(id: number, color: string, session: number): void;
   save(id: number): void;
   close(id: number): void;
   load(): void;
   newLayer(): void;
   showAll(visible: boolean): void;
+}
+
+/** Any CSS color (DS9 names like "green", "cyan") → #rrggbb for <input type=color>. */
+export function toHex(color: string | null): string {
+  const ctx = document.createElement("canvas").getContext("2d");
+  if (!ctx) return "#00ff00";
+  ctx.fillStyle = "#00ff00";
+  ctx.fillStyle = color ?? "#00ff00";
+  const v = ctx.fillStyle;
+  return v.startsWith("#") ? v : "#00ff00";
+}
+
+let pickerSession = 0;
+/** A new id each time a color picker is opened/committed, so one drag through
+ *  the picker coalesces into one undo step. */
+export function nextPickerSession(): number {
+  return ++pickerSession;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
@@ -56,6 +75,7 @@ export function renderRegionLayers(
 ): void {
   root.replaceChildren();
   const counts = host.counts();
+  const colors = host.colors();
   if (layers.length === 0) {
     root.append(el("div", "rl-empty", "No region layers. Load a .reg file, or turn on Edit and draw."));
   }
@@ -86,15 +106,24 @@ export function renderRegionLayers(
 
     const color = el("input", "rl-color");
     color.type = "color";
-    color.value = l.color ?? "#00ff00";
-    color.classList.toggle("unset", l.color === null);
-    color.title = l.color ? "Layer color override (⌥-click to reset to the file's colors)" : "Override the layer's color";
-    color.addEventListener("input", () => host.setColor(l.id, color.value));
-    color.addEventListener("click", (e) => {
-      if (e.altKey && l.color !== null) {
-        e.preventDefault();
-        host.setColor(l.id, null);
-      }
+    const lc = colors.get(l.id);
+    color.value = toHex(lc?.color ?? "#00ff00");
+    color.classList.toggle("mixed", lc?.mixed ?? false);
+    color.disabled = !lc;
+    color.title = lc?.mixed
+      ? "Regions have mixed colors — pick one to recolor the whole layer (⌘Z undoes)"
+      : "Recolor every region in this layer (⌘Z undoes)";
+    let session = nextPickerSession();
+    color.addEventListener("click", () => {
+      session = nextPickerSession();
+    });
+    color.addEventListener("input", () => {
+      color.classList.remove("mixed");
+      host.setColor(l.id, color.value, session);
+    });
+    color.addEventListener("change", () => {
+      host.setColor(l.id, color.value, session);
+      session = nextPickerSession();
     });
 
     const save = el("button", "rl-btn", "Save");

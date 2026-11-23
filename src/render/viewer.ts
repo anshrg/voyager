@@ -26,6 +26,7 @@ import {
   hitTestSourceMarkers,
   makeRegion,
   regionsInRect,
+  regionShown,
   type LayerStyle,
   resizeRegion,
   translateRegion,
@@ -52,6 +53,14 @@ const NAN_READOUT = "NaN";
 // we requested each one we'd fetch (and mostly discard) hundreds of tiles.
 // During the burst the backdrop + already-cached levels keep the view filled.
 const ZOOM_SETTLE_MS = 120;
+/** One undo/redo state: the full region array plus the selection at that
+ *  moment, so ⌘Z brings back what was selected when the edit was made. */
+interface UndoEntry {
+  regions: PixelRegion[];
+  selection: number[];
+  primary: number;
+}
+
 // Bound on the region-edit undo stack (Cmd+Z / Cmd+Shift+Z).
 const MAX_UNDO = 50;
 
@@ -142,7 +151,7 @@ export class Viewer {
   /** Loaded region overlay (pixel space of the current HDU), or null. */
   private regions: PixelRegion[] | null = null;
   /** Per-layer visibility + color overrides (multiple region files). */
-  private layerStyle: LayerStyle = { hidden: new Set(), colors: new Map() };
+  private layerStyle: LayerStyle = { hidden: new Set() };
   /** Layer the region being created in the current gesture goes into. */
   private createLayer: number | undefined = undefined;
   /** Region indices under the cursor / clicked (-1 = none). */
@@ -187,8 +196,11 @@ export class Viewer {
   /** Region-edit undo/redo: snapshots of the full region array taken just
    *  before each mutating gesture (create/move/resize/delete). Cleared
    *  whenever the region set is replaced wholesale (load, HDU/image switch). */
-  private undoStack: PixelRegion[][] = [];
-  private redoStack: PixelRegion[][] = [];
+  private undoStack: UndoEntry[] = [];
+  private redoStack: UndoEntry[] = [];
+  /** Key of the coalescing edit (e.g. one color-picker drag) that made the
+   *  top undo entry; a further edit with the same key reuses that entry. */
+  private undoCoalesce: string | null = null;
 
   private image: ImageRef | null = null;
   /** RGB composite mode: the bands (all on `image`'s grid; image = bands[0]
@@ -514,6 +526,29 @@ export class Viewer {
     return (this.regions ?? []).filter((r) => r.layer === layer);
   }
 
+  /** Each layer's display color: the shared color of its regions, or the
+   *  first region's with `mixed` when they differ (layer swatch). */
+  layerColors(): Map<number, { color: string; mixed: boolean }> {
+    const m = new Map<number, { color: string; mixed: boolean }>();
+    for (const r of this.regions ?? []) {
+      if (r.layer === undefined) continue;
+      const c = (r.color ?? "#00ff00").toLowerCase();
+      const cur = m.get(r.layer);
+      if (!cur) m.set(r.layer, { color: c, mixed: false });
+      else if (cur.color !== c) cur.mixed = true;
+    }
+    return m;
+  }
+
+  /** Indices of every region in a layer. */
+  layerIndices(layer: number): number[] {
+    const out: number[] = [];
+    (this.regions ?? []).forEach((r, i) => {
+      if (r.layer === layer) out.push(i);
+    });
+    return out;
+  }
+
   /** Region count per layer id. */
   layerCounts(): Map<number, number> {
     const m = new Map<number, number>();
@@ -534,10 +569,39 @@ export class Viewer {
   /** Snapshot the current region set for undo, just before a mutating edit
    *  gesture (create/move/resize/delete). Caps the stack and drops redo
    *  history (a fresh edit invalidates any undone-then-redone future). */
-  private snapshotForUndo(): void {
-    this.undoStack.push(this.regions ? structuredClone(this.regions) : []);
+  private snapshotForUndo(coalesce: string | null = null): void {
+    if (coalesce !== null && coalesce === this.undoCoalesce && this.undoStack.length > 0) return;
+    this.undoCoalesce = coalesce;
+    this.undoStack.push(this.undoState());
     if (this.undoStack.length > MAX_UNDO) this.undoStack.shift();
     this.redoStack = [];
+  }
+
+  private undoState(): UndoEntry {
+    return {
+      regions: this.regions ? structuredClone(this.regions) : [],
+      selection: [...this.selection],
+      primary: this.selectedIndex,
+    };
+  }
+
+  /** Restore an undo/redo state, selection included (indices refer to that
+   *  state's own region array, so they stay valid). */
+  private restoreUndoState(e: UndoEntry): void {
+    this.undoCoalesce = null;
+    this.regions = e.regions;
+    this.hoverIndex = -1;
+    const n = e.regions.length;
+    const hidden = (i: number): boolean => !regionShown(e.regions[i], this.layerStyle);
+    this.selection = new Set(e.selection.filter((i) => i < n && !hidden(i)));
+    this.selectedIndex = this.selection.has(e.primary)
+      ? e.primary
+      : this.selection.size > 0
+        ? [...this.selection][this.selection.size - 1]
+        : -1;
+    this.emitSelectionPick();
+    this.callbacks.onRegionsChanged();
+    this.requestDraw();
   }
 
   /** Undo the last region edit (create/move/resize/delete). No-op if there's
@@ -545,26 +609,16 @@ export class Viewer {
   undo(): void {
     if (this.undoStack.length === 0) return;
     const prev = this.undoStack.pop()!;
-    this.redoStack.push(this.regions ? structuredClone(this.regions) : []);
-    this.regions = prev;
-    this.hoverIndex = -1;
-    this.clearSelection();
-    this.callbacks.onRegionPick(null);
-    this.callbacks.onRegionsChanged();
-    this.requestDraw();
+    this.redoStack.push(this.undoState());
+    this.restoreUndoState(prev);
   }
 
   /** Redo the last undone region edit. No-op if there's nothing to redo. */
   redo(): void {
     if (this.redoStack.length === 0) return;
     const next = this.redoStack.pop()!;
-    this.undoStack.push(this.regions ? structuredClone(this.regions) : []);
-    this.regions = next;
-    this.hoverIndex = -1;
-    this.clearSelection();
-    this.callbacks.onRegionPick(null);
-    this.callbacks.onRegionsChanged();
-    this.requestDraw();
+    this.undoStack.push(this.undoState());
+    this.restoreUndoState(next);
   }
 
   hasRegions(): boolean {
@@ -1365,9 +1419,9 @@ export class Viewer {
 
   /** Apply a property edit to regions (numeric entry, color, label): one
    *  undo step, redraw, and re-report the selection. */
-  editRegions(indices: number[], fn: (r: PixelRegion) => void): void {
+  editRegions(indices: number[], fn: (r: PixelRegion) => void, coalesce: string | null = null): void {
     if (!this.regions || indices.length === 0) return;
-    this.snapshotForUndo();
+    this.snapshotForUndo(coalesce);
     for (const i of indices) {
       const r = this.regions[i];
       if (r) fn(r);
@@ -1422,8 +1476,15 @@ export class Viewer {
     // A press on a handle/body that never moved changed nothing: drop its
     // undo snapshot so ⌘Z undoes real edits, not clicks (and dblclicks).
     if (d.mode !== "create" && !d.moved) this.undoStack.pop();
-    // Report the finished region and refresh toolbar (create adds to the set).
-    this.selectRegion(d.index);
+    // Moving/resizing one member of a multi-selection keeps the whole group
+    // selected (with the dragged region as primary); otherwise select just it.
+    if (d.mode !== "create" && this.selection.has(d.index)) {
+      this.selectedIndex = d.index;
+      this.requestDraw();
+      this.emitSelectionPick();
+    } else {
+      this.selectRegion(d.index);
+    }
     if (d.mode === "create") this.callbacks.onRegionsChanged();
   }
 

@@ -1056,8 +1056,15 @@ table.cards td {
   cursor: pointer;
 }
 
-.rl-color.unset {
+/* Layer whose regions have different colors: rainbow ring around the swatch. */
+.rl-color.mixed {
+  border: 2px solid transparent;
+  background: conic-gradient(#f43f5e, #facc15, #22c55e, #06b6d4, #6366f1, #f43f5e) border-box;
+}
+
+.rl-color:disabled {
   opacity: 0.35;
+  cursor: default;
 }
 
 .rl-btn {

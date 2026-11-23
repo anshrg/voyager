@@ -10,11 +10,14 @@
 import type { PixelRegion } from "./api";
 import type { Viewer } from "./render/viewer";
 import type { Wcs } from "./render/wcs";
+import { nextPickerSession, toHex } from "./regionpanel";
 
 export interface RegionPropsHost {
   viewer(): Viewer | null;
   wcs(): Wcs | null;
   layerName(id: number | undefined): string;
+  /** A property edit landed (refresh the layer list's counts/swatches). */
+  edited(): void;
 }
 
 type Units = "pixel" | "sky";
@@ -33,16 +36,6 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
   if (cls) n.className = cls;
   if (text !== undefined) n.textContent = text;
   return n;
-}
-
-/** Any CSS color (DS9 names like "green", "cyan") → #rrggbb for <input type=color>. */
-function toHex(color: string | null): string {
-  const ctx = document.createElement("canvas").getContext("2d");
-  if (!ctx) return "#00ff00";
-  ctx.fillStyle = "#00ff00";
-  ctx.fillStyle = color ?? "#00ff00";
-  const v = ctx.fillStyle;
-  return v.startsWith("#") ? v : "#00ff00";
 }
 
 function center(r: PixelRegion): [number, number] {
@@ -163,9 +156,10 @@ export class RegionProps {
     const grid = el("div", "rp-grid");
     this.root.append(grid);
 
-    const commit = (fn: (r: PixelRegion) => void): void => {
-      v.editRegions(idx, fn);
+    const commit = (fn: (r: PixelRegion) => void, coalesce: string | null = null): void => {
+      v.editRegions(idx, fn, coalesce);
       this.sync();
+      this.host.edited();
     };
     const numRow = (fd: Field): void => {
       const inp = el("input", "rp-num");
@@ -279,8 +273,19 @@ export class RegionProps {
       exclude.checked = !r.include;
     };
     refreshStyle();
-    color.title = "Region color (a layer color override, if set, takes precedence on screen)";
-    color.addEventListener("change", () => commit((r) => { r.color = color.value; }));
+    color.title = "Region color";
+    // Live while the picker is open ("change" alone doesn't fire reliably in
+    // WKWebView); one picker session = one undo step.
+    let session = nextPickerSession();
+    color.addEventListener("click", () => {
+      session = nextPickerSession();
+    });
+    const setColor = (): void => commit((r) => { r.color = color.value; }, `rp-color-${session}`);
+    color.addEventListener("input", setColor);
+    color.addEventListener("change", () => {
+      setColor();
+      session = nextPickerSession();
+    });
     width.addEventListener("change", () => {
       const w = Math.round(Number(width.value));
       if (Number.isFinite(w) && w >= 1) commit((r) => { r.width = Math.min(10, w); });

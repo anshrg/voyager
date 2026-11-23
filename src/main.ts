@@ -652,15 +652,13 @@ async function applyRegionsFor(frame: Frame): Promise<void> {
   if (frame === activeFrame()) renderRegionPanel();
 }
 
-/** Visibility + color overrides of a frame's layers, for the viewer. */
-function layerStyleOf(frame: Frame): { hidden: Set<number>; colors: Map<number, string> } {
+/** Visibility of a frame's layers, for the viewer. */
+function layerStyleOf(frame: Frame): { hidden: Set<number> } {
   const hidden = new Set<number>();
-  const colors = new Map<number, string>();
   for (const l of frame.regionLayers) {
     if (!l.visible) hidden.add(l.id);
-    if (l.color) colors.set(l.id, l.color);
   }
-  return { hidden, colors };
+  return { hidden };
 }
 
 /** Load .reg files as new layers on a frame (each appended, nothing replaced). */
@@ -774,13 +772,15 @@ const regionHost: RegionPanelHost = {
     f.activeLayer = id;
     renderRegionPanel();
   },
-  setColor: (id, color) => {
-    const f = activeFrame();
-    const l = f?.regionLayers.find((x) => x.id === id);
-    if (!f || !l) return;
-    l.color = color;
-    f.viewer?.setLayerStyle(layerStyleOf(f));
-    if (color === null) renderRegionPanel();
+  colors: () => activeFrame()?.viewer?.layerColors() ?? new Map(),
+  setColor: (id, color, session) => {
+    // Writes each region's own color (undoable, saved with the layer). The
+    // layer list isn't re-rendered here: that would detach the open picker.
+    const v = activeFrame()?.viewer;
+    if (!v) return;
+    v.editRegions(v.layerIndices(id), (r) => {
+      r.color = color;
+    }, `layer-color-${id}-${session}`);
   },
   save: (id) => {
     const f = activeFrame();
@@ -819,13 +819,19 @@ async function loadRegionsViaDialog(): Promise<void> {
   await loadRegionLayers(frame, picked);
 }
 
-/** Re-render the layer list for the active frame (if the panel is open). */
+/** Re-render the layer list + selected-region section (if the panel is open). */
 function renderRegionPanel(): void {
+  if (!renderRegionLayerList()) return;
+  regionProps?.sync();
+}
+
+/** Re-render just the layer list; false if the panel is closed. */
+function renderRegionLayerList(): boolean {
   const panel = document.getElementById("region-panel");
-  if (!regionPanelBody || !panel || panel.style.display === "none") return;
+  if (!regionPanelBody || !panel || panel.style.display === "none") return false;
   const f = activeFrame();
   renderRegionLayers(regionPanelBody, f?.regionLayers ?? [], f?.activeLayer ?? null, regionHost);
-  regionProps?.sync();
+  return true;
 }
 
 // ---- frame Viewer lifecycle ----------------------------------------------
@@ -2577,6 +2583,7 @@ function buildUi(): void {
     viewer: () => activeFrame()?.viewer ?? null,
     wcs: () => activeFrame()?.wcs ?? null,
     layerName: (id) => activeFrame()?.regionLayers.find((l) => l.id === id)?.name ?? "no layer",
+    edited: () => renderRegionLayerList(),
   });
 }
 
