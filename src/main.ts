@@ -35,7 +35,7 @@ import { TableView } from "./render/table";
 import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
 import { Wcs } from "./render/wcs";
 import { MAX_BANDS, gridMismatch } from "./render/trilogy";
-import { compositeDraw, distinctUnits, initialRgbState, renderRgbPanel, type RgbState } from "./rgb";
+import { compositeDraw, distinctUnits, initialRgbState, moveRgbBand, renderRgbPanel, type RgbState } from "./rgb";
 
 type ViewTab = "image" | "table" | "header";
 
@@ -379,8 +379,11 @@ function renderFrameBar(): void {
       chip.append(tog);
     }
     const name = el("span", "frame-chip-name", frameName(frame));
-    name.title = comp ? comp.bands.map((b) => `${b.label}: ${b.path}`).join("\n") : frame.file.path;
-    name.addEventListener("click", () => void setActive(frames.indexOf(frame)));
+    name.title =
+      (comp ? comp.bands.map((b) => `${b.label}: ${b.path}`).join("\n") : frame.file.path) +
+      "\n(drag to reorder)";
+    chipFrames.set(chip, frame);
+    bindChipDrag(chip, frame);
     const close = el("button", "frame-chip-close", "×");
     close.title = comp ? "Close the composite (the band frames reappear)" : "Close frame";
     close.addEventListener("click", (e) => {
@@ -390,12 +393,12 @@ function renderFrameBar(): void {
     chip.append(name, close);
     bar.append(chip);
   };
+  chipFrames.clear();
   for (const frame of frames) {
     if (frame.hiddenBy) continue; // drawn nested under its composite
     addChip(frame, false);
-    if (frame.composite?.expanded) {
-      for (const f of frames) if (f.hiddenBy === frame) addChip(f, true);
-    }
+    // Nested in the composite's band order (which drives the rainbow).
+    if (frame.composite?.expanded) for (const b of frame.composite.bands) addChip(b.frame, true);
   }
   must<HTMLElement>("grid-btn").classList.toggle("active-btn", gridMode);
   must<HTMLElement>("blink-btn").classList.toggle("active-btn", blinkTimer !== undefined);
@@ -403,6 +406,124 @@ function renderFrameBar(): void {
   lockBtn.classList.toggle("active-btn", lockMode !== "none");
   lockBtn.textContent =
     lockMode === "wcs" ? "Lock·wcs" : lockMode === "pixel" ? "Lock·px" : "Lock";
+}
+
+// ---- drag-to-reorder frame chips (#16) ---------------------------------------
+
+/** Chip element → its frame, rebuilt on every renderFrameBar. */
+const chipFrames = new Map<HTMLElement, Frame>();
+/** Pointer travel (CSS px) before a press on a chip becomes a drag. */
+const DRAG_START_PX = 4;
+
+/** Press on a chip: a click activates the frame; a drag past DRAG_START_PX
+ *  reorders it among its siblings — top-level chips, or (for a band chip)
+ *  the other bands of the same composite. Pointer events, not HTML5 DnD
+ *  (unreliable in WKWebView). */
+function bindChipDrag(chip: HTMLElement, frame: Frame): void {
+  chip.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+    const bar = must<HTMLElement>("frame-bar");
+    const parent = frame.hiddenBy;
+    const siblings = [...chipFrames.entries()]
+      .filter(([c, f]) => c !== chip && f.hiddenBy === parent)
+      .map(([c]) => c);
+    const x0 = e.clientX;
+    let dragging = false;
+    let drop: { chip: HTMLElement; after: boolean } | null = null;
+    chip.setPointerCapture(e.pointerId);
+
+    const clearMarks = (): void => {
+      for (const c of siblings) c.classList.remove("drop-before", "drop-after");
+    };
+    const onMove = (ev: PointerEvent): void => {
+      if (!dragging) {
+        if (Math.abs(ev.clientX - x0) < DRAG_START_PX) return;
+        dragging = true;
+        chip.classList.add("dragging");
+      }
+      // Auto-scroll the (horizontally scrolling) bar near its edges.
+      const br = bar.getBoundingClientRect();
+      if (ev.clientX < br.left + 30) bar.scrollLeft -= 12;
+      else if (ev.clientX > br.right - 30) bar.scrollLeft += 12;
+      // Nearest sibling by center; drop on whichever side the pointer is.
+      clearMarks();
+      drop = null;
+      let best = Infinity;
+      for (const c of siblings) {
+        const r = c.getBoundingClientRect();
+        const mid = (r.left + r.right) / 2;
+        const d = Math.abs(ev.clientX - mid);
+        if (d < best) {
+          best = d;
+          drop = { chip: c, after: ev.clientX > mid };
+        }
+      }
+      if (drop) drop.chip.classList.add(drop.after ? "drop-after" : "drop-before");
+    };
+    const onEnd = (ev: PointerEvent): void => {
+      chip.removeEventListener("pointermove", onMove);
+      chip.removeEventListener("pointerup", onEnd);
+      chip.removeEventListener("pointercancel", onEnd);
+      if (chip.hasPointerCapture(ev.pointerId)) chip.releasePointerCapture(ev.pointerId);
+      chip.classList.remove("dragging");
+      clearMarks();
+      if (!dragging) {
+        if (ev.type === "pointerup") void setActive(frames.indexOf(frame));
+        return;
+      }
+      const target = drop ? chipFrames.get(drop.chip) : undefined;
+      if (target && drop) reorderFrame(frame, target, drop.after);
+    };
+    chip.addEventListener("pointermove", onMove);
+    chip.addEventListener("pointerup", onEnd);
+    chip.addEventListener("pointercancel", onEnd);
+  });
+}
+
+/** Move `f` before/after `target` (same level). Top level: reorders `frames`
+ *  (grid tiles, cycling, blink follow). Band chips: reorders the composite's
+ *  bands, which re-spreads the rainbow unless weights were hand-edited. */
+function reorderFrame(f: Frame, target: Frame, after: boolean): void {
+  if (f === target || f.hiddenBy !== target.hiddenBy) return;
+  const comp = f.hiddenBy;
+  if (comp?.composite) {
+    const bands = comp.composite.bands;
+    const from = bands.findIndex((b) => b.frame === f);
+    const ti = bands.findIndex((b) => b.frame === target);
+    if (from < 0 || ti < 0) return;
+    // Index after removing `from`, so the drop side stays right either way.
+    const to = (ti > from ? ti - 1 : ti) + (after ? 1 : 0);
+    moveRgbBand(comp.composite, from, to);
+    syncFrameOrder(frames.filter((x) => !x.hiddenBy));
+    pushComposite(comp, true);
+    const label = comp.cell.querySelector(".frame-label");
+    if (label) label.textContent = frameName(comp);
+    if (comp === activeFrame()) {
+      renderHduList(); // weight rows follow the new order
+      renderStatus();
+    }
+  } else {
+    const units = frames.filter((x) => !x.hiddenBy);
+    units.splice(units.indexOf(f), 1);
+    units.splice(units.indexOf(target) + (after ? 1 : 0), 0, f);
+    syncFrameOrder(units);
+  }
+  applyGridLayout();
+  renderFrameBar();
+}
+
+/** Rebuild `frames` from top-level units in order, each composite followed by
+ *  its band frames (band order), keeping `active` on the same frame. */
+function syncFrameOrder(units: Frame[]): void {
+  const act = activeFrame();
+  const flat: Frame[] = [];
+  for (const u of units) {
+    flat.push(u);
+    if (u.composite) for (const b of u.composite.bands) flat.push(b.frame);
+  }
+  for (const x of frames) if (!flat.includes(x)) flat.push(x); // defensive
+  frames.splice(0, frames.length, ...flat);
+  active = act ? frames.indexOf(act) : -1;
 }
 
 /** Chip/label name: "RGB (F115W+F277W+F444W)" for a composite. */
@@ -722,6 +843,10 @@ function syncToolbar(frame: Frame): void {
 function applyGridLayout(): void {
   const grid = must<HTMLElement>("frames-grid");
   grid.classList.toggle("grid", gridMode);
+  // Tile order follows tab order (CSS order: no DOM moves, canvases stay put).
+  frames.forEach((f, i) => {
+    f.cell.style.order = String(i);
+  });
   if (gridMode) {
     let n = 0;
     frames.forEach((f, i) => {
