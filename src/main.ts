@@ -1,6 +1,7 @@
 import {
   closeFits,
   exportTable,
+  getBandInfo,
   getHeader,
   listOpenFiles,
   loadRegionFile,
@@ -19,6 +20,7 @@ import {
   takePendingOpens,
   xmatchTables,
   type CardValue,
+  type DetectedBand,
   type FileSummary,
   type HduInfo,
   type HeaderCard,
@@ -32,6 +34,8 @@ import { HistogramPanel } from "./render/histogram";
 import { TableView } from "./render/table";
 import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
 import { Wcs } from "./render/wcs";
+import { MAX_BANDS, gridMismatch } from "./render/trilogy";
+import { compositeDraw, distinctUnits, initialRgbState, renderRgbPanel, type RgbState } from "./rgb";
 
 type ViewTab = "image" | "table" | "header";
 
@@ -68,6 +72,14 @@ interface Frame {
    *  locate + overlay), bypassing the RA/Dec/X/Y name heuristics. Column
    *  indices refer to the frame's table HDU. null = auto-detect by name. */
   posOverride: PosOverride | null;
+  /** RGB composite frame: its bands + display state. Its `file`/HDU are the
+   *  reference band's (same grid), so WCS, lock, regions, goto and overlays
+   *  work unchanged. null = an ordinary file frame. */
+  composite: RgbState<Frame> | null;
+  /** Band frame folded into this composite: hidden from the frame bar, grid,
+   *  and cycling unless the composite chip is expanded. Kept open — the
+   *  composite reads its pixels through it. */
+  hiddenBy: Frame | null;
 }
 
 /** Manual position-column choice: RA/Dec (sky) or X/Y (pixel) column
@@ -109,6 +121,11 @@ let histLoadedFor: string | null = null;
 
 function activeFrame(): Frame | null {
   return active >= 0 && active < frames.length ? frames[active] : null;
+}
+
+/** A band frame folded into a collapsed composite (not shown anywhere). */
+function isHidden(f: Frame): boolean {
+  return f.hiddenBy !== null && !f.hiddenBy.composite?.expanded;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -221,6 +238,7 @@ function frameHdu(frame: Frame): HduInfo {
 
 /** A file with both an image and a table HDU → split view is available. */
 function frameCanSplit(frame: Frame): boolean {
+  if (frame.composite) return false;
   return frame.file.hdus.some(isViewableImage) && frame.file.hdus.some(isTableHdu);
 }
 
@@ -256,7 +274,18 @@ function renderHduList(): void {
   const list = must<HTMLElement>("hdu-list");
   list.replaceChildren();
   const frame = activeFrame();
+  must<HTMLElement>("sidebar-head").textContent = frame?.composite ? "RGB composite" : "HDUs";
   if (!frame) return;
+  const comp = frame.composite;
+  if (comp) {
+    renderRgbPanel(list, comp, {
+      changed: (structural) => pushComposite(frame, structural),
+      rerender: () => {
+        if (frame === activeFrame()) renderHduList();
+      },
+    });
+    return;
+  }
   for (const hdu of frame.file.hdus) {
     const item = el("button", "hdu-item");
     if (hdu.index === frame.selectedHdu) item.classList.add("selected");
@@ -306,6 +335,14 @@ function renderStatus(): void {
     return;
   }
   const f = frame.file;
+  if (frame.composite) {
+    const c = frame.composite;
+    const n = c.bands.filter((b) => b.include).length;
+    status.textContent =
+      `RGB composite (${c.mode}) — ${c.bands.map((b) => b.label).join(" + ")} — ` +
+      `${c.nx}×${c.ny} — ${c.mode === "trilogy" ? `${n} of ${c.bands.length} bands mixed` : "3-color"}`;
+    return;
+  }
   if (isDerivedPath(f.path)) {
     const rows = f.hdus[0]?.nrows ?? 0;
     status.textContent = `${displayName(f.path)} — crossmatch result — ${rows.toLocaleString()} rows (in memory; Export… to save)`;
@@ -320,21 +357,46 @@ function renderFrameBar(): void {
   const bar = must<HTMLElement>("frame-bar");
   bar.replaceChildren();
   bar.style.display = frames.length > 0 ? "" : "none";
-  frames.forEach((frame, i) => {
-    const chip = el("div", "frame-chip");
+  const addChip = (frame: Frame, nested: boolean): void => {
+    const i = frames.indexOf(frame);
+    const chip = el("div", nested ? "frame-chip nested" : "frame-chip");
     if (i === active) chip.classList.add("active");
-    const name = el("span", "frame-chip-name", displayName(frame.file.path));
-    name.title = frame.file.path;
-    name.addEventListener("click", () => void setActive(i));
+    const comp = frame.composite;
+    if (comp) {
+      chip.classList.add("rgb-chip");
+      const tog = el("button", "frame-chip-close", comp.expanded ? "▾" : "▸");
+      tog.title = comp.expanded ? "Hide the band frames" : "Show the band frames";
+      tog.addEventListener("click", (e) => {
+        e.stopPropagation();
+        comp.expanded = !comp.expanded;
+        // Collapsing while a band frame is active: fall back to the composite.
+        if (!comp.expanded && activeFrame()?.hiddenBy === frame) void setActive(frames.indexOf(frame));
+        else {
+          applyGridLayout();
+          renderFrameBar();
+        }
+      });
+      chip.append(tog);
+    }
+    const name = el("span", "frame-chip-name", frameName(frame));
+    name.title = comp ? comp.bands.map((b) => `${b.label}: ${b.path}`).join("\n") : frame.file.path;
+    name.addEventListener("click", () => void setActive(frames.indexOf(frame)));
     const close = el("button", "frame-chip-close", "×");
-    close.title = "Close frame";
+    close.title = comp ? "Close the composite (the band frames reappear)" : "Close frame";
     close.addEventListener("click", (e) => {
       e.stopPropagation();
-      void closeFrame(i);
+      void closeFrame(frames.indexOf(frame));
     });
     chip.append(name, close);
     bar.append(chip);
-  });
+  };
+  for (const frame of frames) {
+    if (frame.hiddenBy) continue; // drawn nested under its composite
+    addChip(frame, false);
+    if (frame.composite?.expanded) {
+      for (const f of frames) if (f.hiddenBy === frame) addChip(f, true);
+    }
+  }
   must<HTMLElement>("grid-btn").classList.toggle("active-btn", gridMode);
   must<HTMLElement>("blink-btn").classList.toggle("active-btn", blinkTimer !== undefined);
   const lockBtn = must<HTMLElement>("lock-btn");
@@ -343,10 +405,17 @@ function renderFrameBar(): void {
     lockMode === "wcs" ? "Lock·wcs" : lockMode === "pixel" ? "Lock·px" : "Lock";
 }
 
+/** Chip/label name: "RGB (F115W+F277W+F444W)" for a composite. */
+function frameName(frame: Frame): string {
+  if (frame.composite) return `RGB (${frame.composite.bands.map((b) => b.label).join("+")})`;
+  return displayName(frame.file.path);
+}
+
 /** Show/hide panes + toolbar controls to match the active frame's tab (or the
  *  split view, which shows the image and table panes side by side). */
 function renderView(): void {
   const frame = activeFrame();
+  if (frame?.composite) frame.tab = "image"; // a composite has no table/header view
   const hdu = frame ? frameHdu(frame) : null;
   const isImg = hdu !== null && isViewableImage(hdu);
   const isTbl = hdu !== null && isTableHdu(hdu);
@@ -373,7 +442,8 @@ function renderView(): void {
   must<HTMLElement>("filter-box").style.display = showHdr ? "" : "none";
   if (showTbl) refreshOverlayButtons();
 
-  must<HTMLElement>("view-tabs").style.display = isImg || isTbl || canSplit ? "" : "none";
+  must<HTMLElement>("view-tabs").style.display =
+    !frame?.composite && (isImg || isTbl || canSplit) ? "" : "none";
   must<HTMLElement>("tab-image").style.display = isImg ? "" : "none";
   must<HTMLElement>("tab-table").style.display = isTbl ? "" : "none";
   const splitBtn = must<HTMLElement>("tab-split");
@@ -389,6 +459,12 @@ function renderView(): void {
 function ensureHistogram(): void {
   const frame = activeFrame();
   if (!histPanel?.visible || !frame) return;
+  if (frame.composite) {
+    // Per-band histograms don't map onto a composite; the panel owns levels.
+    histPanel.clear();
+    histLoadedFor = null;
+    return;
+  }
   const hdu = frame.viewerHdu;
   if (hdu === null) return;
   const key = `${frame.file.path}#${hdu}`;
@@ -570,7 +646,13 @@ async function loadFrameImage(frame: Frame): Promise<void> {
     const hdu = frame.file.hdus[imgHdu];
     frame.viewer.setEditMode(frame === activeFrame() ? editMode : false);
     frame.viewer.setCreateShape(createShape);
-    await frame.viewer.setImage(frame.file.path, imgHdu, hdu.shape[0], hdu.shape[1]);
+    if (frame.composite) {
+      const { sources, display } = compositeDraw(frame.composite);
+      frame.viewer.setComposite(sources, frame.composite.nx, frame.composite.ny);
+      frame.viewer.setCompositeDisplay(display);
+    } else {
+      await frame.viewer.setImage(frame.file.path, imgHdu, hdu.shape[0], hdu.shape[1]);
+    }
     await loadFrameWcs(frame);
     await applyRegionsFor(frame);
     // Under camera-lock, a freshly shown frame adopts the shared camera (and
@@ -616,6 +698,12 @@ async function ensureViewer(frame: Frame): Promise<void> {
 function syncToolbar(frame: Frame): void {
   const v = frame.viewer;
   if (!v) return;
+  // Single-band display controls don't apply to a composite (its panel in
+  // the sidebar owns levels/stretch/color).
+  const single = frame.composite ? "none" : "";
+  for (const id of ["colormap-select", "stretch-select", "scale-select", "hist-btn", "limits-label"]) {
+    must<HTMLElement>(id).style.display = single;
+  }
   must<HTMLSelectElement>("colormap-select").value = v.getColormap();
   must<HTMLSelectElement>("stretch-select").value = v.getStretch();
   must<HTMLSelectElement>("scale-select").value = v.getScaleMode();
@@ -637,7 +725,7 @@ function applyGridLayout(): void {
   if (gridMode) {
     let n = 0;
     frames.forEach((f, i) => {
-      const show = isViewableImage(frameHdu(f));
+      const show = isViewableImage(frameHdu(f)) && !isHidden(f);
       // Inline display overrides the .grid .frame-cell rule for non-image
       // frames; cleared again in single mode below.
       f.cell.style.display = show ? "" : "none";
@@ -741,15 +829,18 @@ function setTab(tab: ViewTab): void {
 // ---- multi-frame controls -------------------------------------------------
 
 function cycleFrame(dir: number): void {
-  if (frames.length === 0) return;
-  const n = frames.length;
-  void setActive((active + dir + n) % n);
+  // Visible frames only (band frames of a collapsed composite are skipped).
+  const vis = frames.map((f, i): [Frame, number] => [f, i]).filter(([f]) => !isHidden(f));
+  if (vis.length === 0) return;
+  const pos = vis.findIndex(([, i]) => i === active);
+  const n = vis.length;
+  void setActive(vis[(pos + dir + n) % n][1]);
 }
 
 function imageFrameIndices(): number[] {
   return frames
     .map((f, i): [Frame, number] => [f, i])
-    .filter(([f]) => isViewableImage(frameHdu(f)))
+    .filter(([f]) => isViewableImage(frameHdu(f)) && !isHidden(f))
     .map(([, i]) => i);
 }
 
@@ -830,6 +921,151 @@ function cycleLock(): void {
     for (const f of frames) f.viewer?.setRotation(0);
   }
   renderFrameBar();
+}
+
+// ---- RGB composites ---------------------------------------------------------
+
+/** Re-derive what a composite draws after a panel change. Structural changes
+ *  (band set / mode / channel roles) swap the viewer's sources; the rest is
+ *  uniforms only — one frame, no refetch. */
+function pushComposite(frame: Frame, structural: boolean): void {
+  const c = frame.composite;
+  if (!c || !frame.viewer) return;
+  const { sources, display } = compositeDraw(c);
+  if (sources.length === 0) return;
+  if (structural) frame.viewer.setCompositeSources(sources);
+  frame.viewer.setCompositeDisplay(display);
+  if (structural && frame === activeFrame()) renderStatus();
+}
+
+/** An image frame offered by the RGB… dialog. */
+interface RgbCandidate {
+  frame: Frame;
+  hdu: number;
+  nx: number;
+  ny: number;
+  wcs: Wcs | null;
+  band: DetectedBand | null;
+  label: string;
+  /** Why it can't join the reference grid (null = it can). */
+  reason: string | null;
+}
+
+let rgbCandidates: RgbCandidate[] = [];
+
+/** Open the RGB… dialog: list open image frames (header-only band detection,
+ *  instant), pre-tick those on the active frame's pixel grid (≤ MAX_BANDS),
+ *  and disable the rest with the reason. */
+async function openRgbDialog(): Promise<void> {
+  const readout = must<HTMLElement>("readout");
+  const pool = frames.filter((f) => !f.composite && !f.hiddenBy && !isDerivedPath(f.file.path));
+  const cands: RgbCandidate[] = [];
+  for (const f of pool) {
+    const hdu = frameImageHdu(f) ?? linkImageHdu(f);
+    if (hdu === null) continue;
+    const info = f.file.hdus[hdu];
+    let wcs = f.viewerHdu === hdu ? f.wcs : null;
+    if (!wcs) {
+      try {
+        const params = await getWcs(f.file.path, hdu);
+        wcs = params ? new Wcs(params) : null;
+      } catch {
+        wcs = null;
+      }
+    }
+    let band: DetectedBand | null = null;
+    try {
+      band = (await getBandInfo(f.file.path, hdu, false)).band;
+    } catch {
+      band = null;
+    }
+    const label = band?.filter ?? displayName(f.file.path).replace(/\.fits?(\.gz)?$/i, "");
+    cands.push({ frame: f, hdu, nx: info.shape[0], ny: info.shape[1], wcs, band, label, reason: null });
+  }
+  if (cands.length < 2) {
+    readout.textContent = "RGB needs at least 2 open image frames of the same field (same pixel grid)";
+    return;
+  }
+  const act = activeFrame();
+  const ref = cands.find((c) => c.frame === act || c.frame === act?.hiddenBy) ?? cands[0];
+  for (const c of cands) c.reason = c === ref ? null : gridMismatch(ref, c);
+  // Blue → red, unrecognized filters last (stable for ties).
+  cands.sort((a, b) => (a.band?.pivot_um ?? Infinity) - (b.band?.pivot_um ?? Infinity));
+  rgbCandidates = cands;
+
+  const list = must<HTMLElement>("rgb-dialog-list");
+  list.replaceChildren();
+  let ticked = 0;
+  cands.forEach((c, i) => {
+    const row = el("label", "rgb-cand");
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.id = `rgb-cand-${i}`;
+    cb.disabled = c.reason !== null;
+    cb.checked = c.reason === null && ticked < MAX_BANDS;
+    if (cb.checked) ticked++;
+    const name = el("span", "rgb-cand-label", c.label);
+    const file = el("span", "rgb-cand-file", displayName(c.frame.file.path));
+    file.title = c.frame.file.path;
+    const st = el("span", c.reason ? "rgb-cand-bad" : "rgb-cand-ok", c === ref ? "reference grid" : c.reason ?? "same grid");
+    row.append(cb, name, file, st);
+    list.append(row);
+  });
+  const bad = cands.filter((c) => c.reason).length;
+  must<HTMLElement>("rgb-dialog-status").textContent =
+    `${cands.length - bad} of ${cands.length} frames share ${ref.label}'s ${ref.nx}×${ref.ny} grid` +
+    (bad > 0 ? " (mismatched grids need reprojection — not supported yet)" : "") +
+    (ticked >= MAX_BANDS ? ` · at most ${MAX_BANDS} bands` : "");
+  must<HTMLElement>("rgb-dialog").style.display = "";
+}
+
+/** Build the composite from the ticked bands: sample each band's stats
+ *  (parallel, off the main thread), then add the composite frame and fold
+ *  the band frames into it. */
+async function createComposite(): Promise<void> {
+  const statusEl = must<HTMLElement>("rgb-dialog-status");
+  const chosen = rgbCandidates.filter(
+    (_, i) => (document.getElementById(`rgb-cand-${i}`) as HTMLInputElement | null)?.checked,
+  );
+  if (chosen.length === 0) {
+    statusEl.textContent = "tick at least one band";
+    return;
+  }
+  if (chosen.length > MAX_BANDS) {
+    statusEl.textContent = `at most ${MAX_BANDS} bands per composite`;
+    return;
+  }
+  const btn = must<HTMLButtonElement>("rgb-create-btn");
+  btn.disabled = true;
+  statusEl.textContent = "measuring band noise + saturation levels…";
+  try {
+    const infos = await Promise.all(chosen.map((c) => getBandInfo(c.frame.file.path, c.hdu, true)));
+    const bands = chosen.map((c, i) => ({
+      frame: c.frame,
+      path: c.frame.file.path,
+      hdu: c.hdu,
+      label: c.label,
+      band: infos[i].band,
+      stats: infos[i].stats,
+      zscale: infos[i].zscale,
+      bunit: infos[i].bunit,
+    }));
+    if (bands.every((b) => b.stats === null && b.zscale === null)) {
+      statusEl.textContent = "the chosen bands have no usable (finite, non-constant) pixels";
+      return;
+    }
+    const state = initialRgbState(bands, chosen[0].nx, chosen[0].ny);
+    must<HTMLElement>("rgb-dialog").style.display = "none";
+    await addFrame(chosen[0].frame.file, { composite: state, hdu: chosen[0].hdu });
+    const units = distinctUnits(state);
+    if (units.length > 1) {
+      must<HTMLElement>("readout").textContent = `⚠ RGB bands have different units: ${units.join(", ")}`;
+    }
+  } catch (err) {
+    statusEl.textContent = `RGB failed: ${String(err)}`;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---- M5: table row → image locate ----------------------------------------
@@ -1438,7 +1674,7 @@ async function probeCoordinate(query: string): Promise<void> {
 async function openPath(path: string): Promise<void> {
   const status = must<HTMLElement>("status-file");
   // Already open? Just activate its frame (backend dedupes by path anyway).
-  const existing = frames.findIndex((f) => f.file.path === path);
+  const existing = frames.findIndex((f) => f.file.path === path && !f.composite);
   if (existing >= 0) {
     await setActive(existing);
     return;
@@ -1452,21 +1688,36 @@ async function openPath(path: string): Promise<void> {
   }
 }
 
-/** Create + activate a frame for an already-open file (real or derived). */
-async function addFrame(file: FileSummary): Promise<void> {
+/** Create + activate a frame for an already-open file (real or derived), or
+ *  — with `rgb` — an RGB composite over that (reference band's) file. */
+async function addFrame(
+  file: FileSummary,
+  rgb?: { composite: RgbState<Frame>; hdu: number },
+): Promise<void> {
   const cell = el("div", "frame-cell");
-  cell.append(el("div", "frame-label", displayName(file.path)));
   must<HTMLElement>("frames-grid").append(cell);
   // JWST-style files have an empty primary HDU; jump to the first image HDU
   // that actually has pixels (usually SCI).
   const firstImg = file.hdus.find(isViewableImage);
-  const selectedHdu = firstImg ? firstImg.index : 0;
+  const selectedHdu = rgb ? rgb.hdu : firstImg ? firstImg.index : 0;
   const hdu = file.hdus[selectedHdu];
   const tab: ViewTab = isViewableImage(hdu) ? "image" : isTableHdu(hdu) ? "table" : "header";
   const frame: Frame = {
     file, selectedHdu, tab, cards: [], regionPath: null, cell,
     viewer: null, viewerHdu: null, wcs: null, sourceFrom: null, posOverride: null,
+    composite: rgb?.composite ?? null, hiddenBy: null,
   };
+  cell.append(el("div", "frame-label", frameName(frame)));
+  if (rgb) {
+    for (const b of rgb.composite.bands) {
+      b.frame.hiddenBy = frame;
+      // Free the hidden band's WebGL context (WKWebView caps them; see #9).
+      // It is rebuilt lazily (ensureViewer) if the composite is expanded.
+      b.frame.viewer?.destroy();
+      b.frame.viewer = null;
+      b.frame.viewerHdu = null;
+    }
+  }
   // Clicking a cell (tiled mode) makes it the active frame.
   cell.addEventListener(
     "pointerdown",
@@ -1505,12 +1756,24 @@ async function openDerivedFrame(sum: XmatchSummary): Promise<void> {
 async function closeFrame(i: number): Promise<void> {
   const frame = frames[i];
   if (!frame) return;
+  if (frame.hiddenBy) {
+    // The composite reads through this band's open file.
+    must<HTMLElement>("readout").textContent =
+      "this band belongs to an RGB composite — close the composite first (or untick the band in its panel)";
+    return;
+  }
   frame.viewer?.destroy();
   frame.cell.remove();
-  try {
-    await closeFits(frame.file.path);
-  } catch {
-    // Best effort; the frame is gone from the UI regardless.
+  if (frame.composite) {
+    // The composite shares its reference band's file: un-hide the bands, but
+    // leave every file open.
+    for (const f of frames) if (f.hiddenBy === frame) f.hiddenBy = null;
+  } else {
+    try {
+      await closeFits(frame.file.path);
+    } catch {
+      // Best effort; the frame is gone from the UI regardless.
+    }
   }
   frames.splice(i, 1);
   // Shared panels may have been showing this frame; force a reload on reactivate.
@@ -1579,6 +1842,12 @@ function buildUi(): void {
     "Lock",
     "Lock pan/zoom across frames (cycles: off → WCS/sky → pixel)",
     () => cycleLock(),
+  );
+  const rgbBtn = makeToggle(
+    "rgb-btn",
+    "RGB…",
+    "Make an RGB composite (trilogy or 3-color) from open image frames of the same field and pixel grid",
+    () => void openRgbDialog(),
   );
 
   // Image controls (visible only on the image tab).
@@ -1873,6 +2142,29 @@ function buildUi(): void {
   matchPanel.append(mpTitle, mpRowA, mpRowB, mpRowOpts, mpStatus);
   document.body.append(matchPanel);
 
+  // RGB composite dialog (floating; opened by RGB…).
+  const rgbDialog = el("div", "match-panel");
+  rgbDialog.id = "rgb-dialog";
+  rgbDialog.style.display = "none";
+  const rdTitle = el("div", "match-title", "RGB composite — bands on one pixel grid");
+  const rdClose = el("button", "match-close", "×");
+  rdClose.title = "Close";
+  rdClose.addEventListener("click", () => {
+    rgbDialog.style.display = "none";
+  });
+  rdTitle.append(rdClose);
+  const rdList = el("div", "rgb-cand-list");
+  rdList.id = "rgb-dialog-list";
+  const rdRow = el("div", "match-row");
+  const rdCreate = el("button", "", "Create composite");
+  rdCreate.id = "rgb-create-btn";
+  rdCreate.addEventListener("click", () => void createComposite());
+  rdRow.append(rdCreate);
+  const rdStatus = el("div", "match-status");
+  rdStatus.id = "rgb-dialog-status";
+  rgbDialog.append(rdTitle, rdList, rdRow, rdStatus);
+  document.body.append(rgbDialog);
+
   toolbar.append(
     title,
     openBtn,
@@ -1881,6 +2173,7 @@ function buildUi(): void {
     gridBtn,
     blinkBtn,
     lockBtn,
+    rgbBtn,
     controls,
     tableControls,
     filter,
@@ -1892,6 +2185,7 @@ function buildUi(): void {
 
   const sidebar = el("aside", "sidebar");
   const sidebarHead = el("div", "sidebar-head", "HDUs");
+  sidebarHead.id = "sidebar-head";
   const hduList = el("div", "hdu-list");
   hduList.id = "hdu-list";
   sidebar.append(sidebarHead, hduList);

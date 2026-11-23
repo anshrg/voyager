@@ -1,5 +1,6 @@
 pub mod fits;
 pub mod regions;
+pub mod rgb;
 pub mod table;
 pub mod tiles;
 pub mod wcs;
@@ -402,6 +403,70 @@ async fn get_histogram(
         t0.elapsed().as_secs_f64() * 1e3
     );
     Ok(hist)
+}
+
+/// Everything an RGB composite needs to know about one band, computed once
+/// when the composite is built (frontend caches it per path#hdu).
+#[derive(Serialize)]
+struct BandInfo {
+    /// Trilogy stats (median / MAD sigma / bright-tail percentiles); None for
+    /// an empty or constant band.
+    stats: Option<rgb::TrilogyStats>,
+    /// zscale limits over the same sample (simple-RGB default limits).
+    zscale: Option<(f64, f64)>,
+    /// Filter identity + pivot wavelength (header, else filename), for
+    /// blue→red default weights. None = unrecognized.
+    band: Option<rgb::DetectedBand>,
+    /// BUNIT (extension, else primary), to warn when bands' units differ.
+    bunit: Option<String>,
+}
+
+/// Per-band stats + identity for RGB compositing. Trilogy needs native-
+/// resolution samples (block-sampled levels would bias the noise), so this
+/// grid-samples ~1M native pixels: sparse rows only, never the full array.
+#[tauri::command]
+async fn get_band_info(
+    path: String,
+    hdu: usize,
+    with_stats: bool,
+    state: State<'_, AppState>,
+) -> Result<BandInfo, String> {
+    let file = lookup(&state, &path)?;
+    let t0 = Instant::now();
+    let info = tauri::async_runtime::spawn_blocking(move || -> Result<BandInfo, String> {
+        // Header-only (instant) unless stats are asked for: the RGB dialog
+        // labels bands by filter before the user commits to sampling them.
+        let (stats, zscale) = if with_stats {
+            let values =
+                tiles::gather_values(&file, hdu, 1_000_000).map_err(|e| e.to_string())?;
+            (
+                rgb::trilogy_stats(&values),
+                tiles::zscale::zscale(&values, &tiles::zscale::ZScaleParams::default()),
+            )
+        } else {
+            (None, None)
+        };
+        let ext = &file.hdu(hdu).map_err(|e| e.to_string())?.header;
+        let prim = &file.hdu(0).map_err(|e| e.to_string())?.header;
+        let headers = [ext, prim];
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let band = rgb::detect_band(&headers).or_else(|| rgb::detect_band_from_filename(&name));
+        let bunit = headers
+            .iter()
+            .find_map(|h| h.get_str("BUNIT"))
+            .map(|s| s.trim().to_string());
+        Ok(BandInfo { stats, zscale, band, bunit })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    eprintln!(
+        "[voyager] band_info #{hdu} in {:.1} ms",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(info)
 }
 
 #[derive(Serialize)]
@@ -1014,6 +1079,7 @@ pub fn run() {
             resolve_coord,
             get_wcs,
             get_histogram,
+            get_band_info,
             load_region_file,
             save_pixel_regions,
             table_columns,

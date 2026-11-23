@@ -5,6 +5,8 @@
 // All the visual math (stretch, scale limits, colormap) happens in the
 // fragment shader so restyling is one frame, never a CPU re-render.
 
+import { MAX_BANDS } from "./trilogy";
+
 export const STRETCHES = [
   "linear",
   "log",
@@ -126,6 +128,8 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
   if (!program) throw new Error("createProgram failed");
   gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
   gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+  // Pinned so the composite program can share this VAO.
+  gl.bindAttribLocation(program, 0, "a_pos");
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     throw new Error(`program link: ${gl.getProgramInfoLog(program) ?? "unknown"}`);
@@ -141,9 +145,8 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
     new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]),
     gl.STATIC_DRAW,
   );
-  const aPos = gl.getAttribLocation(program, "a_pos");
-  gl.enableVertexAttribArray(aPos);
-  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
   gl.bindVertexArray(null);
 
   const lutTex = gl.createTexture();
@@ -170,6 +173,139 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
       limits: uniform(gl, program, "u_limits"),
       cb: uniform(gl, program, "u_cb"),
       stretch: uniform(gl, program, "u_stretch"),
+    },
+  };
+}
+
+// ---- RGB composite program ------------------------------------------------
+//
+// N co-gridded bands (≤ MAX_BANDS), each normalized over its own [lo, hi],
+// stretched, then mixed into R/G/B by per-band weights. Covers both modes:
+//   - simple RGB: 3 bands with pure R/G/B weights, shared limits, DS9 stretch;
+//   - trilogy: N bands with rainbow/user weights, per-band trilogy levels and
+//     the log curve with per-band softening k (u_stretch == 7).
+// Ported from fitsgl tile.frag (u_mode 2), MIT, H. Akins. Transcribes
+// trilogy.ts `compositePixel` exactly — keep the two in lockstep.
+
+/** GLSL ES 3.00 forbids indexing a sampler array with a loop variable, so
+ *  dispatch on literal indices (fitsgl's bandSamplerDispatch). */
+function bandSamplerDispatch(): string {
+  let body = "";
+  for (let i = 0; i < MAX_BANDS; i++) {
+    body += `  if (idx == ${i}) return texture(u_band[${i}], v_uv).r;\n`;
+  }
+  return body;
+}
+
+const COMPOSITE_FRAG = `#version 300 es
+precision highp float;
+const int MAX_BANDS = ${MAX_BANDS};
+uniform sampler2D u_band[MAX_BANDS];
+uniform vec3 u_weight[MAX_BANDS];
+uniform vec2 u_lim[MAX_BANDS];    // per-band lo, hi
+uniform float u_k[MAX_BANDS];     // per-band trilogy softening
+uniform int u_nBands;
+uniform vec3 u_weightSum;         // host-precomputed Σ weights per channel
+uniform int u_stretch;            // 0..6 DS9 stretches, 7 = trilogy
+uniform float u_saturation;       // 1 = identity, 0 = grayscale
+uniform vec2 u_cb;                // DS9 bias, contrast (applied per channel)
+in vec2 v_uv;
+out vec4 outColor;
+
+float sampleBand(int idx) {
+${bandSamplerDispatch()}  return 0.0;
+}
+
+float stretchFn(float t, float k) {
+  const float a = 1000.0;
+  if (u_stretch == 7) return k > 0.0 ? log(k * t + 1.0) / log(k + 1.0) : t;
+  if (u_stretch == 1) return log(a * t + 1.0) / log(a + 1.0);
+  if (u_stretch == 2) return sqrt(t);
+  if (u_stretch == 3) return t * t;
+  if (u_stretch == 4) return asinh(10.0 * t) / asinh(10.0);
+  if (u_stretch == 5) return sinh(3.0 * t) / sinh(3.0);
+  if (u_stretch == 6) return (pow(a, t) - 1.0) / (a - 1.0);
+  return t;
+}
+
+void main() {
+  vec3 num = vec3(0.0);
+  int nanCount = 0;
+  for (int i = 0; i < MAX_BANDS; i++) {
+    if (i >= u_nBands) break;
+    float v = sampleBand(i);
+    if (isnan(v)) { nanCount++; continue; }
+    float span = u_lim[i].y - u_lim[i].x;
+    float t = clamp((v - u_lim[i].x) / (abs(span) < 1e-30 ? 1e-30 : span), 0.0, 1.0);
+    num += u_weight[i] * stretchFn(t, u_k[i]);
+  }
+  if (nanCount == u_nBands) {
+    outColor = vec4(0.045, 0.05, 0.06, 1.0); // blank coverage, as single-band
+    return;
+  }
+  vec3 rgb = clamp(vec3(
+    u_weightSum.r > 0.0 ? num.r / u_weightSum.r : 0.0,
+    u_weightSum.g > 0.0 ? num.g / u_weightSum.g : 0.0,
+    u_weightSum.b > 0.0 ? num.b / u_weightSum.b : 0.0), 0.0, 1.0);
+  if (u_saturation != 1.0) {
+    float lum = (rgb.r + rgb.g + rgb.b) / 3.0;
+    rgb = clamp(mix(vec3(lum), rgb, u_saturation), 0.0, 1.0);
+  }
+  rgb = clamp(0.5 + (rgb - u_cb.x) * u_cb.y, 0.0, 1.0);
+  outColor = vec4(rgb, 1.0);
+}`;
+
+export interface CompositeProgram {
+  program: WebGLProgram;
+  uniforms: {
+    rect: WebGLUniformLocation;
+    center: WebGLUniformLocation;
+    scale: WebGLUniformLocation;
+    viewport: WebGLUniformLocation;
+    rot: WebGLUniformLocation;
+    bands: WebGLUniformLocation;
+    weight: WebGLUniformLocation;
+    lim: WebGLUniformLocation;
+    k: WebGLUniformLocation;
+    nBands: WebGLUniformLocation;
+    weightSum: WebGLUniformLocation;
+    stretch: WebGLUniformLocation;
+    saturation: WebGLUniformLocation;
+    cb: WebGLUniformLocation;
+  };
+}
+
+/** Compile the composite program into an existing tile program's context
+ *  (shares its VAO via the pinned a_pos location). Built lazily — only frames
+ *  that actually show a composite pay for it. */
+export function createCompositeProgram(gl: WebGL2RenderingContext): CompositeProgram {
+  const program = gl.createProgram();
+  if (!program) throw new Error("createProgram failed");
+  gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+  gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, COMPOSITE_FRAG));
+  gl.bindAttribLocation(program, 0, "a_pos");
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(`composite link: ${gl.getProgramInfoLog(program) ?? "unknown"}`);
+  }
+  const u = (name: string): WebGLUniformLocation => uniform(gl, program, name);
+  return {
+    program,
+    uniforms: {
+      rect: u("u_rect"),
+      center: u("u_center"),
+      scale: u("u_scale"),
+      viewport: u("u_viewport"),
+      rot: u("u_rot"),
+      bands: u("u_band[0]"),
+      weight: u("u_weight[0]"),
+      lim: u("u_lim[0]"),
+      k: u("u_k[0]"),
+      nBands: u("u_nBands"),
+      weightSum: u("u_weightSum"),
+      stretch: u("u_stretch"),
+      saturation: u("u_saturation"),
+      cb: u("u_cb"),
     },
   };
 }

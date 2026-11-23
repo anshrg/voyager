@@ -27,13 +27,16 @@ import {
   type RegionView,
 } from "./regionlayer";
 import {
+  createCompositeProgram,
   createTileProgram,
   createTileTexture,
   uploadLut,
+  type CompositeProgram,
   type Stretch,
   type TileProgram,
   STRETCHES,
 } from "./gl";
+import { MAX_BANDS, type CompositeBand } from "./trilogy";
 
 const MAX_GPU_TILES = 600; // ~150 MB of R32F at 256²
 const NAN_READOUT = "NaN";
@@ -93,6 +96,24 @@ interface ImageRef {
   maxLevel: number;
 }
 
+/** One band of an RGB composite: an image HDU on the shared pixel grid. */
+export interface CompositeSource {
+  path: string;
+  hdu: number;
+  /** Short name for the readout (filter, else file name). */
+  label: string;
+}
+
+/** Everything the composite shader needs besides the tiles; set by the host
+ *  whenever a weight/slider/mode changes (one uniform upload, one frame). */
+export interface CompositeDisplay {
+  /** Parallel to the sources passed to setComposite. */
+  bands: CompositeBand[];
+  /** 0..6 = DS9 stretch index (STRETCHES), 7 = trilogy. */
+  stretch: number;
+  saturation: number;
+}
+
 export class Viewer {
   private readonly canvas: HTMLCanvasElement;
   private readonly overlay: HTMLCanvasElement;
@@ -147,6 +168,12 @@ export class Viewer {
   private redoStack: PixelRegion[][] = [];
 
   private image: ImageRef | null = null;
+  /** RGB composite mode: the bands (all on `image`'s grid; image = bands[0]
+   *  for readout sky, regions and WCS). null = ordinary single-band image. */
+  private sources: CompositeSource[] | null = null;
+  private compDisplay: CompositeDisplay | null = null;
+  /** Composite shader, compiled on first composite use. */
+  private comp: CompositeProgram | null = null;
   /** Bumped on setImage; stale async responses are discarded. */
   private generation = 0;
 
@@ -218,6 +245,7 @@ export class Viewer {
     const gl = this.p.gl;
     gl.deleteTexture(this.p.lutTex);
     gl.deleteProgram(this.p.program);
+    if (this.comp) gl.deleteProgram(this.comp.program);
     // Prompt the browser to reclaim the context immediately (WKWebView caps
     // simultaneous WebGL contexts; frames come and go).
     gl.getExtension("WEBGL_lose_context")?.loseContext();
@@ -228,6 +256,47 @@ export class Viewer {
   // ---- public API -------------------------------------------------------
 
   async setImage(path: string, hdu: number, nx: number, ny: number): Promise<void> {
+    this.sources = null;
+    this.compDisplay = null;
+    this.resetImage(path, hdu, nx, ny);
+    await this.applyScaleMode("zscale");
+  }
+
+  /** Show an RGB composite of co-gridded bands (all nx × ny; the first band
+   *  supplies readout sky / regions). Nothing draws until setCompositeDisplay. */
+  setComposite(sources: CompositeSource[], nx: number, ny: number): void {
+    if (sources.length === 0 || sources.length > MAX_BANDS) {
+      throw new Error(`composite needs 1..${MAX_BANDS} bands`);
+    }
+    this.resetImage(sources[0].path, sources[0].hdu, nx, ny);
+    this.sources = sources;
+    this.compDisplay = null;
+  }
+
+  /** Change which bands participate without resetting the camera, regions,
+   *  or already-fetched tiles (tiles are keyed per band). */
+  setCompositeSources(sources: CompositeSource[]): void {
+    if (!this.sources || sources.length === 0 || sources.length > MAX_BANDS) return;
+    this.sources = sources;
+    this.compDisplay = null;
+    this.limitsReady = false;
+    this.requestDraw();
+  }
+
+  /** Update composite weights/levels/stretch — uniforms only, redraws next frame. */
+  setCompositeDisplay(d: CompositeDisplay): void {
+    if (!this.sources || d.bands.length !== this.sources.length) return;
+    this.compDisplay = d;
+    this.limitsReady = true;
+    this.requestDraw();
+  }
+
+  isComposite(): boolean {
+    return this.sources !== null;
+  }
+
+  /** Shared reset for a new image / composite: drop tiles, overlays, undo. */
+  private resetImage(path: string, hdu: number, nx: number, ny: number): void {
     this.generation++;
     this.clearTiles();
     this.limitsReady = false;
@@ -252,12 +321,13 @@ export class Viewer {
     this.rot = 0;
     this.fit();
     this.resetContrastBias();
-    await this.applyScaleMode("zscale");
   }
 
   clear(): void {
     this.generation++;
     this.image = null;
+    this.sources = null;
+    this.compDisplay = null;
     this.rot = 0;
     this.regions = null;
     this.hoverIndex = -1;
@@ -481,7 +551,7 @@ export class Viewer {
   }
 
   async applyScaleMode(mode: ScaleMode): Promise<void> {
-    if (!this.image) return;
+    if (!this.image || this.sources) return;
     this.scaleMode = mode;
     const gen = this.generation;
     const lim = await getScaleLimits(this.image.path, this.image.hdu, mode);
@@ -831,9 +901,16 @@ export class Viewer {
     this.readoutBusy = true;
     const gen = this.generation;
     try {
-      const r = await getReadout(this.image.path, this.image.hdu, x, y);
+      // Composite: every band's value under the cursor (same pixel — the
+      // bands share one grid); sky comes from the first band.
+      const srcs = this.sources ?? [{ path: this.image.path, hdu: this.image.hdu, label: "" }];
+      const rs = await Promise.all(srcs.map((s) => getReadout(s.path, s.hdu, x, y)));
+      const r = rs[0];
       if (gen === this.generation) {
-        const text = r.value === null ? NAN_READOUT : formatValue(r.value);
+        const fmt = (v: number | null): string => (v === null ? NAN_READOUT : formatValue(v));
+        const text = this.sources
+          ? rs.map((ri, i) => `${srcs[i].label} ${fmt(ri.value)}`).join(" · ")
+          : fmt(r.value);
         this.lastSky = r.sky ?? "";
         this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text, sky: this.lastSky });
       }
@@ -1153,17 +1230,25 @@ export class Viewer {
     this.inflight.clear();
   }
 
-  private tileKey(level: number, tx: number, ty: number): string {
-    return `${level}/${tx}/${ty}`;
+  /** Level first so the backdrop guard in evict() can match by prefix; the
+   *  source suffix lets composite bands share one cache (and survive a band
+   *  being toggled off and on). */
+  private tileKey(level: number, tx: number, ty: number, path: string, hdu: number): string {
+    return `${level}/${tx}/${ty}|${hdu}|${path}`;
   }
 
-  private requestTile(level: number, tx: number, ty: number): void {
+  /** The bands to fetch/draw: the composite sources, or the single image. */
+  private drawSources(): { path: string; hdu: number }[] {
+    if (this.sources) return this.sources;
+    return this.image ? [this.image] : [];
+  }
+
+  private requestTile(level: number, tx: number, ty: number, path: string, hdu: number): void {
     if (!this.image) return;
-    const key = this.tileKey(level, tx, ty);
+    const key = this.tileKey(level, tx, ty, path, hdu);
     if (this.tiles.has(key) || this.inflight.has(key)) return;
     this.inflight.add(key);
     const gen = this.generation;
-    const { path, hdu } = this.image;
     getTile(path, hdu, level, tx, ty)
       .then((tile) => {
         if (gen !== this.generation) return;
@@ -1180,12 +1265,17 @@ export class Viewer {
   }
 
   private evict(): void {
-    if (this.tiles.size <= MAX_GPU_TILES) return;
+    // A composite needs every band's copy of each visible tile, so the budget
+    // grows with the band count (~250 tiles ≈ 62 MB per band beyond the base).
+    const budget = Math.max(MAX_GPU_TILES, 250 * (this.sources?.length ?? 1));
+    if (this.tiles.size <= budget) return;
     const entries = [...this.tiles.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-    const drop = entries.slice(0, this.tiles.size - MAX_GPU_TILES);
+    const drop = entries.slice(0, this.tiles.size - budget);
     for (const [key, t] of drop) {
       // Never evict the backdrop level; it's tiny and always needed.
       if (this.image && key.startsWith(`${this.image.maxLevel}/`)) continue;
+      // Nor anything on screen right now (would refetch-thrash).
+      if (t.lastUsed >= this.tick) continue;
       this.p.gl.deleteTexture(t.tex);
       this.tiles.delete(key);
     }
@@ -1213,7 +1303,9 @@ export class Viewer {
    *  limits are still being computed). Returns true if fully covered. */
   private drawLevel(level: number, request: boolean, render = true): boolean {
     if (!this.image) return false;
-    const { gl, uniforms } = this.p;
+    const { gl } = this.p;
+    const rectLoc = this.sources && this.comp ? this.comp.uniforms.rect : this.p.uniforms.rect;
+    const srcs = this.drawSources();
     const { nx, ny } = this.image;
     const stride = 2 ** level;
     const lw = Math.ceil(nx / stride);
@@ -1240,24 +1332,33 @@ export class Viewer {
     const t1y = Math.min(Math.ceil(lh / TILE) - 1, Math.floor((iy1 - 1) / stride / TILE));
 
     let complete = true;
+    const have: CachedTile[] = [];
     for (let ty = t0y; ty <= t1y; ty++) {
       for (let tx = t0x; tx <= t1x; tx++) {
-        const key = this.tileKey(level, tx, ty);
-        const tile = this.tiles.get(key);
-        if (!tile) {
-          complete = false;
-          if (request) this.requestTile(level, tx, ty);
-          continue;
+        // A composite tile draws only once every band's tile is resident
+        // (all bands share the grid, so the same (level, tx, ty) lines up).
+        have.length = 0;
+        for (const s of srcs) {
+          const tile = this.tiles.get(this.tileKey(level, tx, ty, s.path, s.hdu));
+          if (!tile) {
+            complete = false;
+            if (request) this.requestTile(level, tx, ty, s.path, s.hdu);
+            continue;
+          }
+          tile.lastUsed = this.tick;
+          have.push(tile);
         }
-        tile.lastUsed = this.tick;
-        if (!render) continue;
+        if (have.length !== srcs.length || !render) continue;
         const x0 = tx * TILE * stride;
         const y0 = ty * TILE * stride;
-        const w = Math.min(tile.w * stride, nx - x0);
-        const h = Math.min(tile.h * stride, ny - y0);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, tile.tex);
-        gl.uniform4f(uniforms.rect, x0, y0, w, h);
+        const w = Math.min(have[0].w * stride, nx - x0);
+        const h = Math.min(have[0].h * stride, ny - y0);
+        // Single-band: unit 0 (LUT on 1). Composite: units 0..n-1 (no LUT).
+        have.forEach((t, i) => {
+          gl.activeTexture(gl.TEXTURE0 + i);
+          gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        });
+        gl.uniform4f(rectLoc, x0, y0, w, h);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       }
     }
@@ -1315,19 +1416,23 @@ export class Viewer {
       return;
     }
 
-    gl.useProgram(program);
+    if (this.sources && this.compDisplay) {
+      this.useCompositeProgram(this.compDisplay);
+    } else {
+      gl.useProgram(program);
+      gl.uniform2f(uniforms.center, this.cx, this.cy);
+      gl.uniform1f(uniforms.scale, this.scale);
+      gl.uniform2f(uniforms.viewport, this.canvas.width, this.canvas.height);
+      gl.uniform2f(uniforms.rot, Math.cos(this.rot), Math.sin(this.rot));
+      gl.uniform2f(uniforms.limits, this.limits[0], this.limits[1]);
+      gl.uniform2f(uniforms.cb, this.bias, this.contrast);
+      gl.uniform1i(uniforms.stretch, this.stretchIndex);
+      gl.uniform1i(uniforms.tex, 0);
+      gl.uniform1i(uniforms.lut, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, lutTex);
+    }
     gl.bindVertexArray(vao);
-    gl.uniform2f(uniforms.center, this.cx, this.cy);
-    gl.uniform1f(uniforms.scale, this.scale);
-    gl.uniform2f(uniforms.viewport, this.canvas.width, this.canvas.height);
-    gl.uniform2f(uniforms.rot, Math.cos(this.rot), Math.sin(this.rot));
-    gl.uniform2f(uniforms.limits, this.limits[0], this.limits[1]);
-    gl.uniform2f(uniforms.cb, this.bias, this.contrast);
-    gl.uniform1i(uniforms.stretch, this.stretchIndex);
-    gl.uniform1i(uniforms.tex, 0);
-    gl.uniform1i(uniforms.lut, 1);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, lutTex);
 
     // Target level: finest level whose sampling is not coarser than the
     // screen (floor of log2 image-px-per-screen-px), clamped to the pyramid.
@@ -1345,6 +1450,39 @@ export class Viewer {
       this.drawLevel(lvl, request);
     }
     gl.bindVertexArray(null);
+  }
+
+  /** Bind the composite program and upload this frame's uniforms. */
+  private useCompositeProgram(d: CompositeDisplay): void {
+    const gl = this.p.gl;
+    if (!this.comp) this.comp = createCompositeProgram(gl);
+    const u = this.comp.uniforms;
+    gl.useProgram(this.comp.program);
+    gl.uniform2f(u.center, this.cx, this.cy);
+    gl.uniform1f(u.scale, this.scale);
+    gl.uniform2f(u.viewport, this.canvas.width, this.canvas.height);
+    gl.uniform2f(u.rot, Math.cos(this.rot), Math.sin(this.rot));
+    const n = d.bands.length;
+    const weight = new Float32Array(MAX_BANDS * 3);
+    const lim = new Float32Array(MAX_BANDS * 2);
+    const k = new Float32Array(MAX_BANDS);
+    const sum = [0, 0, 0];
+    d.bands.forEach((b, i) => {
+      weight.set(b.weight, i * 3);
+      lim[i * 2] = b.lo;
+      lim[i * 2 + 1] = b.hi;
+      k[i] = b.k;
+      for (let c = 0; c < 3; c++) sum[c] += b.weight[c];
+    });
+    gl.uniform1iv(u.bands, Int32Array.from({ length: MAX_BANDS }, (_, i) => i));
+    gl.uniform3fv(u.weight, weight);
+    gl.uniform2fv(u.lim, lim);
+    gl.uniform1fv(u.k, k);
+    gl.uniform1i(u.nBands, n);
+    gl.uniform3f(u.weightSum, sum[0], sum[1], sum[2]);
+    gl.uniform1i(u.stretch, d.stretch);
+    gl.uniform1f(u.saturation, d.saturation);
+    gl.uniform2f(u.cb, this.bias, this.contrast);
   }
 }
 
