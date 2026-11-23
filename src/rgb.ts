@@ -51,6 +51,9 @@ export interface RgbState<F> {
   simple: { r: number; g: number; b: number; lo: number; hi: number; stretch: Stretch };
   /** Frame bar shows the band frames nested under the composite chip. */
   expanded: boolean;
+  /** The user hand-edited a weight since the last rainbow spread; a band
+   *  reorder then keeps weights instead of re-spreading the rainbow. */
+  customWeights: boolean;
   nx: number;
   ny: number;
 }
@@ -76,6 +79,7 @@ export function initialRgbState<F>(
     saturation: 1,
     simple: { r, g, b, lo: 0, hi: 1, stretch: "linear" },
     expanded: false,
+    customWeights: false,
     nx,
     ny,
   };
@@ -83,7 +87,8 @@ export function initialRgbState<F>(
   return state;
 }
 
-/** Rainbow weights over the included bands (blue → red); excluded get 0. */
+/** Rainbow weights over the included bands in their current order (blue →
+ *  red by default); excluded bands get 0. */
 export function applyRainbow<F>(bands: RgbBand<F>[]): void {
   const inc = bands.filter((b) => b.include);
   const w = rainbowWeights(inc.length);
@@ -91,6 +96,20 @@ export function applyRainbow<F>(bands: RgbBand<F>[]): void {
   inc.forEach((b, i) => {
     b.weight = [...w[i]];
   });
+}
+
+/** Move band `from` to position `to` (drag-reordered chips). Simple-mode
+ *  channel picks follow their bands; trilogy weights re-spread over the new
+ *  order unless hand-edited. */
+export function moveRgbBand<F>(s: RgbState<F>, from: number, to: number): void {
+  if (from === to) return;
+  const pick = { r: s.bands[s.simple.r], g: s.bands[s.simple.g], b: s.bands[s.simple.b] };
+  const [band] = s.bands.splice(from, 1);
+  s.bands.splice(Math.max(0, Math.min(s.bands.length, to)), 0, band);
+  s.simple.r = s.bands.indexOf(pick.r);
+  s.simple.g = s.bands.indexOf(pick.g);
+  s.simple.b = s.bands.indexOf(pick.b);
+  if (!s.customWeights) applyRainbow(s.bands);
 }
 
 /** Simple-mode shared range: the mean of the three channel bands' zscale
@@ -257,9 +276,11 @@ function renderTrilogy<F>(panel: HTMLElement, s: RgbState<F>, host: RgbPanelHost
   const head = el("div", "rgb-section-head");
   head.append(el("span", "", "Weights"));
   const rainbow = el("button", "", "✦ rainbow");
-  rainbow.title = "Spread the included bands blue → red across B → R";
+  rainbow.title =
+    "Spread the included bands across B → R in their current order (drag the band chips under ▸ to reorder)";
   rainbow.addEventListener("click", () => {
     applyRainbow(s.bands);
+    s.customWeights = false;
     host.changed(false);
     host.rerender();
   });
@@ -321,6 +342,7 @@ function renderTrilogy<F>(panel: HTMLElement, s: RgbState<F>, host: RgbPanelHost
         const v = Number(inp.value);
         if (!Number.isFinite(v)) return;
         b.weight[c] = Math.min(1, Math.max(0, v));
+        s.customWeights = true;
         sw.style.background = swatch(b.weight);
         host.changed(false);
       });

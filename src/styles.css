@@ -947,3 +947,23 @@ table.cards td {
   font-size: 11px;
   margin-top: 4px;
 }
+
+/* ---- drag-to-reorder frame chips (#16) ---- */
+.frame-chip {
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.frame-chip.dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.frame-chip.drop-before {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.frame-chip.drop-after {
+  box-shadow: inset -3px 0 0 var(--accent);
+}

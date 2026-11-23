@@ -153,6 +153,10 @@ anything. Promote items into a milestone deliberately, not casually.
   them out with the reason (`gridMismatch` in src/render/trilogy.ts).
 - **Save the composite to a file** (optional): PNG of the current view and/or
   a full-resolution render.
+- **Reset to defaults** button (next to ✦ rainbow, separate from it): restore
+  the composite's initial state — mode, weights, included bands, trilogy
+  sliders, color saturation, simple-mode channels/range/stretch, bias/contrast.
+  Rainbow stays "re-spread weights only" so it never clobbers liked sliders.
 - Wavelength-proportional rainbow option (hues spaced by log λ, not rank) —
   matters for mixed NIRCam+MIRI sets.
 - Per-pixel weight renormalization at coverage edges (CAMPFIRE pipeline
