@@ -5,19 +5,65 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
-## PR #11 closed 2026-08-14 — cold-scan hang diagnosed and fixed; needs re-test on the Mac
+## Drag-to-reorder frame chips (issue #16) — user-verified 2026-11-23
 
-Ansh (owner, M2 MacBook Air) tested the M5 crossmatch build from PR #11 and
-closed it: *"cross-match functionality does not work - enters indefinite
-loop."* That build predates the cold-scan fix, which had been diagnosed
-during live testing (first sort on the 1M-row/11 GB catalog hung) but never
-made it to GitHub — pushes were blocked by the repo ruleset ("changes must
-be made through a pull request", scoped to **all** branches; Ansh needs to
-re-scope it to `main` in Settings → Rules), and the container holding the
-unpushed commit was recycled, so the fix was **re-implemented from scratch**
-(this working tree; commit "cold column scans: stream…").
+Frame-bar chips reorder by pointer drag (`bindChipDrag`/`reorderFrame`/
+`syncFrameOrder` in main.ts; click without drag still activates). `frames`
+order is the source of truth: grid tiles follow via CSS `order`, cycling and
+blink follow the array. A composite chip moves with its bands; band chips
+under ▸ reorder only within their composite (`moveRgbBand` in rgb.ts) — band
+order drives the rainbow (re-spread unless `customWeights`), sidebar rows,
+and the frame name; simple-mode picks follow their bands. User confirmed the
+full 8-step checklist (6 frames: A2744 trio + rgb fixtures).
 
-**Root cause** (two layers):
+## RGB composites (issue #14, PR #15) — user-verified 2026-11-23
+
+`RGB…` toolbar button → dialog of open image frames (blue→red by detected
+filter; off-grid frames disabled with reason) → a composite frame whose
+band frames fold under an expandable chip (▸). Modes: **trilogy** (fitsgl
+per-band levels x0/x1/x2 + softening k, N ≤ 12 bands, R/G/B weight matrix,
+rainbow) and **simple** 3-color (shared range + DS9 stretch). Controls live
+in the sidebar while the composite is active. The composite frame reuses the
+reference band's file/HDU → WCS lock, regions, goto, overlays unchanged.
+
+User ran the full checklist on the three 5 GB A2744 NIRCam mosaics
+(F200W/F277W/F444W, filename-detected) + an off-grid fixture: **all 8 steps
+passed**. Band stats sampling: 0.35–0.6 s per 5 GB band (release).
+
+Where things are: `src-tauri/src/rgb/` (stats + band detection, ported from
+fitsgl-py), `get_band_info` (lib.rs), `src/render/trilogy.ts` (level math,
+grid check), composite program in `gl.ts`, Viewer composite mode
+(`setComposite*`), `src/rgb.ts` (state + panel). Gates:
+`tests/rgb_fixtures.rs` and `npm run test:ts` (scripts/check_trilogy.mjs)
+against `fixtures/rgb_expected.json` (scripts/gen_rgb_fixtures.py).
+
+Gotchas: hidden band frames have their Viewer destroyed (frees WebGL
+contexts) and rebuild lazily on expand; closing a band frame that belongs to
+a composite is blocked; tile GPU budget scales 250 tiles/band and never
+evicts on-screen tiles. Untested: real MIRI data (detection covers MIRI
+filters; MIRI must be on the same grid until v2 reprojection). v2 items
+(reprojection, save to file, reset-to-defaults button) are in BACKLOG.
+
+## M5 crossmatch MERGED 2026-08-14 (PR #11) — including the cold-scan fix
+
+PR #11 (M5: column cache, kd-tree match core, derived tables,
+Match/Export/probe UI) is **merged to main**, including `f08dac6` — the
+cold-scan streaming fix. Timeline: Ansh first closed the PR ("cross-match
+enters indefinite loop", M2 MacBook Air) because his build predated the
+fix, which was stuck locally behind the then-all-branches ruleset (and the
+original fix commit had been lost with a recycled session container — it
+was re-implemented from scratch, better: see dispatch trap below). After
+the diagnosis was posted on the PR, Ansh re-scoped the ruleset to `main`
+only, the fix pushed, and he confirmed: *"Hang is now resolved … appears
+functional. Merge approved."*
+
+**Still untested on the Mac**: exact time scaling (Ansh: "haven't tested
+time scaling") — the 1M×1M `--ignored` release perf test and the
+cold-vs-warm sort timing on the 11 GB catalog from the PR checklist are
+worth a pass when convenient. Ruleset note: `main` now requires PRs;
+feature-branch pushes work again.
+
+**Root cause of the hang, for the record** (two layers):
 1. A cold full-column materialization looped `cell()` row by row,
    demand-faulting the whole multi-GB file through the mmap one 4 KB page at
    a time — minutes of synchronous fault latency on macOS, which presents as
@@ -39,16 +85,9 @@ Gated by: per-cell-identity test over the astropy fixtures, plus
 `tests/table_stream.rs` (multi-chunk 1.2M-row synthetic table + truncated
 file). 89 tests green, tsc clean.
 
-**Mac re-test needed** (then the PR #11 checklist): cold first sort on the
-11 GB catalog, and a crossmatch of two large catalogs — watch for
-`(cols: miss+miss…)` then `hit` on re-runs in the log. Container Linux
-timing: 1.2M×2-col scan ≈ 0.5 s debug.
-
-Status 2026-08-14: push of this fix rejected by the ruleset (git **and**
-GitHub API both `GH013`); patch re-sent to the user's chat as backup
-(`git am` on top of `277d5a5`); diagnosis + ruleset ask posted as a comment
-on closed PR #11. Reopening the PR is Ansh/Hollis's call — do not reopen
-unilaterally.
+Log breadcrumbs for perf checks: `(cols: miss+miss…)` on a cold
+sort/match, `hit` on re-runs. Container Linux timing: 1.2M×2-col scan
+≈ 0.5 s debug.
 
 ## Current milestone: everything implemented through M5 depth is now **user-verified working (2026-07-12)** — including zoom-flash fix, table horizontal scroll, the full M5-depth + multi-region-select surface, the overnight-2026-07-12 batch (region undo/redo, reverse-link-keeps-sort, new-polygon creation, position-column picker), cross-file marker→row, and real-data confirmation (row-locate on a wide JWST catalog + region save round-trip through DS9). Next work comes from BACKLOG (M6 packaging/polish, M4 polish, overlay follow-ups).
 
