@@ -10,7 +10,7 @@ import {
   parseCoord,
   pickFitsFile,
   pickFitsSavePath,
-  pickRegionFile,
+  pickRegionFiles,
   pickRegionSavePath,
   getWcs,
   resolveCoord,
@@ -24,6 +24,7 @@ import {
   type FileSummary,
   type HduInfo,
   type HeaderCard,
+  type PixelRegion,
   type ScaleMode,
   type TableCell,
   type TableColumn,
@@ -35,6 +36,13 @@ import { TableView } from "./render/table";
 import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
 import { Wcs } from "./render/wcs";
 import { MAX_BANDS, gridMismatch } from "./render/trilogy";
+import {
+  buildRegionPanel,
+  newLayer,
+  renderRegionLayers,
+  type RegionLayer,
+  type RegionPanelHost,
+} from "./regionpanel";
 import { compositeDraw, distinctUnits, initialRgbState, moveRgbBand, renderRgbPanel, type RgbState } from "./rgb";
 
 type ViewTab = "image" | "table" | "header";
@@ -49,8 +57,11 @@ interface Frame {
   selectedHdu: number;
   tab: ViewTab;
   cards: HeaderCard[];
-  /** Loaded .reg path for this frame; regions re-resolve per HDU (sky→WCS). */
-  regionPath: string | null;
+  /** Region layers (loaded .reg files + untitled drawn layers); file
+   *  layers re-resolve per HDU (sky→WCS). Regions live in the Viewer. */
+  regionLayers: RegionLayer[];
+  /** Layer new regions are drawn into (null = none yet). */
+  activeLayer: number | null;
   /** Container div in #frames-grid holding this frame's canvas + overlay. */
   cell: HTMLElement;
   /** Lazily created on first show; null until then. */
@@ -617,44 +628,200 @@ async function ensureTable(frame: Frame): Promise<void> {
   }
 }
 
-/** (Re)load the picked .reg file for a frame and show warnings (active only). */
+/** (Re)load every file layer of a frame against the image the viewer shows
+ *  (its WCS/grid — in split mode that differs from the sidebar-selected table
+ *  HDU). Untitled layers keep their metadata but their regions don't survive
+ *  an image reload (pixel coordinates of another grid). */
 async function applyRegionsFor(frame: Frame): Promise<void> {
   if (!frame.viewer) return;
-  const isActive = frame === activeFrame();
-  const readout = must<HTMLElement>("readout");
-  // Regions resolve against the image the viewer shows (its WCS/grid), which
-  // in split mode differs from the sidebar-selected (table) HDU.
   const hdu = frame.viewerHdu ?? frame.selectedHdu;
-  if (!frame.regionPath) {
-    frame.viewer.setRegions(null);
-  } else {
+  const all: PixelRegion[] = [];
+  for (const layer of frame.regionLayers) {
+    if (!layer.path) continue;
     try {
-      const result = await loadRegionFile(frame.file.path, hdu, frame.regionPath);
-      frame.viewer.setRegions(result.regions);
-      if (isActive) {
-        readout.textContent =
-          result.warnings.length > 0
-            ? `regions: ${result.warnings[0]}${
-                result.warnings.length > 1 ? ` (+${result.warnings.length - 1} more)` : ""
-              }`
-            : `${result.regions.length} region${result.regions.length === 1 ? "" : "s"} loaded`;
-      }
-      if (result.warnings.length > 0) console.warn("region warnings:", result.warnings);
+      const result = await loadRegionFile(frame.file.path, hdu, layer.path);
+      layer.warnings = result.warnings;
+      for (const r of result.regions) all.push({ ...r, layer: layer.id });
     } catch (err) {
-      frame.regionPath = null;
-      frame.viewer.setRegions(null);
-      if (isActive) readout.textContent = `regions: ${String(err)}`;
+      layer.warnings = [String(err)];
     }
   }
-  if (isActive) refreshRegionButtons();
+  frame.viewer.setRegions(all.length > 0 || frame.regionLayers.length > 0 ? all : null);
+  frame.viewer.setLayerStyle(layerStyleOf(frame));
+  if (frame === activeFrame()) renderRegionPanel();
 }
 
-/** Show the Save/clear region buttons whenever the active frame has regions. */
-function refreshRegionButtons(): void {
-  const show = activeFrame()?.viewer?.hasRegions() ? "" : "none";
-  must<HTMLElement>("region-clear-btn").style.display = show;
-  must<HTMLElement>("region-save-btn").style.display = show;
-  must<HTMLElement>("region-frame-select").style.display = show;
+/** Visibility + color overrides of a frame's layers, for the viewer. */
+function layerStyleOf(frame: Frame): { hidden: Set<number>; colors: Map<number, string> } {
+  const hidden = new Set<number>();
+  const colors = new Map<number, string>();
+  for (const l of frame.regionLayers) {
+    if (!l.visible) hidden.add(l.id);
+    if (l.color) colors.set(l.id, l.color);
+  }
+  return { hidden, colors };
+}
+
+/** Load .reg files as new layers on a frame (each appended, nothing replaced). */
+async function loadRegionLayers(frame: Frame, paths: string[]): Promise<void> {
+  if (!frame.viewer || paths.length === 0) return;
+  const hdu = frame.viewerHdu ?? frame.selectedHdu;
+  const readout = must<HTMLElement>("readout");
+  const msgs: string[] = [];
+  for (const path of paths) {
+    try {
+      const result = await loadRegionFile(frame.file.path, hdu, path);
+      const layer = newLayer(basename(path), path);
+      layer.warnings = result.warnings;
+      frame.regionLayers.push(layer);
+      frame.viewer.addRegions(result.regions.map((r) => ({ ...r, layer: layer.id })));
+      if (frame.activeLayer === null) frame.activeLayer = layer.id;
+      msgs.push(
+        `${layer.name}: ${result.regions.length}` +
+          (result.warnings.length > 0 ? ` (${result.warnings.length} warning${result.warnings.length === 1 ? "" : "s"})` : ""),
+      );
+      if (result.warnings.length > 0) console.warn(`region warnings (${path}):`, result.warnings);
+    } catch (err) {
+      msgs.push(`${basename(path)}: ${String(err)}`);
+    }
+  }
+  frame.viewer.setLayerStyle(layerStyleOf(frame));
+  if (frame === activeFrame()) {
+    readout.textContent = `regions — ${msgs.join(" · ")}`;
+    showRegionPanel(true);
+  }
+}
+
+/** The layer to draw a new region into: the active layer (re-shown if it
+ *  was hidden), else a fresh "untitled" layer. Called by the viewer at the
+ *  start of a create gesture. */
+function drawLayerFor(frame: Frame): number {
+  let layer = frame.regionLayers.find((l) => l.id === frame.activeLayer);
+  if (!layer) {
+    layer = newLayer(`untitled ${frame.regionLayers.filter((l) => !l.path).length + 1}`, null);
+    frame.regionLayers.push(layer);
+    frame.activeLayer = layer.id;
+  }
+  if (!layer.visible) {
+    layer.visible = true;
+    frame.viewer?.setLayerStyle(layerStyleOf(frame));
+  }
+  if (frame === activeFrame()) renderRegionPanel();
+  return layer.id;
+}
+
+/** Save one layer as a .reg (image or sky frame); the layer then points at
+ *  the saved file (so a later image reload re-reads the saved version). */
+async function saveRegionLayer(frame: Frame, id: number): Promise<void> {
+  const layer = frame.regionLayers.find((l) => l.id === id);
+  if (!layer || !frame.viewer) return;
+  const readout = must<HTMLElement>("readout");
+  const regions = frame.viewer.layerRegions(id).map(({ layer: _l, ...r }) => r as PixelRegion);
+  if (regions.length === 0) {
+    readout.textContent = `layer ${layer.name} has no regions to save`;
+    return;
+  }
+  const out = await pickRegionSavePath(layer.path ?? `${layer.name.replace(/\s+/g, "_")}.reg`);
+  if (!out) return;
+  try {
+    const result = await savePixelRegions(
+      frame.file.path,
+      frame.viewerHdu ?? frame.selectedHdu,
+      regions,
+      regionSaveFrame?.value ?? "image",
+      out,
+    );
+    layer.path = out;
+    layer.name = basename(out);
+    readout.textContent =
+      result.warnings.length > 0
+        ? `saved ${result.count} regions (${result.warnings.length} warned — see console)`
+        : `saved ${result.count} region${result.count === 1 ? "" : "s"} to ${out}`;
+    if (result.warnings.length > 0) console.warn("region save warnings:", result.warnings);
+    renderRegionPanel();
+  } catch (err) {
+    readout.textContent = `region save failed: ${String(err)}`;
+  }
+}
+
+/** Region panel body + save-frame select (built in buildUi). */
+let regionPanelBody: HTMLElement | null = null;
+let regionSaveFrame: HTMLSelectElement | null = null;
+
+function showRegionPanel(show: boolean): void {
+  must<HTMLElement>("region-panel").style.display = show ? "" : "none";
+  must<HTMLElement>("region-panel-btn").classList.toggle("active-btn", show);
+  if (show) renderRegionPanel();
+}
+
+/** Host callbacks for the panel, acting on the active frame. */
+const regionHost: RegionPanelHost = {
+  counts: () => activeFrame()?.viewer?.layerCounts() ?? new Map(),
+  toggleVisible: (id) => {
+    const f = activeFrame();
+    const l = f?.regionLayers.find((x) => x.id === id);
+    if (!f || !l) return;
+    l.visible = !l.visible;
+    f.viewer?.setLayerStyle(layerStyleOf(f));
+    renderRegionPanel();
+  },
+  setActive: (id) => {
+    const f = activeFrame();
+    if (!f) return;
+    f.activeLayer = id;
+    renderRegionPanel();
+  },
+  setColor: (id, color) => {
+    const f = activeFrame();
+    const l = f?.regionLayers.find((x) => x.id === id);
+    if (!f || !l) return;
+    l.color = color;
+    f.viewer?.setLayerStyle(layerStyleOf(f));
+    if (color === null) renderRegionPanel();
+  },
+  save: (id) => {
+    const f = activeFrame();
+    if (f) void saveRegionLayer(f, id);
+  },
+  close: (id) => {
+    const f = activeFrame();
+    if (!f) return;
+    f.regionLayers = f.regionLayers.filter((l) => l.id !== id);
+    if (f.activeLayer === id) f.activeLayer = f.regionLayers[f.regionLayers.length - 1]?.id ?? null;
+    f.viewer?.removeLayer(id);
+    renderRegionPanel();
+  },
+  load: () => void loadRegionsViaDialog(),
+  newLayer: () => {
+    const f = activeFrame();
+    if (!f) return;
+    const layer = newLayer(`untitled ${f.regionLayers.filter((l) => !l.path).length + 1}`, null);
+    f.regionLayers.push(layer);
+    f.activeLayer = layer.id;
+    renderRegionPanel();
+  },
+  showAll: (visible) => {
+    const f = activeFrame();
+    if (!f) return;
+    for (const l of f.regionLayers) l.visible = visible;
+    f.viewer?.setLayerStyle(layerStyleOf(f));
+    renderRegionPanel();
+  },
+};
+
+async function loadRegionsViaDialog(): Promise<void> {
+  const frame = activeFrame();
+  if (!frame?.viewer) return;
+  const picked = await pickRegionFiles();
+  await loadRegionLayers(frame, picked);
+}
+
+/** Re-render the layer list for the active frame (if the panel is open). */
+function renderRegionPanel(): void {
+  const panel = document.getElementById("region-panel");
+  if (!regionPanelBody || !panel || panel.style.display === "none") return;
+  const f = activeFrame();
+  renderRegionLayers(regionPanelBody, f?.regionLayers ?? [], f?.activeLayer ?? null, regionHost);
 }
 
 // ---- frame Viewer lifecycle ----------------------------------------------
@@ -688,8 +855,9 @@ function makeViewer(frame: Frame): Viewer {
       must<HTMLElement>("region-info").textContent = desc ?? "";
     },
     onRegionsChanged: () => {
-      if (frame === activeFrame()) refreshRegionButtons();
+      if (frame === activeFrame()) renderRegionPanel();
     },
+    drawLayer: () => drawLayerFor(frame),
     onCameraChange: (cx, cy, scale) => mirrorCameraFrom(frame, cx, cy, scale),
     onSourcePick: (row) => void locateSourceRow(frame, row),
   });
@@ -833,7 +1001,7 @@ function syncToolbar(frame: Frame): void {
   histPanel?.setLimits(lo, hi);
   must<HTMLElement>("region-edit-btn").classList.toggle("active-btn", editMode);
   must<HTMLElement>("region-shape-select").style.display = editMode ? "" : "none";
-  refreshRegionButtons();
+  renderRegionPanel();
   must<HTMLElement>("region-info").textContent = "";
 }
 
@@ -1828,7 +1996,7 @@ async function addFrame(
   const hdu = file.hdus[selectedHdu];
   const tab: ViewTab = isViewableImage(hdu) ? "image" : isTableHdu(hdu) ? "table" : "header";
   const frame: Frame = {
-    file, selectedHdu, tab, cards: [], regionPath: null, cell,
+    file, selectedHdu, tab, cards: [], regionLayers: [], activeLayer: null, cell,
     viewer: null, viewerHdu: null, wcs: null, sourceFrom: null, posOverride: null,
     composite: rgb?.composite ?? null, hiddenBy: null,
   };
@@ -2005,26 +2173,13 @@ function buildUi(): void {
     ensureHistogram();
   });
   const regBtn = el("button", "", "Reg…");
-  regBtn.title = "Load a DS9 region file (.reg) onto the image";
-  regBtn.addEventListener("click", () => {
-    void (async () => {
-      const frame = activeFrame();
-      if (!frame) return;
-      const picked = await pickRegionFile();
-      if (!picked) return;
-      frame.regionPath = picked;
-      await applyRegionsFor(frame);
-    })();
-  });
-  const regClearBtn = el("button", "", "×");
-  regClearBtn.id = "region-clear-btn";
-  regClearBtn.title = "Clear regions";
-  regClearBtn.style.display = "none";
-  regClearBtn.addEventListener("click", () => {
-    const frame = activeFrame();
-    if (!frame) return;
-    frame.regionPath = null;
-    void applyRegionsFor(frame);
+  regBtn.title = "Load DS9 region files (.reg) as new layers on the image (several at once is fine)";
+  regBtn.addEventListener("click", () => void loadRegionsViaDialog());
+  const regPanelBtn = el("button", "", "Layers");
+  regPanelBtn.id = "region-panel-btn";
+  regPanelBtn.title = "Region layers: show/hide, recolor, save, or close each loaded/drawn region file";
+  regPanelBtn.addEventListener("click", () => {
+    showRegionPanel(must<HTMLElement>("region-panel").style.display === "none");
   });
   // Region edit mode toggle + create-shape picker.
   const editBtn = el("button", "", "Edit");
@@ -2050,40 +2205,6 @@ function buildUi(): void {
     activeFrame()?.viewer?.setEditMode(editMode);
   });
 
-  const regSaveBtn = el("button", "", "Save");
-  regSaveBtn.id = "region-save-btn";
-  regSaveBtn.title = "Save the current regions to a .reg file";
-  regSaveBtn.style.display = "none";
-  // Coordinate frame for saved regions (sky needs the HDU's WCS).
-  const frameSel = makeSelect("region-frame-select", ["image", "sky"], () => {});
-  frameSel.title = "Coordinate frame for saved regions (image = pixels, sky = icrs)";
-  frameSel.style.display = "none";
-  regSaveBtn.addEventListener("click", () => {
-    void (async () => {
-      const frame = activeFrame();
-      if (!frame || !frame.viewer || !frame.viewer.hasRegions()) return;
-      const outFrame = frameSel.value;
-      const out = await pickRegionSavePath(frame.regionPath ?? undefined);
-      if (!out) return;
-      const readout = must<HTMLElement>("readout");
-      try {
-        const result = await savePixelRegions(
-          frame.file.path,
-          frame.viewerHdu ?? frame.selectedHdu,
-          frame.viewer.getRegions(),
-          outFrame,
-          out,
-        );
-        readout.textContent =
-          result.warnings.length > 0
-            ? `saved ${result.count} regions (${result.warnings.length} warned — see console)`
-            : `saved ${result.count} region${result.count === 1 ? "" : "s"} to ${out}`;
-        if (result.warnings.length > 0) console.warn("region save warnings:", result.warnings);
-      } catch (err) {
-        readout.textContent = `region save failed: ${String(err)}`;
-      }
-    })();
-  });
   const gotoBox = el("input", "goto");
   gotoBox.id = "goto-box";
   gotoBox.placeholder = "goto α δ";
@@ -2116,11 +2237,9 @@ function buildUi(): void {
     fitBtn,
     histBtn,
     regBtn,
+    regPanelBtn,
     editBtn,
     shapeSel,
-    regSaveBtn,
-    frameSel,
-    regClearBtn,
     gotoBox,
     limitsLabel,
     cbLabel,
@@ -2441,6 +2560,11 @@ function buildUi(): void {
   tableView = new TableView(tablePane, (cells, columns) => void locateRow(cells, columns));
 
   histPanel = new HistogramPanel(imagePane, (lo, hi) => activeFrame()?.viewer?.setLimits(lo, hi));
+
+  const rp = buildRegionPanel(regionHost, () => showRegionPanel(false));
+  imagePane.append(rp.root);
+  regionPanelBody = rp.body;
+  regionSaveFrame = rp.frameSelect;
 }
 
 async function init(): Promise<void> {

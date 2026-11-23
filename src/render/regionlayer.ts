@@ -19,6 +19,24 @@ export interface RegionView {
 
 const DEFAULT_COLOR = "#00ff00"; // DS9 default green; .reg names are CSS-valid
 
+/** Per-layer display state (multiple region files on one image). Regions in
+ *  a hidden layer are neither drawn nor hit-tested; a layer color overrides
+ *  each region's own DS9 color. */
+export interface LayerStyle {
+  hidden: ReadonlySet<number>;
+  colors: ReadonlyMap<number, string>;
+}
+
+/** Whether a region is in a visible layer (untagged regions always are). */
+export function regionShown(reg: PixelRegion, layers?: LayerStyle): boolean {
+  return !layers || reg.layer === undefined || !layers.hidden.has(reg.layer);
+}
+
+function regionColor(reg: PixelRegion, layers?: LayerStyle): string {
+  const over = reg.layer !== undefined ? layers?.colors.get(reg.layer) : undefined;
+  return over ?? reg.color ?? DEFAULT_COLOR;
+}
+
 /** Which regions to draw emphasized (indices into the region array, -1 =
  *  none). `selected` is the primary region — white glow + corner handles;
  *  every index in `selection` (a multi-select set) gets a white glow without
@@ -53,6 +71,7 @@ export function drawRegions(
   regions: readonly PixelRegion[] | null,
   view: RegionView,
   hl?: RegionHighlight,
+  layers?: LayerStyle,
 ): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -63,16 +82,18 @@ export function drawRegions(
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
+    if (!regionShown(reg, layers)) continue;
+    const color = regionColor(reg, layers);
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =
       hl && i === hl.selected ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
     ctx.save();
-    ctx.strokeStyle = ctx.fillStyle = reg.color ?? DEFAULT_COLOR;
+    ctx.strokeStyle = ctx.fillStyle = color;
     ctx.lineWidth = Math.max(1, (reg.width ?? 1) * view.dpr) + (emph ? 1.5 * view.dpr : 0);
     ctx.setLineDash(reg.dash ? [6 * view.dpr, 4 * view.dpr] : []);
     if (emph) {
-      ctx.shadowColor = emph === 1 ? reg.color ?? DEFAULT_COLOR : "#ffffff";
+      ctx.shadowColor = emph === 1 ? color : "#ffffff";
       ctx.shadowBlur = (emph === 1 ? 5 : 8) * view.dpr;
     }
 
@@ -286,6 +307,7 @@ export function regionsInRect(
   y0: number,
   x1: number,
   y1: number,
+  layers?: LayerStyle,
 ): number[] {
   const project = screenMap(view);
   const lox = Math.min(x0, x1);
@@ -294,6 +316,7 @@ export function regionsInRect(
   const hiy = Math.max(y0, y1);
   const out: number[] = [];
   for (let i = 0; i < regions.length; i++) {
+    if (!regionShown(regions[i], layers)) continue;
     const [cx, cy] = regionCenterPx(regions[i]);
     const [sx, sy] = project(cx, cy);
     if (sx >= lox && sx <= hix && sy >= loy && sy <= hiy) out.push(i);
@@ -403,11 +426,13 @@ export function hitTestRegion(
   mx: number,
   my: number,
   tol = 6,
+  layers?: LayerStyle,
 ): number {
   if (!regions) return -1;
   const project = screenMap(view);
   const slack = tol * view.dpr;
   for (let i = regions.length - 1; i >= 0; i--) {
+    if (!regionShown(regions[i], layers)) continue;
     if (regionHit(regions[i], view, project, mx, my, slack)) return i;
   }
   return -1;

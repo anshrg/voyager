@@ -206,6 +206,9 @@ export type PixelRegion = {
   text: string | null;
   /** Point marker style ("circle", "cross", "x", …). */
   point: string | null;
+  /** Frontend-only: the region layer (loaded file / untitled) this region
+   *  belongs to. Never produced by the backend; stripped before saving. */
+  layer?: number;
 } & (
   | { shape: "circle"; x: number; y: number; r: number }
   | { shape: "annulus"; x: number; y: number; rin: number; rout: number }
@@ -253,6 +256,20 @@ export async function pickRegionSavePath(defaultPath?: string): Promise<string |
     filters: [{ name: "DS9 regions", extensions: ["reg"] }],
   });
   return typeof selected === "string" ? selected : null;
+}
+
+/** Pick one or more .reg files (each becomes a region layer). */
+export async function pickRegionFiles(): Promise<string[]> {
+  const selected = await openDialog({
+    multiple: true,
+    directory: false,
+    filters: [
+      { name: "DS9 regions", extensions: ["reg"] },
+      { name: "All files", extensions: ["*"] },
+    ],
+  });
+  if (selected === null) return [];
+  return Array.isArray(selected) ? selected : [selected];
 }
 
 export async function pickRegionFile(): Promise<string | null> {
