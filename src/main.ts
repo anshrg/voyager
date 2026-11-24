@@ -15,6 +15,7 @@ import {
   getWcs,
   resolveCoord,
   savePixelRegions,
+  transferRegions,
   tableColumns,
   tableColumnsF64,
   takePendingOpens,
@@ -821,6 +822,48 @@ async function saveRegionLayer(frame: Frame, id: number): Promise<void> {
   }
 }
 
+/** Copy one layer of `src` onto other image frames as new layers (same
+ *  name, never saved). Each region is matched on the sky (source WCS →
+ *  target WCS); without a WCS on either side it is copied pixel-for-pixel.
+ *  A target whose Viewer is retired (hidden band) gets it on rebuild. */
+async function copyRegionLayer(src: Frame, id: number, targets: Frame[]): Promise<void> {
+  const layer = src.regionLayers.find((l) => l.id === id);
+  const srcHdu = src.viewerHdu ?? frameImageHdu(src);
+  if (!layer || !src.viewer || srcHdu === null) return;
+  const regions = src.viewer.layerRegions(id).map(({ layer: _l, ...r }) => r as PixelRegion);
+  const readout = must<HTMLElement>("readout");
+  if (regions.length === 0) {
+    readout.textContent = `layer ${layer.name} has no regions to copy`;
+    return;
+  }
+  const msgs: string[] = [];
+  for (const t of targets) {
+    const dstHdu = t.viewerHdu ?? frameImageHdu(t);
+    if (dstHdu === null) continue;
+    try {
+      const res = await transferRegions(src.file.path, srcHdu, t.file.path, dstHdu, regions);
+      const copy = newLayer(layer.name, null);
+      copy.warnings = res.warnings;
+      t.regionLayers.push(copy);
+      if (t.activeLayer === null) t.activeLayer = copy.id;
+      const tagged = res.regions.map((r) => ({ ...r, layer: copy.id }));
+      if (t.viewer) {
+        t.viewer.addRegions(tagged);
+        t.viewer.setLayerStyle(layerStyleOf(t));
+      } else {
+        t.pendingRegions = [...(t.pendingRegions ?? []), ...tagged];
+      }
+      msgs.push(
+        `${frameName(t)}: ${res.regions.length}${res.sky ? "" : " (pixel copy — no WCS)"}` +
+          (res.warnings.length > 0 ? ` (${res.warnings.length} skipped)` : ""),
+      );
+    } catch (err) {
+      msgs.push(`${frameName(t)}: ${String(err)}`);
+    }
+  }
+  readout.textContent = `copied ${layer.name} → ${msgs.join(" · ")}`;
+}
+
 /** Region panel body + save-frame select (built in buildUi). */
 let regionPanelBody: HTMLElement | null = null;
 /** Selected-region properties section of the panel (#7). */
@@ -906,6 +949,17 @@ const regionHost: RegionPanelHost = {
   save: (id) => {
     const f = activeFrame();
     if (f) void saveRegionLayer(f, id);
+  },
+  copyTargets: () => {
+    const src = activeFrame();
+    return frames
+      .map((f, i) => ({ f, i }))
+      .filter(({ f }) => f !== src && frameImageHdu(f) !== null)
+      .map(({ f, i }) => ({ key: i, name: frameName(f) }));
+  },
+  copyTo: (id, targets) => {
+    const f = activeFrame();
+    if (f) void copyRegionLayer(f, id, targets.map((i) => frames[i]).filter((t): t is Frame => !!t));
   },
   close: (id) => {
     const f = activeFrame();

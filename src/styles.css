@@ -1429,3 +1429,36 @@ table.cards td {
   flex-direction: column;
   gap: 2px;
 }
+
+/* Layer "Copy to…" popup. */
+.rl-copy-menu {
+  position: absolute;
+  z-index: 5;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.rl-copy-head {
+  padding: 2px 6px 4px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+.rl-copy-item {
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.rl-copy-item:hover {
+  background: var(--bg-hover);
+}

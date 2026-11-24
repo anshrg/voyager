@@ -274,3 +274,44 @@ fn pixel_region_save_round_trips() {
         }
     }
 }
+
+/// Layer "Copy to…": regions moved between two images with different grids
+/// land where the source WCS says they are on the sky (target pixel =
+/// target.world_to_pix(source.pix_to_world(center))), and sizes scale by the
+/// pixel-scale ratio. Same-image transfer is the identity.
+#[test]
+fn transfer_between_grids_follows_the_sky() {
+    let dir = fixtures_dir();
+    let a = FitsFile::open(&dir.join("rgb_f115w.fits")).expect("open f115w");
+    let b = FitsFile::open(&dir.join("rgb_offgrid.fits")).expect("open offgrid");
+    let first_wcs = |f: &FitsFile| f.hdus.iter().find_map(|h| Wcs::from_header(&h.header));
+    let wa = first_wcs(&a).expect("f115w wcs");
+    let wb = first_wcs(&b).expect("offgrid wcs");
+    let samples = sample_pixel_regions();
+
+    let (same, warn, sky) = voyager_lib::regions::transfer(&samples, Some(&wa), Some(&wa));
+    assert!(sky && warn.is_empty());
+    for (got, want) in same.iter().zip(&samples) {
+        assert_pixel_close(&got.shape, &want.shape, 1e-4, "self transfer");
+    }
+
+    let (moved, warn, _) = voyager_lib::regions::transfer(&samples, Some(&wa), Some(&wb));
+    assert!(warn.is_empty(), "{warn:?}");
+    for (got, want) in moved.iter().zip(&samples) {
+        if let (PixelShape::Circle { x, y, r }, PixelShape::Circle { x: x0, y: y0, r: r0 }) =
+            (&got.shape, &want.shape)
+        {
+            let (ra, dec) = wa.pix_to_world(*x0, *y0);
+            let (ex, ey) = wb.world_to_pix(ra, dec).unwrap();
+            assert!((x - ex).abs() < 1e-4 && (y - ey).abs() < 1e-4, "center {x},{y} vs {ex},{ey}");
+            // Local plate-scale ratio (deg/px) from one-pixel steps.
+            let step = |w: &Wcs, px: f64, py: f64| {
+                let (r1, d1) = w.pix_to_world(px, py);
+                let (r2, d2) = w.pix_to_world(px + 1.0, py);
+                ((r2 - r1) * d1.to_radians().cos()).hypot(d2 - d1)
+            };
+            let ratio = step(&wa, *x0, *y0) / step(&wb, ex, ey);
+            assert!((r - r0 * ratio).abs() < 1e-3 * r0.max(1.0), "radius {r} vs {}", r0 * ratio);
+        }
+    }
+}

@@ -544,6 +544,33 @@ fn save_pixel_regions(
     Ok(RegionSaveResult { count, warnings })
 }
 
+#[derive(Serialize)]
+struct RegionTransferResult {
+    regions: Vec<regions::PixelRegion>,
+    warnings: Vec<String>,
+    /// true = matched on the sky via both WCSs; false = pixel copy.
+    sky: bool,
+}
+
+/// Map one image's pixel regions onto another image's pixel grid (layer
+/// "Copy to…"): through the sky when both HDUs have a WCS, else as-is.
+#[tauri::command]
+fn transfer_regions(
+    src_path: String,
+    src_hdu: usize,
+    dst_path: String,
+    dst_hdu: usize,
+    regions: Vec<regions::PixelRegion>,
+    state: State<'_, AppState>,
+) -> Result<RegionTransferResult, String> {
+    let src = lookup(&state, &src_path)?;
+    let dst = lookup(&state, &dst_path)?;
+    let sw = wcs::Wcs::from_header(&src.hdu(src_hdu).map_err(|e| e.to_string())?.header);
+    let dw = wcs::Wcs::from_header(&dst.hdu(dst_hdu).map_err(|e| e.to_string())?.header);
+    let (regions, warnings, sky) = regions::transfer(&regions, sw.as_ref(), dw.as_ref());
+    Ok(RegionTransferResult { regions, warnings, sky })
+}
+
 /// Column metadata for a table HDU (names, units, kinds, sortability).
 /// Serves derived (crossmatch) tables too, like every table command.
 #[tauri::command]
@@ -1082,6 +1109,7 @@ pub fn run() {
             get_band_info,
             load_region_file,
             save_pixel_regions,
+            transfer_regions,
             table_columns,
             table_view,
             table_rows,

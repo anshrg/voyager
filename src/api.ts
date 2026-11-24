@@ -250,6 +250,25 @@ export function savePixelRegions(
   return invoke<RegionSaveResult>("save_pixel_regions", { path, hdu, regions, frame, outPath });
 }
 
+export interface RegionTransferResult {
+  regions: PixelRegion[];
+  warnings: string[];
+  /** true = matched on the sky via both WCSs; false = copied in pixels. */
+  sky: boolean;
+}
+
+/** Map one image's pixel regions onto another image's grid (layer "Copy
+ *  to…"): via the sky when both HDUs have a WCS, else pixel-for-pixel. */
+export function transferRegions(
+  srcPath: string,
+  srcHdu: number,
+  dstPath: string,
+  dstHdu: number,
+  regions: PixelRegion[],
+): Promise<RegionTransferResult> {
+  return invoke<RegionTransferResult>("transfer_regions", { srcPath, srcHdu, dstPath, dstHdu, regions });
+}
+
 export async function pickRegionSavePath(defaultPath?: string): Promise<string | null> {
   const selected = await saveDialog({
     defaultPath,
