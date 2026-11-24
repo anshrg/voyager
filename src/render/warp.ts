@@ -63,7 +63,26 @@ export function gridMapFor(ref: GridSpec, band: GridSpec): GridMap | string {
     return ref.wcs || band.wcs ? "only one has a WCS" : `size ${band.nx}×${band.ny} ≠ ${ref.nx}×${ref.ny}, no WCS`;
   }
   if (ref.wcs.sipIgnored() || band.wcs.sipIgnored()) return "SIP distortion — can't reproject";
-  return new WcsWarp(ref.wcs, band.wcs);
+  const warp = new WcsWarp(ref.wcs, band.wcs);
+  return footprintsOverlap(warp, ref, band) ? warp : "no sky overlap";
+}
+
+/** Do the two images' pixel footprints overlap on the sky? Samples a grid
+ *  over each image and asks whether any sample lands inside the other one
+ *  (both directions, so a small image inside a big one is caught). */
+export function footprintsOverlap(map: GridMap, ref: { nx: number; ny: number }, band: { nx: number; ny: number }): boolean {
+  const n = 16;
+  const inside = (p: [number, number] | null, g: { nx: number; ny: number }): boolean =>
+    p !== null && p[0] >= -0.5 && p[1] >= -0.5 && p[0] <= g.nx - 0.5 && p[1] <= g.ny - 0.5;
+  for (let j = 0; j <= n; j++) {
+    for (let i = 0; i <= n; i++) {
+      const fx = i / n;
+      const fy = j / n;
+      if (inside(map.bandToRef(fx * band.nx - 0.5, fy * band.ny - 0.5), ref)) return true;
+      if (inside(map.refToBand(fx * ref.nx - 0.5, fy * ref.ny - 0.5), band)) return true;
+    }
+  }
+  return false;
 }
 
 /** Mesh cells per tile side (TILE = 256 → 32-band-px cells at level 0). */

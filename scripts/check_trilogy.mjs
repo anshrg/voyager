@@ -97,15 +97,9 @@ try {
   // must match astropy, and the tile mesh's linear interpolation must stay
   // within 0.01 reference px of the exact map, even at coarse pyramid levels.
   for (const c of exp.warps) {
-    const ref = { nx: exp.nx, ny: exp.ny, wcs: new Wcs(c.ref_wcs) };
-    const band = { nx: 1, ny: 1, wcs: new Wcs(c.band_wcs) };
-    const map = W.gridMapFor(ref, band);
-    checks++;
-    if (typeof map === "string" || map.identity) {
-      fails++;
-      console.error(`FAIL warp ${c.name}: expected a WCS warp, got ${typeof map === "string" ? map : "identity"}`);
-      continue;
-    }
+    // Geometry only (the stress cases needn't overlap the small reference;
+    // gridMapFor's overlap rule is checked separately below).
+    const map = new W.WcsWarp(new Wcs(c.ref_wcs), new Wcs(c.band_wcs));
     close(map.bandPerRef, c.band_per_ref, 1e-12, `warp ${c.name} bandPerRef`);
     for (const p of c.pairs) {
       const b = map.refToBand(p.ref[0], p.ref[1]);
@@ -152,6 +146,25 @@ try {
     if (typeof sip !== "string") {
       fails++;
       console.error("FAIL warp: a SIP-ignored WCS must not reproject");
+    }
+    // A field 26° away (GOODS-N vs the fixture field) has no overlap.
+    checks++;
+    const far = { ...miri.wcs, lon0: 189.2, lat0: 62.2 };
+    if (W.gridMapFor(ref, { nx: 30000, ny: 30000, wcs: new Wcs(far) }) !== "no sky overlap") {
+      fails++;
+      console.error("FAIL warp: a far-away field must report no sky overlap");
+    }
+    // Overlap either way: a small band inside a big reference, and the reverse.
+    checks++;
+    const tiny = { ...miri.wcs, crpix: [1, 1] };
+    if (typeof W.gridMapFor(ref, { nx: 2, ny: 2, wcs: new Wcs(tiny) }) === "string") {
+      fails++;
+      console.error("FAIL warp: a 2×2 band inside the reference should overlap");
+    }
+    checks++;
+    if (typeof W.gridMapFor({ nx: 2, ny: 2, wcs: ref.wcs }, { nx: miri.nx, ny: miri.ny, wcs: new Wcs(miri.wcs) }) === "string") {
+      fails++;
+      console.error("FAIL warp: a 2×2 reference inside the band should overlap");
     }
     checks++;
     if (W.gridMapFor(ref, ref) !== W.IDENTITY_MAP) {

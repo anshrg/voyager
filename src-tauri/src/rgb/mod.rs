@@ -46,11 +46,22 @@ pub fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
-/// Trilogy stats from a pixel sample. Non-finite values are ignored. None when
-/// there are no finite values or the sample is degenerate (MAD == 0, e.g. a
-/// constant band) — mirroring fitsgl, so a flat band never yields sigma == 0.
+/// Fraction of exact zeros above which they are taken as zero-filled
+/// no-coverage (mosaics padded with 0.0 instead of NaN) rather than sky.
+pub const ZERO_FILL_FRACTION: f64 = 0.05;
+
+/// Trilogy stats from a pixel sample. Non-finite values are ignored, and so
+/// are exact zeros when they are more than ZERO_FILL_FRACTION of the finite
+/// sample (e.g. GOODS-N NIRCam mosaics: ~75% 0.0 padding, which would put the
+/// median and MAD at 0). None when nothing usable is left or the sample is
+/// degenerate (MAD == 0, e.g. a constant band) — mirroring fitsgl, so a flat
+/// band never yields sigma == 0.
 pub fn trilogy_stats(values: &[f64]) -> Option<TrilogyStats> {
     let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    let zeros = v.iter().filter(|&&x| x == 0.0).count();
+    if zeros as f64 > ZERO_FILL_FRACTION * v.len() as f64 {
+        v.retain(|&x| x != 0.0);
+    }
     if v.is_empty() {
         return None;
     }
@@ -373,6 +384,23 @@ pub fn detect_band_from_filename(filename: &str) -> Option<DetectedBand> {
 mod tests {
     use super::*;
     use crate::fits::{Card, Value};
+
+    #[test]
+    fn zero_filled_padding_is_ignored_by_trilogy_stats() {
+        // 25% real sky + 75% exact-zero padding: stats must match the sky alone.
+        let sky: Vec<f64> = (0..1000).map(|i| 1.0 + ((i * 37) % 101) as f64 * 0.01).collect();
+        let mut padded = sky.clone();
+        padded.extend(std::iter::repeat(0.0).take(3000));
+        let a = trilogy_stats(&sky).expect("sky stats");
+        let b = trilogy_stats(&padded).expect("padded stats");
+        assert_eq!(a, b);
+        // A few genuine zeros (below the threshold) are kept as data.
+        let mut few = sky.clone();
+        few.extend(std::iter::repeat(0.0).take(10));
+        assert!(trilogy_stats(&few).unwrap().mean < a.mean);
+        // All zeros → nothing usable.
+        assert!(trilogy_stats(&[0.0; 100]).is_none());
+    }
 
     fn header(kv: &[(&str, &str)]) -> Header {
         Header {

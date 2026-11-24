@@ -160,6 +160,9 @@ def warp_case(name, band):
 
 def stats(data):
     f = data[np.isfinite(data)].astype(np.float64)
+    # Zero-filled padding (> 5% exact zeros) is no-coverage, as rgb::trilogy_stats.
+    if np.count_nonzero(f == 0) > 0.05 * f.size:
+        f = f[f != 0]
     p50, p99, p999, p9999, p99999 = np.percentile(f, [50.0, 99.0, 99.9, 99.99, 99.999])
     sigma = 1.4826 * float(np.median(np.abs(f - p50)))
     return {
