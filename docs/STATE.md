@@ -5,6 +5,21 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## Histogram zoom, pinned readout, Fit in the frame bar — user-verified 2026-11-23
+
+- **Histogram** (`src/render/histogram.ts`): the x-axis is a view range independent of the data.
+  - It opens on the limits widened by one span each side, clipped to the data range.
+  - Wheel zooms about the cursor and dragging the background pans; double-click or "fit" resets, "full" shows the whole data range.
+  - When a zoom or pan settles (debounced 120 ms), it re-bins over the view: `get_histogram(…, range)`, which also returns `data_lo`/`data_hi`. The sub-range binning is numpy-gated (`hist_checks` in expected.json).
+  - ⌥ drags a handle at 1/10 speed. Off-view limits draw as edge arrows.
+- **Pinned readout**:
+  - A click on empty image in Pan calls `pinAt`: the readout freezes at that pixel with the goto crosshair, and the status text becomes selectable (`.readout.pinned`).
+  - Esc → `unpin`.
+  - `pinnedFrame` in main.ts stops other frames' hovers from overwriting it.
+- **Double-click** re-centers on the point. It drops the pin its first click made; in edit tools, polygon dblclick editing still applies.
+- **Fit** moved to the frame bar, next to ◀ ▶.
+- **Readout** appends decimal RA/Dec to the sexagesimal. `asciiMinus` forces ASCII "-".
+
 ## Image tool bar + layout without a top bar (issues #20, #22) — user-verified 2026-11-23
 
 There is no top bar any more, so the image starts at the frame tabs.
