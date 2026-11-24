@@ -260,6 +260,19 @@ def expectations(hdul: fits.HDUList, path: Path) -> dict:
                 "counts": [int(c) for c in counts],
             }
         )
+        # Zoomed histogram view (#24): a sub-range drops values outside it and
+        # keeps v == hi in the last bin (numpy semantics).
+        slo, shi = (float(v) for v in np.percentile(finite, [20, 80]))
+        sub, _ = np.histogram(finite, bins=32, range=(slo, shi))
+        hist_checks.append(
+            {
+                "hdu": hdu_index,
+                "bins": 32,
+                "lo": slo,
+                "hi": shi,
+                "counts": [int(c) for c in sub],
+            }
+        )
 
     # Table ground truth: column metadata, cell spot-checks, one sort and a
     # couple of filters, for the BINTABLE (hdu 2) and ASCII TABLE (hdu 6).

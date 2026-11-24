@@ -373,28 +373,38 @@ fn get_wcs(
 
 #[derive(Serialize)]
 struct Histogram {
+    /// Binned range (the requested view, or the data range).
     lo: f64,
     hi: f64,
     counts: Vec<u32>,
+    /// Finite min..max of the sample (the "full" view).
+    data_lo: f64,
+    data_hi: f64,
 }
 
 /// Pixel-distribution histogram over the same spatial sample used for scale
-/// limits; range = finite min..max of the sample.
+/// limits. Bins span `range` (a zoomed histogram view) when given, else the
+/// sample's finite min..max.
 #[tauri::command]
 async fn get_histogram(
     path: String,
     hdu: usize,
     bins: usize,
+    range: Option<(f64, f64)>,
     state: State<'_, AppState>,
 ) -> Result<Histogram, String> {
     let file = lookup(&state, &path)?;
     let t0 = Instant::now();
     let hist = tauri::async_runtime::spawn_blocking(move || -> Result<Histogram, String> {
         let values = tiles::gather_values(&file, hdu, 200_000).map_err(|e| e.to_string())?;
-        let (lo, hi) =
+        let (data_lo, data_hi) =
             tiles::zscale::minmax(&values).ok_or_else(|| "image has no finite pixels".to_string())?;
+        let (lo, hi) = match range {
+            Some((a, b)) if a.is_finite() && b.is_finite() && b > a => (a, b),
+            _ => (data_lo, data_hi),
+        };
         let counts = tiles::histogram(&values, bins, lo, hi);
-        Ok(Histogram { lo, hi, counts })
+        Ok(Histogram { lo, hi, counts, data_lo, data_hi })
     })
     .await
     .map_err(|e| e.to_string())??;

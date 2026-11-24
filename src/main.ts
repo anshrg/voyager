@@ -129,6 +129,10 @@ function retireViewer(frame: Frame): void {
     camera: v.getCamera(),
   };
   frame.pendingRegions = structuredClone(v.getRegions());
+  if (pinnedFrame === frame) {
+    pinnedFrame = null;
+    must<HTMLElement>("readout").classList.remove("pinned");
+  }
   v.destroy();
   frame.viewer = null;
   frame.viewerHdu = null;
@@ -185,6 +189,8 @@ let tableView: TableView | null = null;
 /** `${path}#${hdu}` the shared TableView currently displays. */
 let tableLoadedFor: string | null = null;
 let histPanel: HistogramPanel | null = null;
+/** Frame whose viewer holds a pinned readout (click in Pan), or null. */
+let pinnedFrame: Frame | null = null;
 /** `${path}#${hdu}` the shared histogram currently displays. */
 let histLoadedFor: string | null = null;
 
@@ -469,16 +475,27 @@ function renderFrameBar(): void {
     // Nested in the composite's band order (which drives the rainbow).
     if (frame.composite?.expanded) for (const b of frame.composite.bands) addChip(b.frame, true);
   }
-  // Previous/next frame (also [ and ]), right-aligned in the frame bar.
-  if (frames.length > 1) {
+  // Right end of the frame bar: Fit (image frames), then previous/next
+  // frame (also [ and ]) when there are several.
+  if (frames.length > 0) {
     const nav = el("div", "frame-nav");
-    const prev = el("button", "frame-nav-btn", "◀");
-    prev.title = "Previous frame ([)";
-    prev.addEventListener("click", () => cycleFrame(-1));
-    const next = el("button", "frame-nav-btn", "▶");
-    next.title = "Next frame (])";
-    next.addEventListener("click", () => cycleFrame(1));
-    nav.append(prev, next);
+    const fit = el("button", "frame-nav-btn frame-fit-btn");
+    fit.title = "Fit the image to the window";
+    fit.innerHTML =
+      '<svg viewBox="0 0 18 18" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">' +
+      '<path d="M3.5 14.5 14.5 3.5"/><path d="M9.5 3.5h5v5"/><path d="M8.5 14.5h-5v-5"/></svg>';
+    fit.addEventListener("click", () => activeFrame()?.viewer?.fit());
+    fit.style.display = activeFrame()?.viewer && activeFrame()?.viewerHdu !== null ? "" : "none";
+    nav.append(fit);
+    if (frames.length > 1) {
+      const prev = el("button", "frame-nav-btn", "◀");
+      prev.title = "Previous frame ([)";
+      prev.addEventListener("click", () => cycleFrame(-1));
+      const next = el("button", "frame-nav-btn", "▶");
+      next.title = "Next frame (])";
+      next.addEventListener("click", () => cycleFrame(1));
+      nav.append(prev, next);
+    }
     bar.append(nav);
   }
   regionTools?.syncView({
@@ -672,7 +689,7 @@ function ensureHistogram(): void {
   const key = `${frame.file.path}#${hdu}`;
   if (histLoadedFor === key) return;
   histLoadedFor = key;
-  void histPanel.load(frame.file.path, hdu);
+  void histPanel.load(frame.file.path, hdu, frame.viewer?.getLimits());
 }
 
 /** (Re)load the shared TableView for a frame's table HDU. */
@@ -890,6 +907,11 @@ function syncRegionTools(): void {
   });
 }
 
+/** Typographic minus/dashes → ASCII hyphen-minus. */
+function asciiMinus(t: string): string {
+  return t.replace(/[\u2212\u2012\u2013\u2014\uFE63\uFF0D]/g, "-");
+}
+
 /** Typed limit fields (Display section); a focused field isn't overwritten. */
 function showLimits(lo: number, hi: number): void {
   for (const [id, v] of [
@@ -1018,10 +1040,23 @@ function renderRegionLayerList(): boolean {
 function makeViewer(frame: Frame): Viewer {
   return new Viewer(frame.cell, {
     onReadout: (info) => {
-      must<HTMLElement>("readout").textContent =
+      // A pinned readout belongs to its frame: other frames' hovers (grid
+      // mode) don't overwrite it.
+      if (pinnedFrame && frame !== pinnedFrame) return;
+      // Plain ASCII "-" for every minus sign (copy-paste into code/catalogs).
+      must<HTMLElement>("readout").textContent = asciiMinus(
         info.x === null
           ? ""
-          : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`;
+          : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`,
+      );
+    },
+    onPin: (pinned) => {
+      if (!pinned && pinnedFrame !== frame) return;
+      if (pinned && pinnedFrame && pinnedFrame !== frame) pinnedFrame.viewer?.escape();
+      pinnedFrame = pinned ? frame : null;
+      const r = must<HTMLElement>("readout");
+      r.classList.toggle("pinned", pinned);
+      r.title = pinned ? "Pinned readout — select to copy; Esc to release" : "";
     },
     onLimits: (lo, hi) => {
       if (frame !== activeFrame()) return;
@@ -2254,6 +2289,10 @@ async function closeFrame(i: number): Promise<void> {
     return;
   }
   frame.viewer?.destroy();
+  if (pinnedFrame === frame) {
+    pinnedFrame = null;
+    must<HTMLElement>("readout").classList.remove("pinned");
+  }
   frame.cell.remove();
   if (frame.composite) {
     // The composite shares its reference band's file: un-hide the bands, but
@@ -2705,7 +2744,10 @@ function buildUi(): void {
       if (active >= 0) void closeFrame(active);
       return;
     }
-    if (e.key === "Escape") activeFrame()?.viewer?.escape();
+    if (e.key === "Escape") {
+      if (pinnedFrame && pinnedFrame !== activeFrame()) pinnedFrame.viewer?.escape();
+      activeFrame()?.viewer?.escape();
+    }
     if ((e.key === "Delete" || e.key === "Backspace") && !typing) {
       e.preventDefault();
       activeFrame()?.viewer?.deleteSelected();
@@ -2740,7 +2782,6 @@ function buildUi(): void {
   const rp = buildRegionPanel(regionHost, () => showRegionPanel(false));
   imagePane.append(rp.root);
   regionTools = new RegionTools({
-    fit: () => activeFrame()?.viewer?.fit(),
     grid: () => toggleGrid(),
     blink: () => toggleBlink(),
     lock: () => cycleLock(),

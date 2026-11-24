@@ -181,18 +181,24 @@ export function getBandInfo(path: string, hdu: number, withStats: boolean): Prom
 }
 
 export interface Histogram {
+  /** Binned range: the requested view, or the data range. */
   lo: number;
   hi: number;
   counts: number[];
+  /** Finite min..max of the sample. */
+  data_lo: number;
+  data_hi: number;
 }
 
-/** Pixel-distribution histogram over the scale-limit spatial sample. */
+/** Pixel-distribution histogram over the scale-limit spatial sample, binned
+ *  over `range` (a zoomed view) or the sample's full min..max. */
 export function getHistogram(
   path: string,
   hdu: number,
   bins: number,
+  range: [number, number] | null = null,
 ): Promise<Histogram> {
-  return invoke<Histogram>("get_histogram", { path, hdu, bins });
+  return invoke<Histogram>("get_histogram", { path, hdu, bins, range });
 }
 
 /** A region resolved to image-pixel space by the backend (FITS 0-based

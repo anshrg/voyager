@@ -1,6 +1,6 @@
 // Image tool bar (issues #20, #22): a slim vertical palette floating on the
 // left edge of the image. Top to bottom:
-//   View     fit · grid · blink · lock · RGB…
+//   View     grid · blink · lock · RGB…
 //   Regions  load .reg · Layers panel · Draw (shapes fly out to the right)
 //   Edit     pan · select · lasso · undo · redo · delete — only once the frame
 //            has region layers or a draw/select tool is active
@@ -13,7 +13,6 @@ import type { RegionTool } from "./render/viewer";
 export type LockMode = "none" | "wcs" | "pixel";
 
 export interface RegionToolsHost {
-  fit(): void;
   grid(): void;
   blink(): void;
   lock(): void;
@@ -154,7 +153,6 @@ export class RegionTools {
     this.lockBadge.className = "rt-badge";
     this.lockBtn.append(this.lockBadge);
     body.append(
-      btn("fit", "Fit the image to the window (double-click the image also fits)", () => host.fit()),
       this.gridBtn,
       this.blinkBtn,
       this.lockBtn,

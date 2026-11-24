@@ -99,6 +99,8 @@ export interface ReadoutInfo {
 
 export interface ViewerCallbacks {
   onReadout(info: ReadoutInfo): void;
+  /** The readout was pinned to a clicked pixel (true) or released (false). */
+  onPin?(pinned: boolean): void;
   onLimits(lo: number, hi: number): void;
   /** Right-drag colormap adjustment (defaults: bias 0.5, contrast 1). */
   onContrastBias(bias: number, contrast: number): void;
@@ -227,6 +229,10 @@ export class Viewer {
   /** Locator crosshair, pinned to an image pixel (0-based center) or null.
    *  Set by goto and table-row linking; fades out only on Escape. */
   private marker: [number, number] | null = null;
+  /** Pinned readout pixel (0-based; click on empty image in Pan): the
+   *  readout freezes there until Escape. */
+  private pinned: [number, number] | null = null;
+  private pinnedAt = 0;
   private markerAlpha = 1;
   private markerFadeRaf: number | undefined;
 
@@ -385,6 +391,7 @@ export class Viewer {
   /** Shared reset for a new image / composite: drop tiles, overlays, undo. */
   private resetImage(path: string, hdu: number, nx: number, ny: number): void {
     this.generation++;
+    this.dropPin();
     this.clearTiles();
     this.limitsReady = false;
     this.regions = null;
@@ -412,6 +419,7 @@ export class Viewer {
 
   clear(): void {
     this.generation++;
+    this.dropPin();
     this.image = null;
     this.sources = null;
     this.compDisplay = null;
@@ -470,6 +478,7 @@ export class Viewer {
 
   /** Escape: fade out the marker and drop any region selection. */
   escape(): void {
+    this.unpin();
     if (this.polygonDraft) {
       this.polygonDraft = null;
       this.polygonCursor = null;
@@ -912,6 +921,12 @@ export class Viewer {
     return [this.cx + ox, this.cy + oy];
   }
 
+  /** Canvas device-pixel position → image coordinates (as toImage). */
+  private deviceToImage(mx: number, my: number): [number, number] {
+    const [ox, oy] = this.deviceToImageOffset(mx - this.canvas.width / 2, my - this.canvas.height / 2);
+    return [this.cx + ox, this.cy + oy];
+  }
+
   /** Device-pixel screen offset (from the canvas center) → image-pixel offset,
    *  inverting the view rotation + y-flip. Identity direction when rot=0
    *  (screen y down ↦ image y up). */
@@ -1086,7 +1101,7 @@ export class Viewer {
       this.updateReadout(e);
     });
     this.canvas.addEventListener("pointerleave", () => {
-      this.callbacks.onReadout({ x: null, y: null, value: "", sky: "" });
+      if (!this.pinned) this.callbacks.onReadout({ x: null, y: null, value: "", sky: "" });
       if (this.hoverIndex !== -1) {
         this.hoverIndex = -1;
         this.canvas.style.cursor = "";
@@ -1125,14 +1140,18 @@ export class Viewer {
         return;
       }
       // Edit mode, selected polygon: dblclick a vertex deletes it, an edge
-      // inserts one (#6). Otherwise dblclick fits the view.
+      // inserts one (#6). Otherwise dblclick re-centers the view on that point
+      // (Fit lives in the frame bar). The dblclick's first click pinned the
+      // readout there; a re-center isn't a pin request, so drop it.
       if (this.editMode && this.editPolygonTopology(e)) return;
-      this.fit();
+      if (this.pinned && performance.now() - this.pinnedAt < 600) this.unpin();
+      const [fx, fy] = this.toImage(e);
+      this.centerOn(fx - 0.5, fy - 0.5);
     });
   }
 
   private updateReadout(e: MouseEvent): void {
-    if (!this.image) return;
+    if (!this.image || this.pinned) return;
     const [fx, fy] = this.toImage(e);
     const x = Math.floor(fx);
     const y = Math.floor(fy);
@@ -1163,7 +1182,9 @@ export class Viewer {
         const text = this.sources
           ? rs.map((ri, i) => `${srcs[i].label} ${fmt(ri.value)}`).join(" · ")
           : fmt(r.value);
-        this.lastSky = r.sky ?? "";
+        // Sexagesimal, then decimal degrees (6 dp ≈ 4 mas) for copy-paste.
+        this.lastSky =
+          r.sky && r.ra !== null && r.dec !== null ? `${r.sky}  ${r.ra.toFixed(6)} ${r.dec.toFixed(6)}` : (r.sky ?? "");
         this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text, sky: this.lastSky });
       }
     } catch {
@@ -1224,6 +1245,39 @@ export class Viewer {
     }
     if (idx < 0 && this.pickSourceAt(mx, my)) return;
     this.selectRegion(idx);
+    if (idx < 0) this.pinAt(mx, my);
+  }
+
+  /** Freeze the readout on the pixel under (mx, my) and mark it. */
+  private pinAt(mx: number, my: number): void {
+    if (!this.image) return;
+    const [fx, fy] = this.deviceToImage(mx, my);
+    const x = Math.floor(fx);
+    const y = Math.floor(fy);
+    if (x < 0 || y < 0 || x >= this.image.nx || y >= this.image.ny) return;
+    this.pinned = [x, y];
+    this.pinnedAt = performance.now();
+    this.setMarker(x, y);
+    this.callbacks.onPin?.(true);
+    this.callbacks.onReadout({ x: x + 1, y: y + 1, value: "…", sky: this.lastSky });
+    this.readoutPending = [x, y];
+    void this.pumpReadout();
+  }
+
+  /** Forget a pin without the marker fade (the image is being replaced). */
+  private dropPin(): void {
+    if (!this.pinned) return;
+    this.pinned = null;
+    this.callbacks.onPin?.(false);
+  }
+
+  /** Release a pinned readout (Escape). */
+  private unpin(): void {
+    if (!this.pinned) return;
+    this.pinned = null;
+    this.callbacks.onPin?.(false);
+    this.callbacks.onReadout({ x: null, y: null, value: "", sky: "" });
+    this.startMarkerFade();
   }
 
   /** If a catalog source marker (with a row id) is near (mx, my), report its
