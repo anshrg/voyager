@@ -39,16 +39,22 @@ import {
   type RegionView,
 } from "./regionlayer";
 import {
+  createBandTarget,
   createCompositeProgram,
   createTileProgram,
   createTileTexture,
+  createWarpProgram,
   uploadLut,
+  SENTINEL_OUTSIDE,
   type CompositeProgram,
   type Stretch,
   type TileProgram,
+  type WarpProgram,
   STRETCHES,
 } from "./gl";
 import { MAX_BANDS, type CompositeBand } from "./trilogy";
+import { bandBounds, gridMapFor, meshIndices, tileMesh, type GridMap } from "./warp";
+import type { Wcs } from "./wcs";
 
 const MAX_GPU_TILES = 600; // ~150 MB of R32F at 256²
 const NAN_READOUT = "NaN";
@@ -173,12 +179,25 @@ interface ImageRef {
   maxLevel: number;
 }
 
-/** One band of an RGB composite: an image HDU on the shared pixel grid. */
+/** One band of an RGB composite: an image HDU, on the reference grid or
+ *  reprojected onto it through both WCSs (warp.ts). */
 export interface CompositeSource {
   path: string;
   hdu: number;
   /** Short name for the readout (filter, else file name). */
   label: string;
+  nx: number;
+  ny: number;
+  wcs: Wcs | null;
+}
+
+/** The pixel grid a composite is drawn on (its reference band's image). */
+export interface CompositeRef {
+  path: string;
+  hdu: number;
+  nx: number;
+  ny: number;
+  wcs: Wcs | null;
 }
 
 /** Everything the composite shader needs besides the tiles; set by the host
@@ -267,6 +286,19 @@ export class Viewer {
   private compDisplay: CompositeDisplay | null = null;
   /** Composite shader, compiled on first composite use. */
   private comp: CompositeProgram | null = null;
+  /** Reprojected composites (any band off the reference grid): how each
+   *  source maps onto `image`'s grid (null = can't be drawn), each source's
+   *  own pyramid depth, and the lazily built GL for the two-pass draw. */
+  private refWcs: Wcs | null = null;
+  private maps: (GridMap | null)[] = [];
+  private srcMaxLevel: number[] = [];
+  private compScreen: CompositeProgram | null = null;
+  private warpGl: WarpProgram | null = null;
+  private warpFailed = false;
+  private bandTargets: WebGLTexture[] = [];
+  private bandTargetSize: [number, number] = [0, 0];
+  /** Warp meshes per band tile (keyed like tiles); dropped with the tile. */
+  private meshes = new Map<string, Float32Array | null>();
   /** Bumped on setImage; stale async responses are discarded. */
   private generation = 0;
 
@@ -339,6 +371,9 @@ export class Viewer {
     gl.deleteTexture(this.p.lutTex);
     gl.deleteProgram(this.p.program);
     if (this.comp) gl.deleteProgram(this.comp.program);
+    if (this.compScreen) gl.deleteProgram(this.compScreen.program);
+    if (this.warpGl) gl.deleteProgram(this.warpGl.program);
+    for (const t of this.bandTargets) gl.deleteTexture(t);
     // Prompt the browser to reclaim the context immediately (WKWebView caps
     // simultaneous WebGL contexts; frames come and go).
     gl.getExtension("WEBGL_lose_context")?.loseContext();
@@ -351,19 +386,26 @@ export class Viewer {
   async setImage(path: string, hdu: number, nx: number, ny: number): Promise<void> {
     this.sources = null;
     this.compDisplay = null;
+    this.maps = [];
+    this.srcMaxLevel = [];
+    this.refWcs = null;
     this.resetImage(path, hdu, nx, ny);
     await this.applyScaleMode("zscale");
   }
 
-  /** Show an RGB composite of co-gridded bands (all nx × ny; the first band
-   *  supplies readout sky / regions). Nothing draws until setCompositeDisplay. */
-  setComposite(sources: CompositeSource[], nx: number, ny: number): void {
+  /** Show an RGB composite drawn on `ref`'s pixel grid (which supplies the
+   *  readout sky, regions, WCS). Bands on that grid draw in one pass; bands
+   *  on other grids are reprojected through both WCSs (warp.ts). Nothing
+   *  draws until setCompositeDisplay. */
+  setComposite(sources: CompositeSource[], ref: CompositeRef): void {
     if (sources.length === 0 || sources.length > MAX_BANDS) {
       throw new Error(`composite needs 1..${MAX_BANDS} bands`);
     }
-    this.resetImage(sources[0].path, sources[0].hdu, nx, ny);
+    this.resetImage(ref.path, ref.hdu, ref.nx, ref.ny);
+    this.refWcs = ref.wcs;
     this.sources = sources;
     this.compDisplay = null;
+    this.computeMaps();
   }
 
   /** Change which bands participate without resetting the camera, regions,
@@ -373,7 +415,33 @@ export class Viewer {
     this.sources = sources;
     this.compDisplay = null;
     this.limitsReady = false;
+    this.computeMaps();
     this.requestDraw();
+  }
+
+  /** Per-source grid map + pyramid depth against the reference grid. */
+  private computeMaps(): void {
+    this.meshes.clear();
+    if (!this.sources || !this.image) {
+      this.maps = [];
+      this.srcMaxLevel = [];
+      return;
+    }
+    const ref = { nx: this.image.nx, ny: this.image.ny, wcs: this.refWcs };
+    this.maps = this.sources.map((s) => {
+      const m = gridMapFor(ref, { nx: s.nx, ny: s.ny, wcs: s.wcs });
+      if (typeof m === "string") {
+        console.warn(`composite band ${s.label} can't join the grid: ${m}`);
+        return null;
+      }
+      return m;
+    });
+    this.srcMaxLevel = this.sources.map((s) => pyramidDepth(s.nx, s.ny));
+  }
+
+  /** Any band reprojected (→ the two-pass draw). */
+  private isWarped(): boolean {
+    return this.sources !== null && this.maps.some((m) => m === null || !m.identity);
   }
 
   /** Update composite weights/levels/stretch — uniforms only, redraws next frame. */
@@ -407,9 +475,7 @@ export class Viewer {
     // Markers are projected through the outgoing image's WCS; drop them.
     this.sourceMarkers = null;
     this.sourceRows = null;
-    let maxLevel = 0;
-    while (Math.ceil(Math.max(nx, ny) / 2 ** maxLevel) > TILE) maxLevel++;
-    this.image = { path, hdu, nx, ny, maxLevel };
+    this.image = { path, hdu, nx, ny, maxLevel: pyramidDepth(nx, ny) };
     // Rotation is re-applied by the host under WCS-align lock (loadFrameImage);
     // default to axis-aligned so a plain image open is never rotated.
     this.rot = 0;
@@ -1172,15 +1238,27 @@ export class Viewer {
     this.readoutBusy = true;
     const gen = this.generation;
     try {
-      // Composite: every band's value under the cursor (same pixel — the
-      // bands share one grid); sky comes from the first band.
-      const srcs = this.sources ?? [{ path: this.image.path, hdu: this.image.hdu, label: "" }];
-      const rs = await Promise.all(srcs.map((s) => getReadout(s.path, s.hdu, x, y)));
-      const r = rs[0];
+      // Composite: every band's value under the cursor — at the same pixel
+      // for co-gridded bands, else the band pixel the reference pixel center
+      // falls in (via both WCSs). Sky comes from the reference grid.
+      const ref = getReadout(this.image.path, this.image.hdu, x, y);
+      const srcs = this.sources;
+      const bandVals = (srcs ?? []).map((s, i): Promise<number | null | undefined> => {
+        const m = this.maps[i];
+        if (!m) return Promise.resolve(undefined);
+        const p = m.refToBand(x, y);
+        if (!p) return Promise.resolve(undefined);
+        const bx = Math.round(p[0]);
+        const by = Math.round(p[1]);
+        if (bx < 0 || by < 0 || bx >= s.nx || by >= s.ny) return Promise.resolve(undefined);
+        return getReadout(s.path, s.hdu, bx, by).then((r) => r.value);
+      });
+      const [r, ...vals] = await Promise.all([ref, ...bandVals]);
       if (gen === this.generation) {
-        const fmt = (v: number | null): string => (v === null ? NAN_READOUT : formatValue(v));
-        const text = this.sources
-          ? rs.map((ri, i) => `${srcs[i].label} ${fmt(ri.value)}`).join(" · ")
+        const fmt = (v: number | null | undefined): string =>
+          v === undefined ? "off" : v === null ? NAN_READOUT : formatValue(v);
+        const text = srcs
+          ? vals.map((v, i) => `${srcs[i].label} ${fmt(v)}`).join(" · ")
           : fmt(r.value);
         // Sexagesimal, then decimal degrees (6 dp ≈ 4 mas) for copy-paste.
         this.lastSky =
@@ -1700,6 +1778,7 @@ export class Viewer {
     for (const t of this.tiles.values()) this.p.gl.deleteTexture(t.tex);
     this.tiles.clear();
     this.inflight.clear();
+    this.meshes.clear();
   }
 
   /** Level first so the backdrop guard in evict() can match by prefix; the
@@ -1707,6 +1786,19 @@ export class Viewer {
    *  being toggled off and on). */
   private tileKey(level: number, tx: number, ty: number, path: string, hdu: number): string {
     return `${level}/${tx}/${ty}|${hdu}|${path}`;
+  }
+
+  /** Is `key` a tile of its source's coarsest (backdrop) level? Composite
+   *  bands on other grids have their own pyramid depth. */
+  private isBackdrop(key: string): boolean {
+    if (!this.image) return false;
+    if (key.startsWith(`${this.image.maxLevel}/`)) return true;
+    const srcs = this.sources ?? [];
+    for (let i = 0; i < srcs.length; i++) {
+      const s = srcs[i];
+      if (key.startsWith(`${this.srcMaxLevel[i]}/`) && key.endsWith(`|${s.hdu}|${s.path}`)) return true;
+    }
+    return false;
   }
 
   /** The bands to fetch/draw: the composite sources, or the single image. */
@@ -1744,12 +1836,13 @@ export class Viewer {
     const entries = [...this.tiles.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
     const drop = entries.slice(0, this.tiles.size - budget);
     for (const [key, t] of drop) {
-      // Never evict the backdrop level; it's tiny and always needed.
-      if (this.image && key.startsWith(`${this.image.maxLevel}/`)) continue;
+      // Never evict a backdrop level; it's tiny and always needed.
+      if (this.isBackdrop(key)) continue;
       // Nor anything on screen right now (would refetch-thrash).
       if (t.lastUsed >= this.tick) continue;
       this.p.gl.deleteTexture(t.tex);
       this.tiles.delete(key);
+      this.meshes.delete(key);
     }
   }
 
@@ -1776,7 +1869,7 @@ export class Viewer {
   private drawLevel(level: number, request: boolean, render = true): boolean {
     if (!this.image) return false;
     const { gl } = this.p;
-    const rectLoc = this.sources && this.comp ? this.comp.uniforms.rect : this.p.uniforms.rect;
+    const rectLoc = this.sources && this.comp?.view ? this.comp.view.rect : this.p.uniforms.rect;
     const srcs = this.drawSources();
     const { nx, ny } = this.image;
     const stride = 2 ** level;
@@ -1878,7 +1971,12 @@ export class Viewer {
     gl.clear(gl.COLOR_BUFFER_BIT);
     this.drawOverlay();
     if (!this.image) return;
+    if (this.sources && this.compDisplay && this.isWarped()) {
+      this.drawWarped(this.compDisplay);
+      return;
+    }
     if (!this.limitsReady) {
+      if (this.isWarped()) return; // composite display arrives with the sources
       // Prefetch visible tiles while zscale runs; draw once limits arrive.
       const lvl = this.targetLevel();
       if (lvl !== this.image.maxLevel) this.drawLevel(this.image.maxLevel, true, false);
@@ -1922,16 +2020,22 @@ export class Viewer {
     gl.bindVertexArray(null);
   }
 
-  /** Bind the composite program and upload this frame's uniforms. */
-  private useCompositeProgram(d: CompositeDisplay): void {
+  /** Bind a composite program (tile variant by default) and upload this
+   *  frame's uniforms. */
+  private useCompositeProgram(d: CompositeDisplay, prog?: CompositeProgram): void {
     const gl = this.p.gl;
-    if (!this.comp) this.comp = createCompositeProgram(gl);
-    const u = this.comp.uniforms;
-    gl.useProgram(this.comp.program);
-    gl.uniform2f(u.center, this.cx, this.cy);
-    gl.uniform1f(u.scale, this.scale);
-    gl.uniform2f(u.viewport, this.canvas.width, this.canvas.height);
-    gl.uniform2f(u.rot, Math.cos(this.rot), Math.sin(this.rot));
+    if (!prog) {
+      if (!this.comp) this.comp = createCompositeProgram(gl);
+      prog = this.comp;
+    }
+    const u = prog.uniforms;
+    gl.useProgram(prog.program);
+    if (prog.view) {
+      gl.uniform2f(prog.view.center, this.cx, this.cy);
+      gl.uniform1f(prog.view.scale, this.scale);
+      gl.uniform2f(prog.view.viewport, this.canvas.width, this.canvas.height);
+      gl.uniform2f(prog.view.rot, Math.cos(this.rot), Math.sin(this.rot));
+    }
     const n = d.bands.length;
     const weight = new Float32Array(MAX_BANDS * 3);
     const lim = new Float32Array(MAX_BANDS * 2);
@@ -1954,6 +2058,161 @@ export class Viewer {
     gl.uniform1f(u.saturation, d.saturation);
     gl.uniform2f(u.cb, this.bias, this.contrast);
   }
+
+  // ---- reprojected composite (bands on different grids) -----------------
+  //
+  // Pass 1, per band: draw its own native tiles through their warp meshes
+  // (vertices in reference pixels, warp.ts) into a screen-sized R32F target
+  // holding raw values (+ sentinels for blank / not covered). Pass 2: the
+  // screen-mode composite shader mixes the targets per screen pixel with the
+  // exact math of the co-gridded path. Nothing is resampled on the CPU.
+
+  /** Lazily build the warp pass; false (once, logged) if the GPU can't. */
+  private ensureWarpGl(): boolean {
+    if (this.warpGl) return true;
+    if (this.warpFailed) return false;
+    try {
+      this.warpGl = createWarpProgram(this.p.gl, meshIndices());
+      this.compScreen = createCompositeProgram(this.p.gl, "screen");
+      return true;
+    } catch (err) {
+      this.warpFailed = true;
+      console.error(err);
+      return false;
+    }
+  }
+
+  /** One R32F target per band, sized to the canvas. */
+  private ensureBandTargets(n: number): void {
+    const gl = this.p.gl;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    if (this.bandTargetSize[0] !== w || this.bandTargetSize[1] !== h) {
+      for (const t of this.bandTargets) gl.deleteTexture(t);
+      this.bandTargets = [];
+      this.bandTargetSize = [w, h];
+    }
+    while (this.bandTargets.length < n) this.bandTargets.push(createBandTarget(gl, w, h));
+    while (this.bandTargets.length > n) gl.deleteTexture(this.bandTargets.pop()!);
+  }
+
+  /** The visible canvas as a polygon in reference draw coordinates. */
+  private viewPolygon(): [number, number][] {
+    const hw = this.canvas.width / 2 / this.scale;
+    const hh = this.canvas.height / 2 / this.scale;
+    const c = Math.cos(-this.rot);
+    const sn = Math.sin(-this.rot);
+    return [
+      [-hw, -hh],
+      [hw, -hh],
+      [hw, hh],
+      [-hw, hh],
+    ].map(([dx, dy]) => [this.cx + c * dx - sn * dy, this.cy + sn * dx + c * dy]);
+  }
+
+  private drawWarped(d: CompositeDisplay): void {
+    const srcs = this.sources;
+    if (!srcs || !this.ensureWarpGl() || !this.warpGl || !this.compScreen) return;
+    const gl = this.p.gl;
+    const W = this.warpGl;
+    const n = srcs.length;
+    this.ensureBandTargets(n);
+
+    gl.useProgram(W.program);
+    gl.uniform2f(W.uniforms.center, this.cx, this.cy);
+    gl.uniform1f(W.uniforms.scale, this.scale);
+    gl.uniform2f(W.uniforms.viewport, this.canvas.width, this.canvas.height);
+    gl.uniform2f(W.uniforms.rot, Math.cos(this.rot), Math.sin(this.rot));
+    gl.uniform1i(W.uniforms.tex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindVertexArray(W.vao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, W.fbo);
+    const poly = this.viewPolygon();
+    const zooming = performance.now() - this.lastWheelAt < ZOOM_SETTLE_MS;
+    const outside = new Float32Array([SENTINEL_OUTSIDE, 0, 0, 0]);
+    for (let i = 0; i < n; i++) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.bandTargets[i], 0);
+      gl.clearBufferfv(gl.COLOR, 0, outside);
+      this.drawBandWarped(i, poly, zooming);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    this.useCompositeProgram(d, this.compScreen);
+    for (let i = 0; i < n; i++) {
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, this.bandTargets[i]);
+    }
+    gl.bindVertexArray(this.p.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+  }
+
+  /** Draw band `i`'s cached tiles over the view (coarsest level first, finer
+   *  on top) into the bound target; request the backdrop + settled level. */
+  private drawBandWarped(i: number, poly: [number, number][], zooming: boolean): void {
+    const s = this.sources![i];
+    const map = this.maps[i];
+    if (!map) return;
+    const maxLevel = this.srcMaxLevel[i];
+    const bb = bandBounds(map, poly) ?? [0, 0, s.nx, s.ny];
+    const bx0 = Math.max(0, bb[0] - 1);
+    const by0 = Math.max(0, bb[1] - 1);
+    const bx1 = Math.min(s.nx, bb[2] + 1);
+    const by1 = Math.min(s.ny, bb[3] + 1);
+    if (bx0 >= bx1 || by0 >= by1) return;
+    // Band pixels per device pixel decides this band's own pyramid level.
+    const perDev = map.bandPerRef / this.scale;
+    const target = Math.min(maxLevel, Math.max(0, Math.floor(Math.log2(perDev))));
+    for (let lvl = maxLevel; lvl >= target; lvl--) {
+      const request = lvl === maxLevel || (lvl === target && !zooming);
+      this.drawBandLevel(i, map, lvl, [bx0, by0, bx1, by1], request);
+    }
+  }
+
+  private drawBandLevel(i: number, map: GridMap, level: number, bb: number[], request: boolean): void {
+    const gl = this.p.gl;
+    const W = this.warpGl!;
+    const s = this.sources![i];
+    const stride = 2 ** level;
+    const lw = Math.ceil(s.nx / stride);
+    const lh = Math.ceil(s.ny / stride);
+    const t0x = Math.floor(bb[0] / stride / TILE);
+    const t1x = Math.min(Math.ceil(lw / TILE) - 1, Math.floor((bb[2] - 1) / stride / TILE));
+    const t0y = Math.floor(bb[1] / stride / TILE);
+    const t1y = Math.min(Math.ceil(lh / TILE) - 1, Math.floor((bb[3] - 1) / stride / TILE));
+    for (let ty = t0y; ty <= t1y; ty++) {
+      for (let tx = t0x; tx <= t1x; tx++) {
+        const key = this.tileKey(level, tx, ty, s.path, s.hdu);
+        const tile = this.tiles.get(key);
+        if (!tile) {
+          if (request) this.requestTile(level, tx, ty, s.path, s.hdu);
+          continue;
+        }
+        tile.lastUsed = this.tick;
+        let mesh = this.meshes.get(key);
+        if (mesh === undefined) {
+          const x0 = tx * TILE * stride;
+          const y0 = ty * TILE * stride;
+          const w = Math.min(tile.w * stride, s.nx - x0);
+          const h = Math.min(tile.h * stride, s.ny - y0);
+          mesh = tileMesh(map, x0, y0, w, h);
+          this.meshes.set(key, mesh);
+        }
+        if (!mesh) continue;
+        gl.bindBuffer(gl.ARRAY_BUFFER, W.vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh, gl.STREAM_DRAW);
+        gl.bindTexture(gl.TEXTURE_2D, tile.tex);
+        gl.drawElements(gl.TRIANGLES, W.indexCount, gl.UNSIGNED_SHORT, 0);
+      }
+    }
+  }
+}
+
+/** Pyramid levels above 0 until the whole image fits one tile per axis. */
+function pyramidDepth(nx: number, ny: number): number {
+  let maxLevel = 0;
+  while (Math.ceil(Math.max(nx, ny) / 2 ** maxLevel) > TILE) maxLevel++;
+  return maxLevel;
 }
 
 /** Center pixel (0-based) of a region; polygon uses its vertex centroid. */

@@ -5,6 +5,23 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## RGB reprojection: bands on different pixel grids — branch `rgb-reproject`, awaiting user verification
+
+Composites now accept bands on different grids (NIRCam 30 mas + MIRI 60 mas, rotated, offset tangent points). No pixels are resampled on the CPU.
+
+- **Reference grid**: the RGB dialog has a "Reference grid" select. The default is the finest pixel scale (ties → active frame, then bluest), and it must be a ticked band. The composite frame's file/HDU is the reference's, so WCS, lock, regions, goto and overlays are unchanged. Rows show "reference · 30 mas" / "same grid" / "reprojected · 60 mas" / the reason a band can't join.
+- **Geometry** (`src/render/warp.ts`, pure):
+  - `gridMapFor(ref, band)` → `IDENTITY_MAP` (co-gridded, per `gridMismatch`), a `WcsWarp` (ref pixel → sky → band pixel through both TAN WCSs), or a reason string (no WCS, or SIP ignored: `WcsParams.sip_ignored` is new).
+  - `tileMesh` places a 9×9 vertex mesh per band tile exactly through the WCS. The linear interpolation in between is ≤ 1.4e-3 px even with a tangent point 0.5° away (most of that is float32 storage).
+- **Draw** (viewer `drawWarped`, used only when some band is off-grid; co-gridded composites keep the original single pass):
+  - Pass 1, per band: native tiles at the band's own pyramid level (`srcMaxLevel`, level from `bandPerRef / scale`) drawn through their meshes into a canvas-sized R32F target (`createBandTarget`; needs EXT_color_buffer_float). The target holds raw values, `SENTINEL_BLANK` for NaN, and is cleared to `SENTINEL_OUTSIDE`.
+  - Pass 2: `createCompositeProgram(gl, "screen")` runs the same mixing body as the tile variant (one GLSL template), reading the targets with texelFetch. All bands outside → discard (background); all blank/outside → blank color; a missing band adds 0 (dims edges, as before).
+  - NEAREST sampling: a coarser band shows its own pixels as blocks (user-approved for v1; bilinear later).
+- **Readout**: each band's value at the band pixel the reference pixel center maps to ("off" outside that band). Sky comes from the reference.
+- **Band layers carried onto the composite**: 1:1 for co-gridded bands, through `transferRegions` (sky) for reprojected ones.
+- **Gates**: `npm run test:ts` (scripts/check_trilogy.mjs now also compiles warp.ts) checks ref↔band pixels against astropy for 3 geometries, mesh error < 0.01 px at level-0 and level-6 tiles, MIRI → warp, SIP → refused, same grid → identity. New fixture `fixtures/rgb_f770w.fits` (MIRI, 60 mas, rotated 15°, tangent point offset, sources at the NIRCam sky positions) also feeds the Rust stats/detection tests.
+- **Memory**: one canvas-sized R32F target per band (≈ 4 B × canvas px × bands), only for reprojected composites.
+
 ## Histogram zoom, pinned readout, Fit in the frame bar — user-verified 2026-11-23
 
 - **Histogram** (`src/render/histogram.ts`): the x-axis is a view range independent of the data.

@@ -179,25 +179,40 @@ export function createTileProgram(canvas: HTMLCanvasElement): TileProgram {
 
 // ---- RGB composite program ------------------------------------------------
 //
-// N co-gridded bands (≤ MAX_BANDS), each normalized over its own [lo, hi],
-// stretched, then mixed into R/G/B by per-band weights. Covers both modes:
+// N bands (≤ MAX_BANDS), each normalized over its own [lo, hi], stretched,
+// then mixed into R/G/B by per-band weights. Covers both modes:
 //   - simple RGB: 3 bands with pure R/G/B weights, shared limits, DS9 stretch;
 //   - trilogy: N bands with rainbow/user weights, per-band trilogy levels and
 //     the log curve with per-band softening k (u_stretch == 7).
 // Ported from fitsgl tile.frag (u_mode 2), MIT, H. Akins. Transcribes
 // trilogy.ts `compositePixel` exactly — keep the two in lockstep.
+//
+// Two ways to feed it the band values (one shared mixing body):
+//   - "tile": co-gridded bands — the same tile of every band, sampled at the
+//     same v_uv in one pass (the original path);
+//   - "screen": bands on different grids — each band was first drawn through
+//     its warp mesh into its own screen-sized R32F target (BAND_FRAG below),
+//     and this pass reads those per screen pixel with texelFetch. Pixels a
+//     band doesn't cover hold SENTINEL_OUTSIDE; its NaN pixels SENTINEL_BLANK.
+
+/** Band-target value where the band has no pixel (cleared to this). */
+export const SENTINEL_OUTSIDE = -3.0e38;
+/** Band-target value for a NaN/blank band pixel. Real data never gets near. */
+export const SENTINEL_BLANK = -2.0e38;
 
 /** GLSL ES 3.00 forbids indexing a sampler array with a loop variable, so
  *  dispatch on literal indices (fitsgl's bandSamplerDispatch). */
-function bandSamplerDispatch(): string {
+function bandSamplerDispatch(screen: boolean): string {
   let body = "";
   for (let i = 0; i < MAX_BANDS; i++) {
-    body += `  if (idx == ${i}) return texture(u_band[${i}], v_uv).r;\n`;
+    const read = screen ? `texelFetch(u_band[${i}], ivec2(gl_FragCoord.xy), 0).r` : `texture(u_band[${i}], v_uv).r`;
+    body += `  if (idx == ${i}) return ${read};\n`;
   }
   return body;
 }
 
-const COMPOSITE_FRAG = `#version 300 es
+function compositeFrag(screen: boolean): string {
+  return `#version 300 es
 precision highp float;
 const int MAX_BANDS = ${MAX_BANDS};
 uniform sampler2D u_band[MAX_BANDS];
@@ -213,8 +228,11 @@ in vec2 v_uv;
 out vec4 outColor;
 
 float sampleBand(int idx) {
-${bandSamplerDispatch()}  return 0.0;
+${bandSamplerDispatch(screen)}  return 0.0;
 }
+
+bool isOutside(float v) { return ${screen ? "v < -2.5e38" : "false"}; }
+bool isBlank(float v) { return ${screen ? "v < -1.0e38" : "isnan(v)"}; }
 
 float stretchFn(float t, float k) {
   const float a = 1000.0;
@@ -231,15 +249,19 @@ float stretchFn(float t, float k) {
 void main() {
   vec3 num = vec3(0.0);
   int nanCount = 0;
+  int outCount = 0;
   for (int i = 0; i < MAX_BANDS; i++) {
     if (i >= u_nBands) break;
     float v = sampleBand(i);
-    if (isnan(v)) { nanCount++; continue; }
+    if (isOutside(v)) { outCount++; continue; }
+    if (isBlank(v)) { nanCount++; continue; }
     float span = u_lim[i].y - u_lim[i].x;
     float t = clamp((v - u_lim[i].x) / (abs(span) < 1e-30 ? 1e-30 : span), 0.0, 1.0);
     num += u_weight[i] * stretchFn(t, u_k[i]);
   }
-  if (nanCount == u_nBands) {
+  // No band covers this pixel: leave the background (as outside an image).
+  if (outCount == u_nBands) discard;
+  if (nanCount + outCount == u_nBands) {
     outColor = vec4(0.045, 0.05, 0.06, 1.0); // blank coverage, as single-band
     return;
   }
@@ -254,49 +276,69 @@ void main() {
   rgb = clamp(0.5 + (rgb - u_cb.x) * u_cb.y, 0.0, 1.0);
   outColor = vec4(rgb, 1.0);
 }`;
+}
+
+/** Full-viewport quad for the screen-mode composite pass. */
+const SCREEN_VERT = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_pos * 2.0 - 1.0, 0.0, 1.0);
+  v_uv = a_pos;
+}`;
+
+/** Mixing uniforms shared by both composite variants. */
+export interface CompositeMixUniforms {
+  bands: WebGLUniformLocation;
+  weight: WebGLUniformLocation;
+  lim: WebGLUniformLocation;
+  k: WebGLUniformLocation;
+  nBands: WebGLUniformLocation;
+  weightSum: WebGLUniformLocation;
+  stretch: WebGLUniformLocation;
+  saturation: WebGLUniformLocation;
+  cb: WebGLUniformLocation;
+}
 
 export interface CompositeProgram {
   program: WebGLProgram;
-  uniforms: {
+  /** View transform — tile variant only (the screen variant has none). */
+  view: {
     rect: WebGLUniformLocation;
     center: WebGLUniformLocation;
     scale: WebGLUniformLocation;
     viewport: WebGLUniformLocation;
     rot: WebGLUniformLocation;
-    bands: WebGLUniformLocation;
-    weight: WebGLUniformLocation;
-    lim: WebGLUniformLocation;
-    k: WebGLUniformLocation;
-    nBands: WebGLUniformLocation;
-    weightSum: WebGLUniformLocation;
-    stretch: WebGLUniformLocation;
-    saturation: WebGLUniformLocation;
-    cb: WebGLUniformLocation;
-  };
+  } | null;
+  uniforms: CompositeMixUniforms;
 }
 
-/** Compile the composite program into an existing tile program's context
- *  (shares its VAO via the pinned a_pos location). Built lazily — only frames
- *  that actually show a composite pay for it. */
-export function createCompositeProgram(gl: WebGL2RenderingContext): CompositeProgram {
+function link(gl: WebGL2RenderingContext, vert: string, frag: string, attribs: string[], what: string): WebGLProgram {
   const program = gl.createProgram();
   if (!program) throw new Error("createProgram failed");
-  gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
-  gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, COMPOSITE_FRAG));
-  gl.bindAttribLocation(program, 0, "a_pos");
+  gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, vert));
+  gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, frag));
+  attribs.forEach((a, i) => gl.bindAttribLocation(program, i, a));
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(`composite link: ${gl.getProgramInfoLog(program) ?? "unknown"}`);
+    throw new Error(`${what} link: ${gl.getProgramInfoLog(program) ?? "unknown"}`);
   }
+  return program;
+}
+
+/** Compile a composite program into an existing tile program's context
+ *  (shares its unit-quad VAO via the pinned a_pos location). Built lazily —
+ *  only frames that actually show a composite pay for it. */
+export function createCompositeProgram(gl: WebGL2RenderingContext, mode: "tile" | "screen" = "tile"): CompositeProgram {
+  const screen = mode === "screen";
+  const program = link(gl, screen ? SCREEN_VERT : VERT, compositeFrag(screen), ["a_pos"], `composite (${mode})`);
   const u = (name: string): WebGLUniformLocation => uniform(gl, program, name);
   return {
     program,
+    view: screen
+      ? null
+      : { rect: u("u_rect"), center: u("u_center"), scale: u("u_scale"), viewport: u("u_viewport"), rot: u("u_rot") },
     uniforms: {
-      rect: u("u_rect"),
-      center: u("u_center"),
-      scale: u("u_scale"),
-      viewport: u("u_viewport"),
-      rot: u("u_rot"),
       bands: u("u_band[0]"),
       weight: u("u_weight[0]"),
       lim: u("u_lim[0]"),
@@ -308,6 +350,102 @@ export function createCompositeProgram(gl: WebGL2RenderingContext): CompositePro
       cb: u("u_cb"),
     },
   };
+}
+
+// ---- Warped band pass (bands on another pixel grid) -----------------------
+//
+// Draws one band's native tiles as warp meshes (vertices already in reference
+// pixel coordinates, see warp.ts tileMesh) into that band's screen-sized
+// R32F target, raw values only — the stretch/mix happens in the screen-mode
+// composite pass, so the math is the exact same code as the co-gridded path.
+// NEAREST sampling: a coarser band shows its own pixels as blocks.
+
+const MESH_VERT = `#version 300 es
+in vec2 a_ref;              // reference-grid draw coords (FITS 0-based + 0.5)
+in vec2 a_uv;               // tile texture coords
+uniform vec2 u_center;
+uniform float u_scale;
+uniform vec2 u_viewport;
+uniform vec2 u_rot;
+out vec2 v_uv;
+void main() {
+  vec2 d = a_ref - u_center;
+  vec2 rd = vec2(u_rot.x * d.x - u_rot.y * d.y, u_rot.y * d.x + u_rot.x * d.y);
+  gl_Position = vec4(rd * u_scale / (0.5 * u_viewport), 0.0, 1.0);
+  v_uv = a_uv;
+}`;
+
+const BAND_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_tex;
+in vec2 v_uv;
+out vec4 outColor;
+void main() {
+  float v = texture(u_tex, v_uv).r;
+  // NaN → blank sentinel; -inf clamps above the sentinels (reads as "low").
+  outColor = vec4(isnan(v) ? -2.0e38 : max(v, -1.0e37), 0.0, 0.0, 1.0);
+}`;
+
+export interface WarpProgram {
+  program: WebGLProgram;
+  /** Mesh VAO: a_ref (0) + a_uv (1) interleaved in `vbo`, indices in `ibo`. */
+  vao: WebGLVertexArrayObject;
+  vbo: WebGLBuffer;
+  indexCount: number;
+  /** Render target for the band passes (attachment swapped per band). */
+  fbo: WebGLFramebuffer;
+  uniforms: {
+    center: WebGLUniformLocation;
+    scale: WebGLUniformLocation;
+    viewport: WebGLUniformLocation;
+    rot: WebGLUniformLocation;
+    tex: WebGLUniformLocation;
+  };
+}
+
+/** Build the warped-band pass, or throw when float render targets are
+ *  unavailable (EXT_color_buffer_float — present on Apple GPUs). */
+export function createWarpProgram(gl: WebGL2RenderingContext, indices: Uint16Array): WarpProgram {
+  if (!gl.getExtension("EXT_color_buffer_float")) {
+    throw new Error("this GPU can't render to float targets (EXT_color_buffer_float) — reprojected RGB unavailable");
+  }
+  const program = link(gl, MESH_VERT, BAND_FRAG, ["a_ref", "a_uv"], "warp band");
+  const vao = gl.createVertexArray();
+  const vbo = gl.createBuffer();
+  const ibo = gl.createBuffer();
+  const fbo = gl.createFramebuffer();
+  if (!vao || !vbo || !ibo || !fbo) throw new Error("warp GL resources failed");
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  const u = (name: string): WebGLUniformLocation => uniform(gl, program, name);
+  return {
+    program,
+    vao,
+    vbo,
+    indexCount: indices.length,
+    fbo,
+    uniforms: { center: u("u_center"), scale: u("u_scale"), viewport: u("u_viewport"), rot: u("u_rot"), tex: u("u_tex") },
+  };
+}
+
+/** A screen-sized R32F band target (NEAREST; read back with texelFetch). */
+export function createBandTarget(gl: WebGL2RenderingContext, w: number, h: number): WebGLTexture {
+  const tex = gl.createTexture();
+  if (!tex) throw new Error("createTexture failed");
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R32F, w, h);
+  return tex;
 }
 
 /** Upload a 256-entry RGB LUT into the shared colormap texture. */
