@@ -129,6 +129,10 @@ function retireViewer(frame: Frame): void {
     camera: v.getCamera(),
   };
   frame.pendingRegions = structuredClone(v.getRegions());
+  if (pinnedFrame === frame) {
+    pinnedFrame = null;
+    must<HTMLElement>("readout").classList.remove("pinned");
+  }
   v.destroy();
   frame.viewer = null;
   frame.viewerHdu = null;
