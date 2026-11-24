@@ -76,6 +76,8 @@ anything. Promote items into a milestone deliberately, not casually.
   inserts a vertex, a vertex deletes it (≥3 kept).
 - Region tool bar v2: configurable single-letter tool shortcuts (user wants
   them configurable; left out of v1).
+- Preference: filled lasso preview (closed + tinted while drawing) — parked
+  as an optional user preference (issue #21); default is outline only.
 - Region text label size option (fixed 11px now).
 
 ## From M4 implementation (parked, not blocking)

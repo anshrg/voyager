@@ -30,6 +30,7 @@ import {
   makeRegion,
   regionsTouching,
   regionShown,
+  type GroupFrame,
   type LayerStyle,
   resizeRegion,
   translateRegion,
@@ -56,14 +57,25 @@ const NAN_READOUT = "NaN";
 // we requested each one we'd fetch (and mostly discard) hundreds of tiles.
 // During the burst the backdrop + already-cached levels keep the view filled.
 const ZOOM_SETTLE_MS = 120;
-/** One undo/redo state: the full region array plus the selection at that
- *  moment, so ⌘Z brings back what was selected when the edit was made. */
+/** What one history step acted on, shared by its undo and redo sides:
+ *  undo restores `before` (the selection when the edit was made), redo
+ *  restores `target` (the regions the edit produced/changed — the moved
+ *  group, a newly drawn region; empty after a delete). Indices refer to the
+ *  region array of the side being restored, so they stay valid. */
+interface HistoryOp {
+  before: number[];
+  beforePrimary: number;
+  target: number[];
+  targetPrimary: number;
+  /** Group-box orientation on each side. */
+  angleBefore: number;
+  angleAfter: number;
+}
+
+/** One undo/redo state: the full region array on one side of an op. */
 interface UndoEntry {
   regions: PixelRegion[];
-  selection: number[];
-  primary: number;
-  /** Multi-selection box orientation at that moment. */
-  groupAngle: number;
+  op: HistoryOp;
 }
 
 // Bound on the region-edit undo stack (Cmd+Z / Cmd+Shift+Z).
@@ -616,55 +628,71 @@ export class Viewer {
   private snapshotForUndo(coalesce: string | null = null): void {
     if (coalesce !== null && coalesce === this.undoCoalesce && this.undoStack.length > 0) return;
     this.undoCoalesce = coalesce;
-    this.undoStack.push(this.undoState());
+    // By default an edit acts on the current selection (move, resize, props,
+    // group scale/rotate); create/delete retarget via setUndoTarget.
+    const sel = [...this.selection];
+    const angle = this.currentGroupAngle();
+    this.undoStack.push({
+      regions: this.regions ? structuredClone(this.regions) : [],
+      op: {
+        before: sel,
+        beforePrimary: this.selectedIndex,
+        target: sel,
+        targetPrimary: this.selectedIndex,
+        angleBefore: angle,
+        angleAfter: angle,
+      },
+    });
     if (this.undoStack.length > MAX_UNDO) this.undoStack.shift();
     this.redoStack = [];
   }
 
-  private undoState(): UndoEntry {
-    return {
-      regions: this.regions ? structuredClone(this.regions) : [],
-      selection: [...this.selection],
-      primary: this.selectedIndex,
-      groupAngle: this.currentGroupAngle(),
-    };
+  /** Set what the just-snapshotted edit produced (e.g. the new region). */
+  private setUndoTarget(target: number[], primary: number): void {
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (!top) return;
+    top.op.target = target;
+    top.op.targetPrimary = primary;
   }
 
-  /** Restore an undo/redo state, selection included (indices refer to that
-   *  state's own region array, so they stay valid). */
-  private restoreUndoState(e: UndoEntry): void {
+  /** Restore one side of a history step and select what it acted on. */
+  private restoreUndoState(regions: PixelRegion[], sel: number[], primary: number, angle: number): void {
     this.undoCoalesce = null;
-    this.regions = e.regions;
+    this.regions = regions;
     this.hoverIndex = -1;
-    const n = e.regions.length;
-    const hidden = (i: number): boolean => !regionShown(e.regions[i], this.layerStyle);
-    this.selection = new Set(e.selection.filter((i) => i < n && !hidden(i)));
-    this.selectedIndex = this.selection.has(e.primary)
-      ? e.primary
+    const n = regions.length;
+    const hidden = (i: number): boolean => !regionShown(regions[i], this.layerStyle);
+    this.selection = new Set(sel.filter((i) => i < n && !hidden(i)));
+    this.selectedIndex = this.selection.has(primary)
+      ? primary
       : this.selection.size > 0
         ? [...this.selection][this.selection.size - 1]
         : -1;
-    this.setGroupAngle(e.groupAngle);
+    this.setGroupAngle(angle);
     this.emitSelectionPick();
     this.callbacks.onRegionsChanged();
     this.requestDraw();
   }
 
-  /** Undo the last region edit (create/move/resize/delete). No-op if there's
-   *  nothing to undo. */
+  /** Undo the last region edit, re-selecting what was selected when it was
+   *  made. No-op if there's nothing to undo. */
   undo(): void {
-    if (this.undoStack.length === 0) return;
-    const prev = this.undoStack.pop()!;
-    this.redoStack.push(this.undoState());
-    this.restoreUndoState(prev);
+    const e = this.undoStack.pop();
+    if (!e) return;
+    // The live box angle is this op's "after" orientation (a group rotate).
+    if (this.selectionKey() === [...e.op.target].sort((a, b) => a - b).join(",")) {
+      e.op.angleAfter = this.currentGroupAngle();
+    }
+    this.redoStack.push({ regions: this.regions ? structuredClone(this.regions) : [], op: e.op });
+    this.restoreUndoState(e.regions, e.op.before, e.op.beforePrimary, e.op.angleBefore);
   }
 
-  /** Redo the last undone region edit. No-op if there's nothing to redo. */
+  /** Redo the last undone edit, re-selecting the regions it acted on. */
   redo(): void {
-    if (this.redoStack.length === 0) return;
-    const next = this.redoStack.pop()!;
-    this.undoStack.push(this.undoState());
-    this.restoreUndoState(next);
+    const e = this.redoStack.pop();
+    if (!e) return;
+    this.undoStack.push({ regions: this.regions ? structuredClone(this.regions) : [], op: e.op });
+    this.restoreUndoState(e.regions, e.op.target, e.op.targetPrimary, e.op.angleAfter);
   }
 
   hasRegions(): boolean {
@@ -720,6 +748,7 @@ export class Viewer {
   deleteSelected(): void {
     if (!this.regions || this.selection.size === 0) return;
     this.snapshotForUndo();
+    this.setUndoTarget([], -1);
     // Remove high indices first so lower ones stay valid.
     for (const i of [...this.selection].sort((a, b) => b - a)) this.regions.splice(i, 1);
     this.clearSelection();
@@ -1144,12 +1173,13 @@ export class Viewer {
     if (this.editMode) {
       // Cursor hints the gesture: resize a handle, move a body, or draw.
       const box = this.groupBoxNow();
-      const ghd = box ? hitTestGroupHandle(box, view, mx, my) : null;
-      const sel = !box && this.regions !== null && this.selectedIndex >= 0 ? this.regions[this.selectedIndex] : null;
+      const ghd = box ? hitTestGroupHandle(box.frame, view, mx, my, box.corners) : null;
+      const sel =
+        this.selection.size < 2 && this.regions !== null && this.selectedIndex >= 0 ? this.regions[this.selectedIndex] : null;
       const hd = sel ? hitTestHandle(sel, view, mx, my) : null;
       this.canvas.style.cursor =
         box && ghd
-          ? groupHandleCursor(box, ghd, view)
+          ? groupHandleCursor(box.frame, ghd, view)
           : sel && hd
             ? handleCursor(sel, hd, view)
             : idx >= 0
@@ -1290,9 +1320,10 @@ export class Viewer {
     if (this.regions === null) this.regions = [];
     const regs = this.regions;
     // 1a. Several selected → the group box's corner/rotate handles.
-    const box = this.groupBoxNow();
-    if (box) {
-      const ghd = hitTestGroupHandle(box, view, mx, my);
+    const gb = this.groupBoxNow();
+    if (gb) {
+      const box = gb.frame;
+      const ghd = hitTestGroupHandle(box, view, mx, my, gb.corners);
       if (ghd) {
         const orig = new Map<number, PixelRegion>();
         for (const i of this.selection) orig.set(i, structuredClone(regs[i]));
@@ -1317,7 +1348,7 @@ export class Viewer {
       }
     }
     // 1b. Handle of the single selected region → resize/rotate/node-drag.
-    if (!box && this.selectedIndex >= 0) {
+    if (this.selection.size < 2 && this.selectedIndex >= 0) {
       const hd = hitTestHandle(regs[this.selectedIndex], view, mx, my);
       if (hd) {
         this.snapshotForUndo();
@@ -1367,6 +1398,7 @@ export class Viewer {
     regs.push(reg);
     this.selectedIndex = regs.length - 1;
     this.selection = new Set([this.selectedIndex]);
+    this.setUndoTarget([this.selectedIndex], this.selectedIndex);
     this.editDrag = { mode: "create", index: this.selectedIndex, anchor: [ix, iy], moved: false };
     this.drawOverlay();
   }
@@ -1434,6 +1466,7 @@ export class Viewer {
       layer: this.callbacks.drawLayer?.(),
     };
     this.regions.push(reg);
+    this.setUndoTarget([this.regions.length - 1], this.regions.length - 1);
     this.callbacks.onRegionsChanged();
     this.selectRegion(this.regions.length - 1);
   }
@@ -1505,10 +1538,14 @@ export class Viewer {
     this.groupAngleKey = this.selectionKey();
   }
 
-  /** Bounding box of the multi-selection (≥ 2 regions), else null. */
-  private groupBoxNow(): ReturnType<typeof groupBox> {
-    if (!this.regions || this.selection.size < 2) return null;
-    return groupBox(this.regions, this.selection, this.layerStyle, this.currentGroupAngle());
+  /** Oriented selection box: the multi-selection (≥ 2 regions, corner scale
+   *  + rotate), or a lone selected polygon (rotate knob only — #20), else null. */
+  private groupBoxNow(): { frame: GroupFrame; corners: boolean } | null {
+    if (!this.regions) return null;
+    const multi = this.selection.size >= 2;
+    if (!multi && !(this.selection.size === 1 && this.regions[this.selectedIndex]?.shape === "polygon")) return null;
+    const frame = groupBox(this.regions, this.selection, this.layerStyle, this.currentGroupAngle());
+    return frame ? { frame, corners: multi } : null;
   }
 
   /** The selected regions (primary first), for the properties panel. */
@@ -1754,7 +1791,7 @@ export class Viewer {
       selected: this.selectedIndex,
       selection: this.selection,
       edit: this.editMode,
-      groupAngle: this.currentGroupAngle(),
+      group: this.groupBoxNow(),
     }, this.layerStyle);
     if (this.image && this.sourceMarkers) {
       drawSourceMarkers(this.overlay, this.sourceMarkers, view, this.sourceColor);
@@ -1762,7 +1799,7 @@ export class Viewer {
     if (this.image && this.marker) {
       drawCrosshair(this.overlay, view, this.marker[0], this.marker[1], this.markerAlpha);
     }
-    if (this.marquee) drawMarquee(this.overlay, this.marquee.pts, view.dpr);
+    if (this.marquee) drawMarquee(this.overlay, this.marquee.pts, view.dpr, this.marquee.kind === "rect");
     if (this.polygonDraft) {
       drawPolygonDraft(this.overlay, view, this.polygonDraft.xs, this.polygonDraft.ys, this.polygonCursor);
     }

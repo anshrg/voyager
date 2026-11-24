@@ -47,8 +47,9 @@ export interface RegionHighlight {
   /** All highlighted regions (multi-select). Always includes `selected`. */
   selection?: ReadonlySet<number>;
   edit: boolean;
-  /** Orientation of the multi-selection box (degrees, CCW). */
-  groupAngle?: number;
+  /** Oriented selection box to draw; `corners` false = rotate knob only
+   *  (a single polygon, whose vertices carry their own handles). */
+  group?: { frame: GroupFrame; corners: boolean } | null;
 }
 
 /** Image pixel center (0-based coord p) → device-pixel screen position.
@@ -80,10 +81,10 @@ export function drawRegions(
   if (!regions || regions.length === 0) return;
 
   const project = screenMap(view);
-  // Several regions selected: one bounding box with group handles replaces
-  // the primary's own handles (#7).
-  const group =
-    hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers, hl.groupAngle ?? 0) : null;
+  // Oriented selection box (several regions, or one polygon), computed by the
+  // viewer; with several selected it replaces the primary's own handles.
+  const group = hl?.group ?? null;
+  const multi = (hl?.selection?.size ?? 0) >= 2;
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
@@ -92,7 +93,7 @@ export function drawRegions(
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =
-      hl && i === hl.selected && !group ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
+      hl && i === hl.selected && !multi ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
     ctx.save();
     ctx.strokeStyle = ctx.fillStyle = color;
     ctx.lineWidth = Math.max(1, (reg.width ?? 1) * view.dpr) + (emph ? 1.5 * view.dpr : 0);
@@ -204,7 +205,7 @@ export function drawRegions(
     if (emph === 2 && hl?.edit) drawEditHandles(ctx, reg, view);
     else if (emph === 2 && bbox) drawHandles(ctx, bbox, view.dpr);
   }
-  if (group) drawGroupBox(ctx, group, view, hl?.edit ?? false);
+  if (group) drawGroupBox(ctx, group.frame, view, hl?.edit ?? false, group.corners);
 }
 
 // ---- multi-selection bounding box (#7) -------------------------------------
@@ -308,12 +309,14 @@ export interface GroupHandle {
   corner: number;
 }
 
-export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
+export function groupHandles(g: GroupFrame, view: RegionView, corners = true): GroupHandle[] {
   const project = screenMap(view);
-  const out: GroupHandle[] = boxCorners(g).map(([x, y], corner) => {
-    const [sx, sy] = project(x, y);
-    return { sx, sy, kind: "corner", corner };
-  });
+  const out: GroupHandle[] = corners
+    ? boxCorners(g).map(([x, y], corner) => {
+        const [sx, sy] = project(x, y);
+        return { sx, sy, kind: "corner", corner };
+      })
+    : [];
   // Rotate knob: beyond the middle of the box's (local) top edge.
   const b = g.box;
   const [kx, ky] = frameToImage(g, (b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
@@ -322,10 +325,17 @@ export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
   return out;
 }
 
-export function hitTestGroupHandle(b: GroupFrame, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
+export function hitTestGroupHandle(
+  b: GroupFrame,
+  view: RegionView,
+  mx: number,
+  my: number,
+  corners = true,
+  tol = 7,
+): GroupHandle | null {
   let best: GroupHandle | null = null;
   let bestD = tol * view.dpr;
-  for (const hd of groupHandles(b, view)) {
+  for (const hd of groupHandles(b, view, corners)) {
     const d = Math.hypot(mx - hd.sx, my - hd.sy);
     if (d <= bestD) {
       bestD = d;
@@ -347,7 +357,15 @@ export function groupHandleCursor(g: GroupFrame, hd: GroupHandle, view: RegionVi
   return "nesw-resize";
 }
 
-function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: RegionView, edit: boolean): void {
+function drawGroupBox(
+  ctx: CanvasRenderingContext2D,
+  b: GroupFrame,
+  view: RegionView,
+  edit: boolean,
+  corners: boolean,
+): void {
+  // A lone polygon outside edit mode needs no box (nothing to grab).
+  if (!corners && !edit) return;
   const project = screenMap(view);
   const pts = boxCorners(b).map(([x, y]) => project(x, y));
   ctx.save();
@@ -360,8 +378,8 @@ function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: Region
   ctx.stroke();
   if (edit) {
     // Stem from the top edge to the rotate knob.
-    const hs = groupHandles(b, view);
-    const knob = hs[4];
+    const hs = groupHandles(b, view, corners);
+    const knob = hs[hs.length - 1];
     ctx.beginPath();
     ctx.moveTo((pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2);
     ctx.lineTo(knob.sx, knob.sy);
@@ -370,7 +388,7 @@ function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: Region
     ctx.fillStyle = "#ffffff";
     ctx.strokeStyle = "#000000";
     const s = 3.5 * view.dpr;
-    for (const hd of groupHandles(b, view)) {
+    for (const hd of hs) {
       if (hd.kind === "rot") {
         ctx.beginPath();
         ctx.arc(hd.sx, hd.sy, s + 0.5 * view.dpr, 0, 2 * Math.PI);
@@ -600,9 +618,16 @@ export function regionsTouching(
   return out;
 }
 
-/** Draw a selection marquee (rectangle or lasso, device px) without
- *  clearing — call after drawRegions. */
-export function drawMarquee(canvas: HTMLCanvasElement, pts: readonly [number, number][], dpr: number): void {
+/** Draw a selection marquee (device px) without clearing — call after
+ *  drawRegions. A rectangle is closed and tinted; a lasso is just the open
+ *  path traced so far (like Photoshop — no fill, no closing segment back to
+ *  the start; a filled preview is a parked preference, see BACKLOG). */
+export function drawMarquee(
+  canvas: HTMLCanvasElement,
+  pts: readonly [number, number][],
+  dpr: number,
+  closed: boolean,
+): void {
   const ctx = canvas.getContext("2d");
   if (!ctx || pts.length < 2) return;
   ctx.save();
@@ -612,8 +637,10 @@ export function drawMarquee(canvas: HTMLCanvasElement, pts: readonly [number, nu
   ctx.setLineDash([4 * dpr, 3 * dpr]);
   ctx.beginPath();
   pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-  ctx.closePath();
-  ctx.fill();
+  if (closed) {
+    ctx.closePath();
+    ctx.fill();
+  }
   ctx.stroke();
   ctx.restore();
 }
@@ -836,6 +863,8 @@ function drawMarker(
       break;
     default: // "boxcircle" (DS9 default) and anything unrecognized
       ctx.rect(x - r, y - r, 2 * r, 2 * r);
+      // Lift the pen: without it the path joins the box corner to the circle.
+      ctx.moveTo(x + r * 0.6, y);
       ctx.arc(x, y, r * 0.6, 0, 2 * Math.PI);
       break;
   }
