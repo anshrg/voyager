@@ -469,16 +469,27 @@ function renderFrameBar(): void {
     // Nested in the composite's band order (which drives the rainbow).
     if (frame.composite?.expanded) for (const b of frame.composite.bands) addChip(b.frame, true);
   }
-  // Previous/next frame (also [ and ]), right-aligned in the frame bar.
-  if (frames.length > 1) {
+  // Right end of the frame bar: Fit (image frames), then previous/next
+  // frame (also [ and ]) when there are several.
+  if (frames.length > 0) {
     const nav = el("div", "frame-nav");
-    const prev = el("button", "frame-nav-btn", "◀");
-    prev.title = "Previous frame ([)";
-    prev.addEventListener("click", () => cycleFrame(-1));
-    const next = el("button", "frame-nav-btn", "▶");
-    next.title = "Next frame (])";
-    next.addEventListener("click", () => cycleFrame(1));
-    nav.append(prev, next);
+    const fit = el("button", "frame-nav-btn frame-fit-btn");
+    fit.title = "Fit the image to the window (double-click the image also fits)";
+    fit.innerHTML =
+      '<svg viewBox="0 0 18 18" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">' +
+      '<path d="M3.5 14.5 14.5 3.5"/><path d="M9.5 3.5h5v5"/><path d="M8.5 14.5h-5v-5"/></svg>';
+    fit.addEventListener("click", () => activeFrame()?.viewer?.fit());
+    fit.style.display = activeFrame()?.viewer && activeFrame()?.viewerHdu !== null ? "" : "none";
+    nav.append(fit);
+    if (frames.length > 1) {
+      const prev = el("button", "frame-nav-btn", "◀");
+      prev.title = "Previous frame ([)";
+      prev.addEventListener("click", () => cycleFrame(-1));
+      const next = el("button", "frame-nav-btn", "▶");
+      next.title = "Next frame (])";
+      next.addEventListener("click", () => cycleFrame(1));
+      nav.append(prev, next);
+    }
     bar.append(nav);
   }
   regionTools?.syncView({
@@ -2740,7 +2751,6 @@ function buildUi(): void {
   const rp = buildRegionPanel(regionHost, () => showRegionPanel(false));
   imagePane.append(rp.root);
   regionTools = new RegionTools({
-    fit: () => activeFrame()?.viewer?.fit(),
     grid: () => toggleGrid(),
     blink: () => toggleBlink(),
     lock: () => cycleLock(),

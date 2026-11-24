@@ -1463,3 +1463,9 @@ table.cards td {
 .rl-copy-item:hover {
   background: var(--bg-hover);
 }
+
+.frame-fit-btn {
+  display: grid;
+  place-items: center;
+  padding: 1px 6px;
+}
