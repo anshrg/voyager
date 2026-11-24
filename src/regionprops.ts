@@ -267,7 +267,7 @@ export class RegionProps {
     const refreshStyle = (): void => {
       const r = v.regionAt(idx[0]);
       if (!r) return;
-      if (document.activeElement !== color) color.value = toHex(r.color);
+      color.value = toHex(r.color); // no focus guard: a swatch isn't typed into, and ⌘Z must refresh it
       if (document.activeElement !== width) width.value = String(r.width ?? 1);
       dash.checked = r.dash;
       exclude.checked = !r.include;

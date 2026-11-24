@@ -78,6 +78,9 @@ export function drawRegions(
   if (!regions || regions.length === 0) return;
 
   const project = screenMap(view);
+  // Several regions selected: one bounding box with group handles replaces
+  // the primary's own handles (#7).
+  const group = hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers) : null;
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
@@ -86,7 +89,7 @@ export function drawRegions(
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =
-      hl && i === hl.selected ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
+      hl && i === hl.selected && !group ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
     ctx.save();
     ctx.strokeStyle = ctx.fillStyle = color;
     ctx.lineWidth = Math.max(1, (reg.width ?? 1) * view.dpr) + (emph ? 1.5 * view.dpr : 0);
@@ -198,6 +201,141 @@ export function drawRegions(
     if (emph === 2 && hl?.edit) drawEditHandles(ctx, reg, view);
     else if (emph === 2 && bbox) drawHandles(ctx, bbox, view.dpr);
   }
+  if (group) drawGroupBox(ctx, group, view, hl?.edit ?? false);
+}
+
+// ---- multi-selection bounding box (#7) -------------------------------------
+
+/** Image-px axis-aligned box [x0, y0, x1, y1] (y up). */
+export type ImageBox = [number, number, number, number];
+
+/** A region's image-px extent. */
+function regionExtent(reg: PixelRegion): ImageBox {
+  switch (reg.shape) {
+    case "circle":
+      return [reg.x - reg.r, reg.y - reg.r, reg.x + reg.r, reg.y + reg.r];
+    case "annulus":
+      return [reg.x - reg.rout, reg.y - reg.rout, reg.x + reg.rout, reg.y + reg.rout];
+    case "ellipse": {
+      // Exact extent of a rotated ellipse.
+      const a = (reg.angle * Math.PI) / 180;
+      const ex = Math.hypot(reg.rx * Math.cos(a), reg.ry * Math.sin(a));
+      const ey = Math.hypot(reg.rx * Math.sin(a), reg.ry * Math.cos(a));
+      return [reg.x - ex, reg.y - ey, reg.x + ex, reg.y + ey];
+    }
+    case "box": {
+      const a = (reg.angle * Math.PI) / 180;
+      const c = Math.abs(Math.cos(a));
+      const sn = Math.abs(Math.sin(a));
+      const ex = (reg.w * c + reg.h * sn) / 2;
+      const ey = (reg.w * sn + reg.h * c) / 2;
+      return [reg.x - ex, reg.y - ey, reg.x + ex, reg.y + ey];
+    }
+    case "polygon":
+      return [Math.min(...reg.xs), Math.min(...reg.ys), Math.max(...reg.xs), Math.max(...reg.ys)];
+    case "point":
+      return [reg.x, reg.y, reg.x, reg.y];
+  }
+}
+
+/** Bounding box of the given (visible) regions, or null if none. */
+export function groupBox(
+  regions: readonly PixelRegion[],
+  indices: Iterable<number>,
+  layers?: LayerStyle,
+): ImageBox | null {
+  let b: ImageBox | null = null;
+  for (const i of indices) {
+    const r = regions[i];
+    if (!r || !regionShown(r, layers)) continue;
+    const e = regionExtent(r);
+    b = b ? [Math.min(b[0], e[0]), Math.min(b[1], e[1]), Math.max(b[2], e[2]), Math.max(b[3], e[3])] : e;
+  }
+  return b;
+}
+
+/** Image-px corners of a box, in order (x0,y0) (x1,y0) (x1,y1) (x0,y1). */
+export function boxCorners(b: ImageBox): [number, number][] {
+  return [
+    [b[0], b[1]],
+    [b[2], b[1]],
+    [b[2], b[3]],
+    [b[0], b[3]],
+  ];
+}
+
+/** A group handle: a corner (scale about the opposite corner) or the rotate
+ *  knob above the box's top edge (rotate about the box center). */
+export interface GroupHandle {
+  sx: number;
+  sy: number;
+  kind: "corner" | "rot";
+  /** Corner index into boxCorners (−1 for rot). */
+  corner: number;
+}
+
+export function groupHandles(b: ImageBox, view: RegionView): GroupHandle[] {
+  const project = screenMap(view);
+  const out: GroupHandle[] = boxCorners(b).map(([x, y], corner) => {
+    const [sx, sy] = project(x, y);
+    return { sx, sy, kind: "corner", corner };
+  });
+  const [sx, sy] = project((b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
+  out.push({ sx, sy, kind: "rot", corner: -1 });
+  return out;
+}
+
+export function hitTestGroupHandle(b: ImageBox, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
+  let best: GroupHandle | null = null;
+  let bestD = tol * view.dpr;
+  for (const hd of groupHandles(b, view)) {
+    const d = Math.hypot(mx - hd.sx, my - hd.sy);
+    if (d <= bestD) {
+      bestD = d;
+      best = hd;
+    }
+  }
+  return best;
+}
+
+/** Hover cursor for a group handle: diagonal resize at corners, grab on rot. */
+export function groupHandleCursor(b: ImageBox, hd: GroupHandle, view: RegionView): string {
+  if (hd.kind === "rot") return "grab";
+  const [cx, cy] = screenMap(view)((b[0] + b[2]) / 2, (b[1] + b[3]) / 2);
+  const down = hd.sy > cy;
+  const right = hd.sx > cx;
+  return down === right ? "nwse-resize" : "nesw-resize";
+}
+
+function drawGroupBox(ctx: CanvasRenderingContext2D, b: ImageBox, view: RegionView, edit: boolean): void {
+  const project = screenMap(view);
+  const pts = boxCorners(b).map(([x, y]) => project(x, y));
+  ctx.save();
+  ctx.setLineDash([5 * view.dpr, 4 * view.dpr]);
+  ctx.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx.lineWidth = view.dpr;
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+  ctx.closePath();
+  ctx.stroke();
+  if (edit) {
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#000000";
+    const s = 3.5 * view.dpr;
+    for (const hd of groupHandles(b, view)) {
+      if (hd.kind === "rot") {
+        ctx.beginPath();
+        ctx.arc(hd.sx, hd.sy, s + 0.5 * view.dpr, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.fillRect(hd.sx - s, hd.sy - s, 2 * s, 2 * s);
+        ctx.strokeRect(hd.sx - s, hd.sy - s, 2 * s, 2 * s);
+      }
+    }
+  }
+  ctx.restore();
 }
 
 /** Nearest catalog source marker to the screen point (mx, my) within `tol`
@@ -811,22 +949,6 @@ export function handleCursor(reg: PixelRegion, hd: Handle, view: RegionView): st
   if (deg < 67.5) return "nwse-resize";
   if (deg < 112.5) return "ns-resize";
   return "nesw-resize";
-}
-
-/** The size a handle role controls (for group-scale ratios), or null. */
-export function handleSize(reg: PixelRegion, role: HandleRole): number | null {
-  switch (reg.shape) {
-    case "circle":
-      return role === "r" ? reg.r : null;
-    case "annulus":
-      return role === "rin" ? reg.rin : role === "rout" ? reg.rout : null;
-    case "ellipse":
-      return role === "rx" ? reg.rx : role === "ry" ? reg.ry : null;
-    case "box":
-      return role === "w" ? reg.w : role === "h" ? reg.h : null;
-    default:
-      return null;
-  }
 }
 
 /** Scale a region about image point (cx, cy) by `s` (center + sizes). */

@@ -2526,8 +2526,11 @@ function buildUi(): void {
 
   document.addEventListener("keydown", (e) => {
     const t = document.activeElement;
+    // Color swatches, checkboxes and radios keep focus after a click but take
+    // no text, so app shortcuts (⌘Z right after picking a color) still apply.
+    const nonText = t instanceof HTMLInputElement && ["color", "checkbox", "radio", "range", "button"].includes(t.type);
     const typing =
-      t instanceof HTMLInputElement ||
+      (t instanceof HTMLInputElement && !nonText) ||
       t instanceof HTMLSelectElement ||
       t instanceof HTMLTextAreaElement;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
