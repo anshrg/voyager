@@ -148,6 +148,8 @@ export interface WcsParams {
   cd_inv: [[number, number], [number, number]];
   lonpole: number;
   swapped: boolean;
+  /** CTYPE had -SIP but the distortion is not applied (RGB won't reproject it). */
+  sip_ignored?: boolean;
 }
 
 /** Fetch an HDU's WCS parameters, or null when it has no supported TAN WCS. */
