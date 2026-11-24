@@ -683,7 +683,7 @@ function ensureHistogram(): void {
   const key = `${frame.file.path}#${hdu}`;
   if (histLoadedFor === key) return;
   histLoadedFor = key;
-  void histPanel.load(frame.file.path, hdu);
+  void histPanel.load(frame.file.path, hdu, frame.viewer?.getLimits());
 }
 
 /** (Re)load the shared TableView for a frame's table HDU. */

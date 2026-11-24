@@ -1299,7 +1299,10 @@ table.cards td {
 }
 
 .disp-hist .hist-inline {
-  position: static;
+  position: relative;
+  left: auto;
+  bottom: auto;
+  padding: 4px;
   width: 100%;
   height: 110px;
 }
@@ -1468,4 +1471,25 @@ table.cards td {
   display: grid;
   place-items: center;
   padding: 1px 6px;
+}
+
+/* Histogram view buttons (#24). */
+.hist-btns {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: flex;
+  gap: 2px;
+  opacity: 0.55;
+}
+
+.hist-panel:hover .hist-btns {
+  opacity: 1;
+}
+
+.hist-btn {
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+  background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
 }
