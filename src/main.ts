@@ -93,6 +93,60 @@ interface Frame {
    *  and cycling unless the composite chip is expanded. Kept open — the
    *  composite reads its pixels through it. */
   hiddenBy: Frame | null;
+  /** Display + region state saved when this frame's Viewer was destroyed
+   *  (folded into a composite), reapplied when it is rebuilt. */
+  savedView?: SavedView | null;
+  /** Regions to install (instead of re-reading files) on the next image
+   *  load: a restored band's edits, or band layers carried into a composite. */
+  pendingRegions?: PixelRegion[] | null;
+}
+
+/** A Viewer's user-visible state, kept across its destroy/rebuild. */
+interface SavedView {
+  colormap: string;
+  stretch: Stretch;
+  scaleMode: ScaleMode;
+  limits: [number, number];
+  bias: number;
+  contrast: number;
+  camera: { cx: number; cy: number; scale: number };
+}
+
+/** Destroy a frame's Viewer, keeping its display settings and regions
+ *  (including unsaved edits) for when it's rebuilt. */
+function retireViewer(frame: Frame): void {
+  const v = frame.viewer;
+  if (!v) return;
+  const cb = v.getContrastBias();
+  frame.savedView = {
+    colormap: v.getColormap(),
+    stretch: v.getStretch(),
+    scaleMode: v.getScaleMode(),
+    limits: v.getLimits(),
+    bias: cb.bias,
+    contrast: cb.contrast,
+    camera: v.getCamera(),
+  };
+  frame.pendingRegions = structuredClone(v.getRegions());
+  v.destroy();
+  frame.viewer = null;
+  frame.viewerHdu = null;
+}
+
+/** Reapply a retired Viewer's settings after its image has loaded (zscale
+ *  has run by then, so the saved limits win). */
+async function restoreSavedView(frame: Frame): Promise<void> {
+  const v = frame.viewer;
+  const sv = frame.savedView;
+  if (!v || !sv || frame.composite) return;
+  frame.savedView = null;
+  v.setColormap(sv.colormap);
+  v.setStretch(sv.stretch);
+  if (sv.scaleMode !== v.getScaleMode()) await v.applyScaleMode(sv.scaleMode);
+  v.setLimits(sv.limits[0], sv.limits[1]);
+  v.setContrastBias(sv.bias, sv.contrast);
+  if (lockMode === "none") v.setCamera(sv.camera.cx, sv.camera.cy, sv.camera.scale);
+  if (frame === activeFrame()) syncToolbar(frame);
 }
 
 /** Manual position-column choice: RA/Dec (sky) or X/Y (pixel) column
@@ -649,6 +703,16 @@ async function ensureTable(frame: Frame): Promise<void> {
  *  an image reload (pixel coordinates of another grid). */
 async function applyRegionsFor(frame: Frame): Promise<void> {
   if (!frame.viewer) return;
+  const pending = frame.pendingRegions;
+  if (pending) {
+    // Restored band / composite carry-over: install the live regions as-is
+    // (file layers keep their edits; untitled layers survive).
+    frame.pendingRegions = null;
+    frame.viewer.setRegions(pending.length > 0 || frame.regionLayers.length > 0 ? pending : null);
+    frame.viewer.setLayerStyle(layerStyleOf(frame));
+    if (frame === activeFrame()) renderRegionPanel();
+    return;
+  }
   const hdu = frame.viewerHdu ?? frame.selectedHdu;
   const all: PixelRegion[] = [];
   for (const layer of frame.regionLayers) {
@@ -1014,6 +1078,7 @@ async function loadFrameImage(frame: Frame): Promise<void> {
     }
     await loadFrameWcs(frame);
     await applyRegionsFor(frame);
+    await restoreSavedView(frame);
     // Under camera-lock, a freshly shown frame adopts the shared camera (and
     // WCS-align rotation). setImage reset rotation to 0, so re-apply it here.
     if (lockMode !== "none") {
@@ -2066,13 +2131,28 @@ async function addFrame(
   };
   cell.append(el("div", "frame-label", frameName(frame)));
   if (rgb) {
+    const carried: PixelRegion[] = [];
     for (const b of rgb.composite.bands) {
       b.frame.hiddenBy = frame;
-      // Free the hidden band's WebGL context (WKWebView caps them; see #9).
-      // It is rebuilt lazily (ensureViewer) if the composite is expanded.
-      b.frame.viewer?.destroy();
-      b.frame.viewer = null;
-      b.frame.viewerHdu = null;
+      // Free the hidden band's WebGL context (WKWebView caps them; see #9),
+      // keeping its settings + regions; rebuilt lazily (ensureViewer) if the
+      // composite is expanded or closed.
+      retireViewer(b.frame);
+      // Paint the band's region layers onto the composite too: every band is
+      // on the composite's pixel grid, so pixel regions carry over 1:1. The
+      // composite gets copies ("F444W · sources.reg"); edits don't flow back.
+      const regs = b.frame.pendingRegions ?? [];
+      for (const l of b.frame.regionLayers) {
+        const copy = newLayer(`${b.label} · ${l.name}`, null);
+        copy.visible = l.visible;
+        copy.warnings = l.warnings;
+        frame.regionLayers.push(copy);
+        for (const r of regs) if (r.layer === l.id) carried.push({ ...structuredClone(r), layer: copy.id });
+      }
+    }
+    if (frame.regionLayers.length > 0) {
+      frame.pendingRegions = carried;
+      frame.activeLayer = frame.regionLayers[0].id;
     }
   }
   // Clicking a cell (tiled mode) makes it the active frame.

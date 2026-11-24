@@ -808,6 +808,17 @@ export class Viewer {
     this.requestDraw();
   }
 
+  getContrastBias(): { bias: number; contrast: number } {
+    return { bias: this.bias, contrast: this.contrast };
+  }
+
+  setContrastBias(bias: number, contrast: number): void {
+    this.bias = bias;
+    this.contrast = contrast;
+    this.callbacks.onContrastBias(bias, contrast);
+    this.requestDraw();
+  }
+
   resetContrastBias(): void {
     this.bias = 0.5;
     this.contrast = 1.0;
