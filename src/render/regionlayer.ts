@@ -47,6 +47,8 @@ export interface RegionHighlight {
   /** All highlighted regions (multi-select). Always includes `selected`. */
   selection?: ReadonlySet<number>;
   edit: boolean;
+  /** Orientation of the multi-selection box (degrees, CCW). */
+  groupAngle?: number;
 }
 
 /** Image pixel center (0-based coord p) → device-pixel screen position.
@@ -80,7 +82,8 @@ export function drawRegions(
   const project = screenMap(view);
   // Several regions selected: one bounding box with group handles replaces
   // the primary's own handles (#7).
-  const group = hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers) : null;
+  const group =
+    hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers, hl.groupAngle ?? 0) : null;
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
@@ -207,7 +210,23 @@ export function drawRegions(
 // ---- multi-selection bounding box (#7) -------------------------------------
 
 /** Image-px axis-aligned box [x0, y0, x1, y1] (y up). */
-export type ImageBox = [number, number, number, number];
+type ImageBox = [number, number, number, number];
+
+/** The multi-selection box: an axis-aligned box [u0, v0, u1, v1] in a frame
+ *  rotated `angle`° CCW about the image origin, so the box turns with the
+ *  group when it is rotated (and keeps its size). */
+export interface GroupFrame {
+  box: ImageBox;
+  angle: number;
+}
+
+/** Local (u, v) of a group frame → image px. */
+function frameToImage(g: GroupFrame, u: number, v: number): [number, number] {
+  const a = (g.angle * Math.PI) / 180;
+  const c = Math.cos(a);
+  const sn = Math.sin(a);
+  return [c * u - sn * v, sn * u + c * v];
+}
 
 /** A region's image-px extent. */
 function regionExtent(reg: PixelRegion): ImageBox {
@@ -238,30 +257,45 @@ function regionExtent(reg: PixelRegion): ImageBox {
   }
 }
 
-/** Bounding box of the given (visible) regions, or null if none. */
+/** Bounding box of the given (visible) regions in a frame at `angle`°, or
+ *  null if none. Each region is rotated into the frame and its exact extent
+ *  taken there. */
 export function groupBox(
   regions: readonly PixelRegion[],
   indices: Iterable<number>,
   layers?: LayerStyle,
-): ImageBox | null {
+  angle = 0,
+): GroupFrame | null {
   let b: ImageBox | null = null;
   for (const i of indices) {
     const r = regions[i];
     if (!r || !regionShown(r, layers)) continue;
-    const e = regionExtent(r);
+    let local = r;
+    if (angle !== 0) {
+      local = structuredClone(r);
+      rotateRegionAbout(local, 0, 0, -angle);
+    }
+    const e = regionExtent(local);
     b = b ? [Math.min(b[0], e[0]), Math.min(b[1], e[1]), Math.max(b[2], e[2]), Math.max(b[3], e[3])] : e;
   }
-  return b;
+  return b ? { box: b, angle } : null;
 }
 
-/** Image-px corners of a box, in order (x0,y0) (x1,y0) (x1,y1) (x0,y1). */
-export function boxCorners(b: ImageBox): [number, number][] {
+/** Image-px corners of a group box, in order around it (opposite corner of
+ *  i is (i + 2) % 4). */
+export function boxCorners(g: GroupFrame): [number, number][] {
+  const b = g.box;
   return [
-    [b[0], b[1]],
-    [b[2], b[1]],
-    [b[2], b[3]],
-    [b[0], b[3]],
+    frameToImage(g, b[0], b[1]),
+    frameToImage(g, b[2], b[1]),
+    frameToImage(g, b[2], b[3]),
+    frameToImage(g, b[0], b[3]),
   ];
+}
+
+/** Image-px center of a group box. */
+export function boxCenter(g: GroupFrame): [number, number] {
+  return frameToImage(g, (g.box[0] + g.box[2]) / 2, (g.box[1] + g.box[3]) / 2);
 }
 
 /** A group handle: a corner (scale about the opposite corner) or the rotate
@@ -274,18 +308,21 @@ export interface GroupHandle {
   corner: number;
 }
 
-export function groupHandles(b: ImageBox, view: RegionView): GroupHandle[] {
+export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
   const project = screenMap(view);
-  const out: GroupHandle[] = boxCorners(b).map(([x, y], corner) => {
+  const out: GroupHandle[] = boxCorners(g).map(([x, y], corner) => {
     const [sx, sy] = project(x, y);
     return { sx, sy, kind: "corner", corner };
   });
-  const [sx, sy] = project((b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
+  // Rotate knob: beyond the middle of the box's (local) top edge.
+  const b = g.box;
+  const [kx, ky] = frameToImage(g, (b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
+  const [sx, sy] = project(kx, ky);
   out.push({ sx, sy, kind: "rot", corner: -1 });
   return out;
 }
 
-export function hitTestGroupHandle(b: ImageBox, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
+export function hitTestGroupHandle(b: GroupFrame, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
   let best: GroupHandle | null = null;
   let bestD = tol * view.dpr;
   for (const hd of groupHandles(b, view)) {
@@ -299,15 +336,18 @@ export function hitTestGroupHandle(b: ImageBox, view: RegionView, mx: number, my
 }
 
 /** Hover cursor for a group handle: diagonal resize at corners, grab on rot. */
-export function groupHandleCursor(b: ImageBox, hd: GroupHandle, view: RegionView): string {
+export function groupHandleCursor(g: GroupFrame, hd: GroupHandle, view: RegionView): string {
   if (hd.kind === "rot") return "grab";
-  const [cx, cy] = screenMap(view)((b[0] + b[2]) / 2, (b[1] + b[3]) / 2);
-  const down = hd.sy > cy;
-  const right = hd.sx > cx;
-  return down === right ? "nwse-resize" : "nesw-resize";
+  const [px, py] = boxCenter(g);
+  const [cx, cy] = screenMap(view)(px, py);
+  const deg = (((Math.atan2(hd.sy - cy, hd.sx - cx) * 180) / Math.PI) % 180 + 180) % 180;
+  if (deg < 22.5 || deg >= 157.5) return "ew-resize";
+  if (deg < 67.5) return "nwse-resize";
+  if (deg < 112.5) return "ns-resize";
+  return "nesw-resize";
 }
 
-function drawGroupBox(ctx: CanvasRenderingContext2D, b: ImageBox, view: RegionView, edit: boolean): void {
+function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: RegionView, edit: boolean): void {
   const project = screenMap(view);
   const pts = boxCorners(b).map(([x, y]) => project(x, y));
   ctx.save();
@@ -319,6 +359,13 @@ function drawGroupBox(ctx: CanvasRenderingContext2D, b: ImageBox, view: RegionVi
   ctx.closePath();
   ctx.stroke();
   if (edit) {
+    // Stem from the top edge to the rotate knob.
+    const hs = groupHandles(b, view);
+    const knob = hs[4];
+    ctx.beginPath();
+    ctx.moveTo((pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2);
+    ctx.lineTo(knob.sx, knob.sy);
+    ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = "#ffffff";
     ctx.strokeStyle = "#000000";

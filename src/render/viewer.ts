@@ -15,6 +15,7 @@ import {
   drawRegions,
   drawRubberBand,
   drawSourceMarkers,
+  boxCenter,
   boxCorners,
   groupBox,
   groupHandleCursor,
@@ -61,6 +62,8 @@ interface UndoEntry {
   regions: PixelRegion[];
   selection: number[];
   primary: number;
+  /** Multi-selection box orientation at that moment. */
+  groupAngle: number;
 }
 
 // Bound on the region-edit undo stack (Cmd+Z / Cmd+Shift+Z).
@@ -128,6 +131,8 @@ type EditDrag =
       gx: number;
       gy: number;
       startDeg: number;
+      /** Box orientation when the drag began. */
+      startAngle: number;
       moved: boolean;
     }
   | { mode: "create"; index: number; anchor: [number, number]; moved: boolean };
@@ -177,6 +182,10 @@ export class Viewer {
   /** All highlighted regions (multi-select). Always contains selectedIndex
    *  when it is ≥ 0; empty when nothing is selected. */
   private selection = new Set<number>();
+  /** Orientation (deg) of the multi-selection box. Belongs to one selection:
+   *  `groupAngleKey` records which, and any other selection reads as 0. */
+  private groupAngle = 0;
+  private groupAngleKey = "";
   /** In-progress rubber-band select rectangle (device px), or null. */
   private rubberBand: { x0: number; y0: number; x1: number; y1: number } | null = null;
 
@@ -598,6 +607,7 @@ export class Viewer {
       regions: this.regions ? structuredClone(this.regions) : [],
       selection: [...this.selection],
       primary: this.selectedIndex,
+      groupAngle: this.currentGroupAngle(),
     };
   }
 
@@ -615,6 +625,7 @@ export class Viewer {
       : this.selection.size > 0
         ? [...this.selection][this.selection.size - 1]
         : -1;
+    this.setGroupAngle(e.groupAngle);
     this.emitSelectionPick();
     this.callbacks.onRegionsChanged();
     this.requestDraw();
@@ -1239,8 +1250,7 @@ export class Viewer {
         for (const i of this.selection) orig.set(i, structuredClone(regs[i]));
         const cs = boxCorners(box);
         const [gx, gy] = ghd.kind === "corner" ? cs[ghd.corner] : [ix, iy];
-        const [ax, ay] =
-          ghd.kind === "corner" ? cs[(ghd.corner + 2) % 4] : [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2];
+        const [ax, ay] = ghd.kind === "corner" ? cs[(ghd.corner + 2) % 4] : boxCenter(box);
         this.snapshotForUndo();
         this.editDrag = {
           mode: "group",
@@ -1252,6 +1262,7 @@ export class Viewer {
           gx,
           gy,
           startDeg: (Math.atan2(iy - ay, ix - ax) * 180) / Math.PI,
+          startAngle: box.angle,
           moved: false,
         };
         return;
@@ -1398,6 +1409,7 @@ export class Viewer {
         if (d.kind === "rot") {
           const deg = (Math.atan2(iy - d.ay, ix - d.ax) * 180) / Math.PI - d.startDeg;
           apply = (r) => rotateRegionAbout(r, d.ax, d.ay, deg);
+          this.setGroupAngle(d.startAngle + deg);
         } else {
           // Project the cursor onto the anchor→corner diagonal: uniform scale.
           const vx = d.gx - d.ax;
@@ -1425,10 +1437,25 @@ export class Viewer {
     this.requestDraw();
   }
 
+  private selectionKey(): string {
+    return [...this.selection].sort((a, b) => a - b).join(",");
+  }
+
+  /** Box orientation for the current selection (0 unless this selection was
+   *  rotated as a group). */
+  private currentGroupAngle(): number {
+    return this.groupAngleKey === this.selectionKey() ? this.groupAngle : 0;
+  }
+
+  private setGroupAngle(deg: number): void {
+    this.groupAngle = deg;
+    this.groupAngleKey = this.selectionKey();
+  }
+
   /** Bounding box of the multi-selection (≥ 2 regions), else null. */
   private groupBoxNow(): ReturnType<typeof groupBox> {
     if (!this.regions || this.selection.size < 2) return null;
-    return groupBox(this.regions, this.selection, this.layerStyle);
+    return groupBox(this.regions, this.selection, this.layerStyle, this.currentGroupAngle());
   }
 
   /** The selected regions (primary first), for the properties panel. */
@@ -1674,6 +1701,7 @@ export class Viewer {
       selected: this.selectedIndex,
       selection: this.selection,
       edit: this.editMode,
+      groupAngle: this.currentGroupAngle(),
     }, this.layerStyle);
     if (this.image && this.sourceMarkers) {
       drawSourceMarkers(this.overlay, this.sourceMarkers, view, this.sourceColor);
