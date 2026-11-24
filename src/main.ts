@@ -414,12 +414,24 @@ function renderFrameBar(): void {
     // Nested in the composite's band order (which drives the rainbow).
     if (frame.composite?.expanded) for (const b of frame.composite.bands) addChip(b.frame, true);
   }
-  must<HTMLElement>("grid-btn").classList.toggle("active-btn", gridMode);
-  must<HTMLElement>("blink-btn").classList.toggle("active-btn", blinkTimer !== undefined);
-  const lockBtn = must<HTMLElement>("lock-btn");
-  lockBtn.classList.toggle("active-btn", lockMode !== "none");
-  lockBtn.textContent =
-    lockMode === "wcs" ? "Lock·wcs" : lockMode === "pixel" ? "Lock·px" : "Lock";
+  // Previous/next frame (also [ and ]), right-aligned in the frame bar.
+  if (frames.length > 1) {
+    const nav = el("div", "frame-nav");
+    const prev = el("button", "frame-nav-btn", "◀");
+    prev.title = "Previous frame ([)";
+    prev.addEventListener("click", () => cycleFrame(-1));
+    const next = el("button", "frame-nav-btn", "▶");
+    next.title = "Next frame (])";
+    next.addEventListener("click", () => cycleFrame(1));
+    nav.append(prev, next);
+    bar.append(nav);
+  }
+  regionTools?.syncView({
+    grid: gridMode,
+    blink: blinkTimer !== undefined,
+    lock: lockMode,
+    multi: frames.length > 1,
+  });
 }
 
 // ---- drag-to-reorder frame chips (#16) ---------------------------------------
@@ -572,9 +584,9 @@ function renderView(): void {
   must<HTMLElement>("image-pane").style.display = showImg ? "" : "none";
   must<HTMLElement>("table-pane").style.display = showTbl ? "" : "none";
   must<HTMLElement>("header-pane").style.display = showHdr ? "" : "none";
-  must<HTMLElement>("image-controls").style.display = showImg ? "" : "none";
-  must<HTMLElement>("table-controls").style.display = showTbl ? "" : "none";
-  must<HTMLElement>("filter-box").style.display = showHdr ? "" : "none";
+  // Sidebar Display section: single-band images only (a composite's RGB
+  // panel owns its levels/stretch/color).
+  must<HTMLElement>("display-section").style.display = showImg && !frame?.composite ? "" : "none";
   if (showTbl) refreshOverlayButtons();
 
   must<HTMLElement>("view-tabs").style.display =
@@ -767,7 +779,37 @@ function syncRegionTools(): void {
     canUndo: v?.canUndo() ?? false,
     canRedo: v?.canRedo() ?? false,
     hasSelection: v?.hasSelection() ?? false,
+    hasLayers: (activeFrame()?.regionLayers.length ?? 0) > 0,
   });
+}
+
+/** Typed limit fields (Display section); a focused field isn't overwritten. */
+function showLimits(lo: number, hi: number): void {
+  for (const [id, v] of [
+    ["limit-lo", lo],
+    ["limit-hi", hi],
+  ] as const) {
+    const inp = must<HTMLInputElement>(id);
+    if (document.activeElement !== inp) inp.value = v.toPrecision(6);
+  }
+}
+
+/** Paint the current colormap into the Display section's color bar. */
+function drawColorbar(name: string): void {
+  const c = must<HTMLCanvasElement>("colorbar");
+  const cm = COLORMAPS.find((m) => m.name === name);
+  const ctx = c.getContext("2d");
+  if (!cm || !ctx) return;
+  c.width = 256;
+  c.height = 1;
+  const img = ctx.createImageData(256, 1);
+  for (let i = 0; i < 256; i++) {
+    img.data[4 * i] = cm.rgb[3 * i];
+    img.data[4 * i + 1] = cm.rgb[3 * i + 1];
+    img.data[4 * i + 2] = cm.rgb[3 * i + 2];
+    img.data[4 * i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 /** Host callbacks for the panel, acting on the active frame. */
@@ -836,6 +878,7 @@ async function loadRegionsViaDialog(): Promise<void> {
 
 /** Re-render the layer list + selected-region section (if the panel is open). */
 function renderRegionPanel(): void {
+  syncRegionTools(); // layer count drives the tool bar's edit section
   if (!renderRegionLayerList()) return;
   regionProps?.sync();
 }
@@ -864,16 +907,14 @@ function makeViewer(frame: Frame): Viewer {
     },
     onLimits: (lo, hi) => {
       if (frame !== activeFrame()) return;
-      must<HTMLElement>("limits-label").textContent =
-        `[${lo.toPrecision(5)}, ${hi.toPrecision(5)}]`;
+      showLimits(lo, hi);
       histPanel?.setLimits(lo, hi);
     },
     onContrastBias: (bias, contrast) => {
       if (frame !== activeFrame()) return;
       const isDefault = Math.abs(bias - 0.5) < 1e-3 && Math.abs(contrast - 1) < 1e-3;
-      must<HTMLElement>("cb-label").textContent = isDefault
-        ? ""
-        : `b ${bias.toFixed(2)} c ${contrast.toFixed(2)}`;
+      must<HTMLElement>("cb-label").textContent = `bias ${bias.toFixed(2)} · contrast ${contrast.toFixed(2)}`;
+      must<HTMLElement>("cb-reset").style.visibility = isDefault ? "hidden" : "";
     },
     onRegionPick: (desc) => {
       if (frame !== activeFrame()) return;
@@ -1016,17 +1057,12 @@ async function ensureViewer(frame: Frame): Promise<void> {
 function syncToolbar(frame: Frame): void {
   const v = frame.viewer;
   if (!v) return;
-  // Single-band display controls don't apply to a composite (its panel in
-  // the sidebar owns levels/stretch/color).
-  const single = frame.composite ? "none" : "";
-  for (const id of ["colormap-select", "stretch-select", "scale-select", "hist-btn", "limits-label"]) {
-    must<HTMLElement>(id).style.display = single;
-  }
   must<HTMLSelectElement>("colormap-select").value = v.getColormap();
+  drawColorbar(v.getColormap());
   must<HTMLSelectElement>("stretch-select").value = v.getStretch();
   must<HTMLSelectElement>("scale-select").value = v.getScaleMode();
   const [lo, hi] = v.getLimits();
-  must<HTMLElement>("limits-label").textContent = `[${lo.toPrecision(5)}, ${hi.toPrecision(5)}]`;
+  showLimits(lo, hi);
   histPanel?.setLimits(lo, hi);
   syncRegionTools();
   renderRegionPanel();
@@ -2134,51 +2170,27 @@ function makeSelect(
   return select;
 }
 
-function makeToggle(id: string, label: string, title: string, onClick: () => void): HTMLButtonElement {
-  const btn = el("button", "", label);
-  btn.id = id;
-  btn.title = title;
-  btn.addEventListener("click", onClick);
-  return btn;
-}
-
 function buildUi(): void {
   const root = must<HTMLElement>("app");
   root.replaceChildren();
 
-  const toolbar = el("header", "toolbar");
+  // Sidebar top (#22): title + Open, then goto — the old top bar is gone so
+  // the image runs to the top of the window.
+  const sideTop = el("div", "side-top");
   const title = el("span", "app-title", "Voyager");
   const openBtn = el("button", "open-btn", "Open…");
+  openBtn.title = "Open FITS files (⌘O)";
   openBtn.addEventListener("click", () => void openViaDialog());
+  sideTop.append(title, openBtn);
 
-  // Multi-frame controls (always available once ≥1 frame is open).
-  const prevBtn = makeToggle("prev-frame-btn", "◀", "Previous frame ([)", () => cycleFrame(-1));
-  const nextBtn = makeToggle("next-frame-btn", "▶", "Next frame (])", () => cycleFrame(1));
-  const gridBtn = makeToggle("grid-btn", "Grid", "Tile all frames (g)", () => toggleGrid());
-  const blinkBtn = makeToggle("blink-btn", "Blink", "Blink-cycle image frames (b)", () =>
-    toggleBlink(),
-  );
-  const lockBtn = makeToggle(
-    "lock-btn",
-    "Lock",
-    "Lock pan/zoom across frames (cycles: off → WCS/sky → pixel)",
-    () => cycleLock(),
-  );
-  const rgbBtn = makeToggle(
-    "rgb-btn",
-    "RGB…",
-    "Make an RGB composite (trilogy or 3-color) from open image frames of the same field and pixel grid",
-    () => void openRgbDialog(),
-  );
-
-  // Image controls (visible only on the image tab).
-  const controls = el("div", "image-controls");
-  controls.id = "image-controls";
-  controls.style.display = "none";
+  // Display section (single-band image frames).
   const colormapSel = makeSelect(
     "colormap-select",
     COLORMAPS.map((c) => c.name),
-    (v) => activeFrame()?.viewer?.setColormap(v),
+    (v) => {
+      activeFrame()?.viewer?.setColormap(v);
+      drawColorbar(v);
+    },
   );
   const stretchSel = makeSelect("stretch-select", STRETCHES, (v) =>
     activeFrame()?.viewer?.setStretch(v as Stretch),
@@ -2186,20 +2198,35 @@ function buildUi(): void {
   const scaleSel = makeSelect("scale-select", ["zscale", "minmax"], (v) => {
     void activeFrame()?.viewer?.applyScaleMode(v as ScaleMode);
   });
-  const limitsLabel = el("span", "limits-label", "");
-  limitsLabel.id = "limits-label";
-  const cbLabel = el("span", "limits-label", "");
+  const colorbar = el("canvas", "colorbar");
+  colorbar.id = "colorbar";
+  const limitInput = (id: string, tip: string): HTMLInputElement => {
+    const inp = el("input", "limit-input");
+    inp.id = id;
+    inp.inputMode = "decimal";
+    inp.title = tip;
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") inp.blur();
+    });
+    inp.addEventListener("change", () => {
+      const v = activeFrame()?.viewer;
+      if (!v) return;
+      const lo = Number(must<HTMLInputElement>("limit-lo").value);
+      const hi = Number(must<HTMLInputElement>("limit-hi").value);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) v.setLimits(lo, hi);
+      else showLimits(...v.getLimits());
+    });
+    return inp;
+  };
+  const limLo = limitInput("limit-lo", "Lower display limit (black). Enter to apply.");
+  const limHi = limitInput("limit-hi", "Upper display limit (white). Enter to apply.");
+  const cbLabel = el("span", "cb-label", "bias 0.50 · contrast 1.00");
   cbLabel.id = "cb-label";
   cbLabel.title = "Right-drag on the image: ← bias → / ↑ contrast ↓. Double-right-click resets.";
-  const fitBtn = el("button", "", "Fit");
-  fitBtn.addEventListener("click", () => activeFrame()?.viewer?.fit());
-  const histBtn = el("button", "", "Hist");
-  histBtn.id = "hist-btn";
-  histBtn.addEventListener("click", () => {
-    if (!histPanel) return;
-    histBtn.classList.toggle("active-btn", histPanel.toggle());
-    ensureHistogram();
-  });
+  const cbReset = el("button", "mini-btn", "reset");
+  cbReset.id = "cb-reset";
+  cbReset.style.visibility = "hidden";
+  cbReset.addEventListener("click", () => activeFrame()?.viewer?.resetContrastBias());
   const gotoBox = el("input", "goto");
   gotoBox.id = "goto-box";
   gotoBox.placeholder = "goto α δ";
@@ -2225,16 +2252,38 @@ function buildUi(): void {
       });
   });
   gotoBox.addEventListener("input", () => gotoBox.classList.remove("goto-error"));
-  controls.append(
-    colormapSel,
-    stretchSel,
-    scaleSel,
-    fitBtn,
-    histBtn,
-    gotoBox,
-    limitsLabel,
-    cbLabel,
+
+  const display = el("div", "display-section");
+  display.id = "display-section";
+  display.style.display = "none";
+  const dispHead = el("button", "sidebar-head section-toggle", "Display ▾");
+  const dispBody = el("div", "display-body");
+  dispHead.title = "Collapse/expand the display controls";
+  dispHead.addEventListener("click", () => {
+    const open = dispBody.style.display === "none";
+    dispBody.style.display = open ? "" : "none";
+    dispHead.textContent = open ? "Display ▾" : "Display ▸";
+    if (open) ensureHistogram();
+  });
+  const row = (label: string, ...kids: HTMLElement[]): HTMLElement => {
+    const r = el("div", "disp-row");
+    r.append(el("span", "disp-label", label), ...kids);
+    return r;
+  };
+  const histBox = el("div", "disp-hist");
+  const limRow = row("Limits", limLo, el("span", "disp-dash", "–"), limHi);
+  const cbRow = el("div", "disp-row");
+  cbRow.append(cbLabel, cbReset);
+  dispBody.append(
+    row("Colormap", colormapSel),
+    colorbar,
+    row("Stretch", stretchSel),
+    row("Scale", scaleSel),
+    histBox,
+    limRow,
+    cbRow,
   );
+  display.append(dispHead, dispBody);
 
   const filter = el("input", "filter");
   filter.id = "filter-box";
@@ -2245,9 +2294,8 @@ function buildUi(): void {
   });
 
   // Table-tab controls: overlay this catalog's sources onto image frames.
-  const tableControls = el("div", "image-controls");
+  const tableControls = el("div", "pane-bar");
   tableControls.id = "table-controls";
-  tableControls.style.display = "none";
   const overlayBtn = el("button", "", "Overlay ▸ image");
   overlayBtn.title =
     "Mark this catalog's sources on the image: its own linked image (Split view) and any other open WCS image frame. Click a marker to jump to its table row.";
@@ -2400,20 +2448,6 @@ function buildUi(): void {
   rgbDialog.append(rdTitle, rdList, rdRow, rdStatus);
   document.body.append(rgbDialog);
 
-  toolbar.append(
-    title,
-    openBtn,
-    prevBtn,
-    nextBtn,
-    gridBtn,
-    blinkBtn,
-    lockBtn,
-    rgbBtn,
-    controls,
-    tableControls,
-    filter,
-  );
-
   const content = el("div", "content");
   content.id = "content";
   content.style.display = "none";
@@ -2423,7 +2457,9 @@ function buildUi(): void {
   sidebarHead.id = "sidebar-head";
   const hduList = el("div", "hdu-list");
   hduList.id = "hdu-list";
-  sidebar.append(sidebarHead, hduList);
+  const sideGoto = el("div", "side-goto");
+  sideGoto.append(gotoBox);
+  sidebar.append(sideTop, sideGoto, sidebarHead, hduList, display);
 
   const main = el("main", "main");
 
@@ -2462,6 +2498,7 @@ function buildUi(): void {
   const tablePane = el("div", "table-pane");
   tablePane.id = "table-pane";
   tablePane.style.display = "none";
+  tablePane.append(tableControls);
 
   const headerPane = el("div", "header-pane");
   headerPane.id = "header-pane";
@@ -2473,7 +2510,11 @@ function buildUi(): void {
   const tbody = el("tbody");
   tbody.id = "card-body";
   table.append(thead, tbody);
-  headerPane.append(table);
+  const headerBar = el("div", "pane-bar");
+  headerBar.append(filter);
+  const headerScroll = el("div", "header-scroll");
+  headerScroll.append(table);
+  headerPane.append(headerBar, headerScroll);
 
   // The three panes share a flex container: stacked (only one shown) in
   // single-view, side by side in split view (see #view-panes.split in CSS).
@@ -2485,9 +2526,13 @@ function buildUi(): void {
 
   const empty = el("div", "empty-state");
   empty.id = "empty-state";
+  const emptyOpen = el("button", "open-btn", "Open…");
+  emptyOpen.addEventListener("click", () => void openViaDialog());
   empty.append(
+    el("div", "app-title empty-brand", "Voyager"),
     el("div", "empty-title", "No file open"),
-    el("div", "empty-hint", "Press ⌘O, click Open…, or double-click a .fits file in Finder"),
+    emptyOpen,
+    el("div", "empty-hint", "or press ⌘O, or double-click a .fits file in Finder"),
   );
 
   const status = el("footer", "status");
@@ -2502,7 +2547,7 @@ function buildUi(): void {
   readout.id = "readout";
   status.append(statusFile, regionInfo, readout);
 
-  root.append(toolbar, empty, content, status);
+  root.append(empty, content, status);
 
   document.addEventListener("keydown", (e) => {
     const t = document.activeElement;
@@ -2553,11 +2598,16 @@ function buildUi(): void {
 
   tableView = new TableView(tablePane, (cells, columns) => void locateRow(cells, columns));
 
-  histPanel = new HistogramPanel(imagePane, (lo, hi) => activeFrame()?.viewer?.setLimits(lo, hi));
+  histPanel = new HistogramPanel(histBox, (lo, hi) => activeFrame()?.viewer?.setLimits(lo, hi), true);
 
   const rp = buildRegionPanel(regionHost, () => showRegionPanel(false));
   imagePane.append(rp.root);
   regionTools = new RegionTools({
+    fit: () => activeFrame()?.viewer?.fit(),
+    grid: () => toggleGrid(),
+    blink: () => toggleBlink(),
+    lock: () => cycleLock(),
+    rgb: () => void openRgbDialog(),
     load: () => void loadRegionsViaDialog(),
     toggleLayers: () => showRegionPanel(must<HTMLElement>("region-panel").style.display === "none"),
     setTool: (tool, shape) => {

@@ -31,18 +31,6 @@ body,
   flex-direction: column;
 }
 
-.toolbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  row-gap: 6px;
-  padding: 8px 12px;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;
-}
-
 .app-title {
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -72,7 +60,6 @@ button:hover {
   border-radius: 6px;
   padding: 4px 10px;
   width: 240px;
-  margin-left: auto;
 }
 
 .filter:focus {
@@ -330,6 +317,14 @@ button:hover {
 
 .header-pane {
   flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.header-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 
@@ -385,6 +380,7 @@ button.active-btn {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
+  flex-direction: column;
 }
 
 .table-view {
@@ -1181,9 +1177,7 @@ table.cards td {
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
-  max-height: calc(100% - 40px);
-  overflow-y: auto;
-  scrollbar-width: none;
+  /* No overflow clipping: the Draw flyout sits outside the bar. */
 }
 
 .rt-btn {
@@ -1218,4 +1212,185 @@ table.cards td {
   height: 1px;
   margin: 3px 2px;
   background: var(--border);
+}
+
+/* ---- layout without the top bar (#22) ---- */
+.side-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 6px;
+}
+
+.side-top .open-btn {
+  padding: 2px 10px;
+}
+
+.side-goto {
+  padding: 2px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.side-goto .goto {
+  width: 100%;
+}
+
+.section-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.section-toggle:hover {
+  color: var(--fg);
+}
+
+.display-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 12px;
+}
+
+.disp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.disp-label {
+  width: 62px;
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.disp-row .control-select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.colorbar {
+  width: 100%;
+  height: 8px;
+  border-radius: 2px;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+}
+
+.disp-hist .hist-inline {
+  position: static;
+  width: 100%;
+  height: 110px;
+}
+
+.limit-input {
+  flex: 1 1 0;
+  min-width: 0;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 5px;
+}
+
+.limit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.disp-dash {
+  color: var(--fg-dim);
+}
+
+.cb-label {
+  flex: 1 1 auto;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.mini-btn {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+/* Controls row at the top of the table / header panes. */
+.pane-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.frame-nav {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  align-self: center;
+  padding-bottom: 4px;
+}
+
+.frame-nav-btn {
+  padding: 1px 7px;
+  font-size: 10px;
+}
+
+.empty-brand {
+  font-size: 22px;
+  margin: 0 0 4px;
+}
+
+/* Tool bar: lock-mode badge and the Draw shape flyout. */
+.rt-btn {
+  position: relative;
+}
+
+.rt-badge {
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.rt-draw {
+  position: relative;
+}
+
+.rt-has-flyout::after {
+  content: "";
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  border: 3px solid transparent;
+  border-right-color: currentColor;
+  border-bottom-color: currentColor;
+  opacity: 0.6;
+}
+
+.rt-flyout {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: -4px;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
 }

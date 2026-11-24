@@ -18,11 +18,12 @@ export class HistogramPanel {
   private generation = 0;
   private dragging: "lo" | "hi" | null = null;
 
-  constructor(container: HTMLElement, onLimits: (lo: number, hi: number) => void) {
+  /** `inline`: embedded in the sidebar Display section, always shown (#22). */
+  constructor(container: HTMLElement, onLimits: (lo: number, hi: number) => void, inline = false) {
     this.onLimits = onLimits;
     this.root = document.createElement("div");
-    this.root.className = "hist-panel";
-    this.root.style.display = "none";
+    this.root.className = inline ? "hist-panel hist-inline" : "hist-panel";
+    if (!inline) this.root.style.display = "none";
     this.canvas = document.createElement("canvas");
     this.canvas.className = "hist-canvas";
     this.root.append(this.canvas);

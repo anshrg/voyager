@@ -1,13 +1,23 @@
-// Region tool bar (issue #20): a slim vertical palette floating on the left
-// edge of the image. Top to bottom: load .reg / Layers panel; pan / select /
-// lasso; draw tools (one per shape); undo / redo / delete.
+// Image tool bar (issues #20, #22): a slim vertical palette floating on the
+// left edge of the image. Top to bottom:
+//   View     fit · grid · blink · lock · RGB…
+//   Regions  load .reg · Layers panel · Draw (shapes fly out to the right)
+//   Edit     pan · select · lasso · undo · redo · delete — only once the frame
+//            has region layers or a draw/select tool is active
 //
 // Pure DOM; main.ts owns the state and passes intents through the host.
 
 import type { CreatableShape } from "./render/regionlayer";
 import type { RegionTool } from "./render/viewer";
 
+export type LockMode = "none" | "wcs" | "pixel";
+
 export interface RegionToolsHost {
+  fit(): void;
+  grid(): void;
+  blink(): void;
+  lock(): void;
+  rgb(): void;
   load(): void;
   toggleLayers(): void;
   setTool(tool: RegionTool, shape: CreatableShape | null): void;
@@ -18,6 +28,11 @@ export interface RegionToolsHost {
 
 /** 18×18 stroke icons (currentColor). */
 const ICONS: Record<string, string> = {
+  fit: '<path d="M2.5 6.5v-4h4M11.5 2.5h4v4M15.5 11.5v4h-4M6.5 15.5h-4v-4"/><rect x="6" y="6" width="6" height="6" rx="1"/>',
+  grid: '<rect x="2.5" y="2.5" width="5.5" height="5.5"/><rect x="10" y="2.5" width="5.5" height="5.5"/><rect x="2.5" y="10" width="5.5" height="5.5"/><rect x="10" y="10" width="5.5" height="5.5"/>',
+  blink: '<path d="M1.5 9s2.8-5 7.5-5 7.5 5 7.5 5-2.8 5-7.5 5-7.5-5-7.5-5z"/><circle cx="9" cy="9" r="2.2"/>',
+  lock: '<rect x="3.5" y="8" width="11" height="8" rx="1.5"/><path d="M6 8V5.5a3 3 0 0 1 6 0V8"/>',
+  rgb: '<circle cx="9" cy="6.3" r="3.6"/><circle cx="6.4" cy="10.9" r="3.6"/><circle cx="11.6" cy="10.9" r="3.6"/>',
   load: '<path d="M2 5.5h5l1.5 1.5H16v8.5H2z"/><path d="M9 13V8.5M7 10.5l2-2 2 2"/>',
   layers: '<path d="M9 2.5 16 6l-7 3.5L2 6z"/><path d="M2 9.5 9 13l7-3.5"/><path d="M2 12.5 9 16l7-3.5"/>',
   pan:
@@ -71,15 +86,36 @@ const EDIT_TIP =
   "Selected polygon: double-click an edge to add a vertex, a vertex to remove it. " +
   "Shift-drag: add to the selection · ⌥-drag or right-drag: pan · Delete removes · ⌘Z/⌘⇧Z undo/redo.";
 
+export interface RegionToolsState {
+  tool: RegionTool;
+  shape: CreatableShape;
+  layersOpen: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  hasSelection: boolean;
+  /** The frame has region layers (shows the edit section). */
+  hasLayers: boolean;
+}
+
 export class RegionTools {
   readonly root: HTMLElement;
   private readonly toolBtns = new Map<string, HTMLButtonElement>();
+  private readonly gridBtn: HTMLButtonElement;
+  private readonly blinkBtn: HTMLButtonElement;
+  private readonly lockBtn: HTMLButtonElement;
+  private readonly lockBadge: HTMLElement;
   private readonly layersBtn: HTMLButtonElement;
+  private readonly drawBtn: HTMLButtonElement;
+  private readonly flyout: HTMLElement;
+  private readonly editSection: HTMLElement;
   private readonly undoBtn: HTMLButtonElement;
   private readonly redoBtn: HTMLButtonElement;
   private readonly deleteBtn: HTMLButtonElement;
+  private readonly host: RegionToolsHost;
+  private state: RegionToolsState | null = null;
 
   constructor(host: RegionToolsHost) {
+    this.host = host;
     this.root = document.createElement("div");
     this.root.className = "region-tools";
     const btn = (name: string, tip: string, onClick: () => void): HTMLButtonElement => {
@@ -97,43 +133,108 @@ export class RegionTools {
       d.className = "rt-sep";
       return d;
     };
-    const tool = (key: string, name: string, tip: string, t: RegionTool, shape: CreatableShape | null): void => {
-      const b = btn(name, tip, () => host.setTool(t, shape));
-      this.toolBtns.set(key, b);
-      this.root.append(b);
-    };
 
+    // View.
+    this.gridBtn = btn("grid", "Grid: tile all image frames (g)", () => host.grid());
+    this.blinkBtn = btn("blink", "Blink: cycle through the image frames (b)", () => host.blink());
+    this.lockBtn = btn("lock", "Lock pan/zoom across frames (click cycles: off → WCS/sky → pixel)", () => host.lock());
+    this.lockBadge = document.createElement("span");
+    this.lockBadge.className = "rt-badge";
+    this.lockBtn.append(this.lockBadge);
     this.root.append(
-      btn("load", "Load DS9 region files (.reg) as new layers (several at once is fine)", () => host.load()),
+      btn("fit", "Fit the image to the window (double-click the image also fits)", () => host.fit()),
+      this.gridBtn,
+      this.blinkBtn,
+      this.lockBtn,
+      btn("rgb", "RGB composite (trilogy or 3-color) from open frames on the same pixel grid", () => host.rgb()),
+      sep(),
     );
+
+    // Regions: load, layers, draw (+ shape flyout).
     this.layersBtn = btn("layers", "Region layers panel: show/hide, recolor, save, close; selected-region properties", () =>
       host.toggleLayers(),
     );
-    this.root.append(this.layersBtn, sep());
-    tool("pan", "pan", "Pan (default): drag pans, click selects a region. No editing.", "pan", null);
-    tool("select", "select", "Select: drag empty space to select every region it touches." + EDIT_TIP, "select", null);
-    tool("lasso", "lasso", "Lasso: draw a loop to select every region it touches." + EDIT_TIP, "lasso", null);
-    this.root.append(sep());
-    for (const { shape, tip } of SHAPES) tool(shape, shape, tip + EDIT_TIP, "draw", shape);
-    this.root.append(sep());
+    this.drawBtn = btn("circle", "", () => this.onDraw());
+    this.drawBtn.classList.add("rt-has-flyout");
+    this.flyout = document.createElement("div");
+    this.flyout.className = "rt-flyout";
+    this.flyout.style.display = "none";
+    for (const { shape, tip } of SHAPES) {
+      const b = btn(shape, tip, () => {
+        this.closeFlyout();
+        host.setTool("draw", shape);
+      });
+      this.toolBtns.set(shape, b);
+      this.flyout.append(b);
+    }
+    const drawWrap = document.createElement("div");
+    drawWrap.className = "rt-draw";
+    drawWrap.append(this.drawBtn, this.flyout);
+    document.addEventListener("pointerdown", (e) => {
+      if (this.flyout.style.display !== "none" && !drawWrap.contains(e.target as Node)) this.closeFlyout();
+    });
+    this.root.append(
+      btn("load", "Load DS9 region files (.reg) as new layers (several at once is fine)", () => host.load()),
+      this.layersBtn,
+      drawWrap,
+    );
+
+    // Edit (only with layers / an active editing tool).
+    this.editSection = document.createElement("div");
+    this.editSection.className = "rt-section";
+    const tool = (key: string, tip: string, t: RegionTool): void => {
+      const b = btn(key, tip, () => host.setTool(t, null));
+      this.toolBtns.set(key, b);
+      this.editSection.append(b);
+    };
+    this.editSection.append(sep());
+    tool("pan", "Pan (default): drag pans, click selects a region. No editing.", "pan");
+    tool("select", "Select: drag empty space to select every region it touches." + EDIT_TIP, "select");
+    tool("lasso", "Lasso: draw a loop to select every region it touches." + EDIT_TIP, "lasso");
     this.undoBtn = btn("undo", "Undo region edit (⌘Z)", () => host.undo());
     this.redoBtn = btn("redo", "Redo region edit (⌘⇧Z)", () => host.redo());
     this.deleteBtn = btn("delete", "Delete the selected region(s) (Delete)", () => host.deleteSelected());
-    this.root.append(this.undoBtn, this.redoBtn, this.deleteBtn);
+    this.editSection.append(sep(), this.undoBtn, this.redoBtn, this.deleteBtn);
+    this.root.append(this.editSection);
+  }
+
+  /** Draw button: activate drawing with the last shape and open the shape
+   *  flyout (a second click closes it). */
+  private onDraw(): void {
+    if (this.flyout.style.display !== "none") {
+      this.closeFlyout();
+      return;
+    }
+    const shape = this.state?.shape ?? "circle";
+    if (this.state?.tool !== "draw") this.host.setTool("draw", shape);
+    this.flyout.style.display = "";
+  }
+
+  private closeFlyout(): void {
+    this.flyout.style.display = "none";
+  }
+
+  /** Reflect the multi-frame view toggles. */
+  syncView(v: { grid: boolean; blink: boolean; lock: LockMode; multi: boolean }): void {
+    this.gridBtn.classList.toggle("on", v.grid);
+    this.blinkBtn.classList.toggle("on", v.blink);
+    this.lockBtn.classList.toggle("on", v.lock !== "none");
+    this.lockBadge.textContent = v.lock === "wcs" ? "sky" : v.lock === "pixel" ? "px" : "";
+    for (const b of [this.gridBtn, this.blinkBtn, this.lockBtn]) b.disabled = !v.multi;
   }
 
   /** Reflect the current tool + panel/undo state. */
-  sync(state: {
-    tool: RegionTool;
-    shape: CreatableShape;
-    layersOpen: boolean;
-    canUndo: boolean;
-    canRedo: boolean;
-    hasSelection: boolean;
-  }): void {
+  sync(state: RegionToolsState): void {
+    this.state = state;
     const key = state.tool === "draw" ? state.shape : state.tool;
     for (const [k, b] of this.toolBtns) b.classList.toggle("on", k === key);
+    // The Draw button wears the current shape's icon.
+    this.drawBtn.replaceChildren(icon(state.shape));
+    this.drawBtn.classList.toggle("on", state.tool === "draw");
+    this.drawBtn.title =
+      `Draw ${state.shape}s (click to pick another shape).` + EDIT_TIP;
     this.layersBtn.classList.toggle("on", state.layersOpen);
+    this.editSection.style.display = state.hasLayers || state.tool !== "pan" ? "" : "none";
     this.undoBtn.disabled = !state.canUndo;
     this.redoBtn.disabled = !state.canRedo;
     this.deleteBtn.disabled = !state.hasSelection;
