@@ -5,6 +5,38 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## Image tool bar + layout without a top bar (issues #20, #22) — user-verified 2026-11-23
+
+There is no top bar any more, so the image starts at the frame tabs.
+- **Sidebar**, top to bottom:
+  - title + Open
+  - goto
+  - view switch (Image | Table | Header, segmented, plus Split)
+  - HDUs
+  - **Display** section for single-band images: colormap + color bar, stretch, scale, inline histogram (`HistogramPanel(…, inline=true)`), typed limits, bias/contrast + reset
+- **Left tool bar** (`src/regiontools.ts`, class `RegionTools`):
+  - View: Fit, Grid, Blink, Lock (badge), RGB
+  - Regions: Load, Layers, Draw. Draw toggles; the shape flyout opens on start.
+  - Edit: Pan/Select/Lasso + undo/redo/delete, only once the frame has layers or a tool ≠ pan
+  - The bar collapses (localStorage `voyager.toolbarCollapsed`).
+- **Elsewhere:** table controls are a `pane-bar` row atop the table pane; the header filter sits atop the header pane; ◀ ▶ are in the frame bar.
+
+Viewer behavior:
+- **Tools:** `setTool(pan|select|lasso|draw)`.
+- **Marquee:** rectangle or lasso, device px. Selection is "any part touching": `regionsTouching` tests sampled screen-space outlines with polygon intersection, after a bbox prefilter. The lasso draws as an open path; filled preview is parked in #21.
+- **Selection box:** a single polygon gets an oriented box with a rotate knob only. `GroupFrame` + `groupAngle`, keyed to the selection.
+- **History:** a `HistoryOp {before, target, angles}` is shared by the undo and redo sides. Undo re-selects `before`; redo re-selects `target`.
+
+RGB composites:
+- Band frames keep display + regions across a composite (`retireViewer` / `restoreSavedView` / `pendingRegions` in main.ts).
+- Band layers are copied onto the composite as "‹band› · ‹layer›".
+
+Layer **⧉ Copy to…**: `transfer_regions` (lib.rs) → `regions::transfer`. Pixel → sky (source WCS) → pixel (target WCS), or a pixel copy with no WCS. Gate: `transfer_between_grids_follows_the_sky` in tests/region_fixtures.rs.
+
+Gotchas:
+- Copied and carried layers have `path = null`, so the target's image/HDU reload drops them, the same as untitled layers.
+- Tool bar buttons `preventDefault` on mousedown so ⌘Z/Delete keep working.
+
 ## Region layers + editing polish (issues #18, #6, #7) — user-verified 2026-11-23
 
 Several .reg files per image as **layers** (`src/regionpanel.ts`, floating
