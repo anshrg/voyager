@@ -483,6 +483,33 @@ fn svd_ellipse(m: [[f64; 2]; 2], input_circular: bool) -> (f64, f64, f64) {
     (out_w, out_h, angle)
 }
 
+/// Copy pixel regions from one image onto another (layer "Copy to…").
+/// With a WCS on both sides each region goes pixel → sky (source WCS) →
+/// pixel (target WCS) — the same conversions as saving in sky frame and
+/// re-loading, so positions, sizes and angles follow the sky. Without a WCS
+/// on either side the pixel coordinates are copied as-is. Returns the
+/// regions, per-region warnings, and whether the sky path was used.
+pub fn transfer(
+    regions: &[PixelRegion],
+    src: Option<&Wcs>,
+    dst: Option<&Wcs>,
+) -> (Vec<PixelRegion>, Vec<String>, bool) {
+    match (src, dst) {
+        (Some(s), Some(d)) => {
+            let mut out = Vec::new();
+            let mut warnings = Vec::new();
+            for (i, pr) in regions.iter().enumerate() {
+                match pr.to_sky_region(s).and_then(|r| r.to_pixel(Some(d))) {
+                    Ok(p) => out.push(p),
+                    Err(e) => warnings.push(format!("region {}: {e}", i + 1)),
+                }
+            }
+            (out, warnings, true)
+        }
+        _ => (regions.to_vec(), Vec::new(), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

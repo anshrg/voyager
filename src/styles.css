@@ -31,18 +31,6 @@ body,
   flex-direction: column;
 }
 
-.toolbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  row-gap: 6px;
-  padding: 8px 12px;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;
-}
-
 .app-title {
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -72,7 +60,6 @@ button:hover {
   border-radius: 6px;
   padding: 4px 10px;
   width: 240px;
-  margin-left: auto;
 }
 
 .filter:focus {
@@ -150,12 +137,11 @@ button:hover {
   min-width: 0;
 }
 
+/* Sidebar view switch: segmented Image | Table | Header, Split apart. */
 .view-tabs {
-  flex: 0 0 auto;
   display: flex;
-  gap: 2px;
-  padding: 6px 12px 0;
-  background: var(--bg-panel);
+  gap: 6px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -187,15 +173,31 @@ button:hover {
 
 .tab {
   border: 1px solid var(--border);
-  border-bottom: none;
-  border-radius: 6px 6px 0 0;
+  border-radius: 6px;
   background: var(--bg);
   color: var(--fg-dim);
-  padding: 4px 16px;
+  padding: 3px 9px;
+  font-size: 12px;
+}
+
+/* Adjacent view buttons fuse into one segmented control. */
+.tab:not(.tab-split) + .tab:not(.tab-split) {
+  margin-left: -7px;
+}
+
+.tab:not(.tab-split):has(+ .tab:not(.tab-split)) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.tab:not(.tab-split) + .tab:not(.tab-split) {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 
 .tab.active {
-  background: var(--bg-hover);
+  position: relative;
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg));
   color: var(--fg);
   border-color: var(--accent);
 }
@@ -330,6 +332,14 @@ button:hover {
 
 .header-pane {
   flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.header-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 
@@ -385,6 +395,7 @@ button.active-btn {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
+  flex-direction: column;
 }
 
 .table-view {
@@ -540,7 +551,7 @@ button.active-btn {
 
 .hist-panel {
   position: absolute;
-  left: 12px;
+  left: 56px; /* clear of the region tool bar */
   bottom: 12px;
   width: 340px;
   height: 120px;
@@ -1009,7 +1020,8 @@ table.cards td {
 
 .rl-row {
   display: grid;
-  grid-template-columns: 16px 16px 1fr 26px auto auto;
+  /* vis · active · name · color · copy · save · close */
+  grid-template-columns: 16px 16px 1fr 26px auto auto auto;
   align-items: center;
   gap: 6px;
   padding: 2px 4px;
@@ -1165,4 +1177,289 @@ table.cards td {
   align-items: center;
   gap: 3px;
   color: var(--fg-dim);
+}
+
+/* ---- region tool bar (#20) ---- */
+.region-tools {
+  position: absolute;
+  top: 28px;
+  left: 8px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  /* No overflow clipping: the Draw flyout sits outside the bar. */
+}
+
+.rt-btn {
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.rt-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+
+.rt-btn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.rt-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.rt-sep {
+  height: 1px;
+  margin: 3px 2px;
+  background: var(--border);
+}
+
+/* ---- layout without the top bar (#22) ---- */
+.side-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 6px;
+}
+
+.side-top .open-btn {
+  padding: 2px 10px;
+}
+
+.side-goto {
+  padding: 2px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.side-goto .goto {
+  width: 100%;
+}
+
+.section-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.section-toggle:hover {
+  color: var(--fg);
+}
+
+.display-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 12px;
+}
+
+.disp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.disp-label {
+  width: 62px;
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.disp-row .control-select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.colorbar {
+  width: 100%;
+  height: 8px;
+  border-radius: 2px;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+}
+
+.disp-hist .hist-inline {
+  position: static;
+  width: 100%;
+  height: 110px;
+}
+
+.limit-input {
+  flex: 1 1 0;
+  min-width: 0;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 5px;
+}
+
+.limit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.disp-dash {
+  color: var(--fg-dim);
+}
+
+.cb-label {
+  flex: 1 1 auto;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.mini-btn {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+/* Controls row at the top of the table / header panes. */
+.pane-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.frame-nav {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  align-self: center;
+  padding-bottom: 4px;
+}
+
+.frame-nav-btn {
+  padding: 1px 7px;
+  font-size: 10px;
+}
+
+.empty-brand {
+  font-size: 22px;
+  margin: 0 0 4px;
+}
+
+/* Tool bar: lock-mode badge and the Draw shape flyout. */
+.rt-btn {
+  position: relative;
+}
+
+.rt-badge {
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.rt-draw {
+  position: relative;
+}
+
+.rt-has-flyout::after {
+  content: "";
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  border: 3px solid transparent;
+  border-right-color: currentColor;
+  border-bottom-color: currentColor;
+  opacity: 0.6;
+}
+
+.rt-flyout {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: -4px;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+/* Tool bar collapse (#22). */
+.rt-collapse {
+  height: 18px;
+  opacity: 0.6;
+}
+
+.rt-collapse:hover {
+  opacity: 1;
+}
+
+.region-tools.collapsed {
+  padding: 2px;
+}
+
+.rt-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Layer "Copy to…" popup. */
+.rl-copy-menu {
+  position: absolute;
+  z-index: 5;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+
+.rl-copy-head {
+  padding: 2px 6px 4px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+.rl-copy-item {
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.rl-copy-item:hover {
+  background: var(--bg-hover);
 }

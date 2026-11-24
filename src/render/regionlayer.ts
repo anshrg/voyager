@@ -47,8 +47,9 @@ export interface RegionHighlight {
   /** All highlighted regions (multi-select). Always includes `selected`. */
   selection?: ReadonlySet<number>;
   edit: boolean;
-  /** Orientation of the multi-selection box (degrees, CCW). */
-  groupAngle?: number;
+  /** Oriented selection box to draw; `corners` false = rotate knob only
+   *  (a single polygon, whose vertices carry their own handles). */
+  group?: { frame: GroupFrame; corners: boolean } | null;
 }
 
 /** Image pixel center (0-based coord p) → device-pixel screen position.
@@ -80,10 +81,10 @@ export function drawRegions(
   if (!regions || regions.length === 0) return;
 
   const project = screenMap(view);
-  // Several regions selected: one bounding box with group handles replaces
-  // the primary's own handles (#7).
-  const group =
-    hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers, hl.groupAngle ?? 0) : null;
+  // Oriented selection box (several regions, or one polygon), computed by the
+  // viewer; with several selected it replaces the primary's own handles.
+  const group = hl?.group ?? null;
+  const multi = (hl?.selection?.size ?? 0) >= 2;
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
@@ -92,7 +93,7 @@ export function drawRegions(
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =
-      hl && i === hl.selected && !group ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
+      hl && i === hl.selected && !multi ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
     ctx.save();
     ctx.strokeStyle = ctx.fillStyle = color;
     ctx.lineWidth = Math.max(1, (reg.width ?? 1) * view.dpr) + (emph ? 1.5 * view.dpr : 0);
@@ -204,7 +205,7 @@ export function drawRegions(
     if (emph === 2 && hl?.edit) drawEditHandles(ctx, reg, view);
     else if (emph === 2 && bbox) drawHandles(ctx, bbox, view.dpr);
   }
-  if (group) drawGroupBox(ctx, group, view, hl?.edit ?? false);
+  if (group) drawGroupBox(ctx, group.frame, view, hl?.edit ?? false, group.corners);
 }
 
 // ---- multi-selection bounding box (#7) -------------------------------------
@@ -308,12 +309,14 @@ export interface GroupHandle {
   corner: number;
 }
 
-export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
+export function groupHandles(g: GroupFrame, view: RegionView, corners = true): GroupHandle[] {
   const project = screenMap(view);
-  const out: GroupHandle[] = boxCorners(g).map(([x, y], corner) => {
-    const [sx, sy] = project(x, y);
-    return { sx, sy, kind: "corner", corner };
-  });
+  const out: GroupHandle[] = corners
+    ? boxCorners(g).map(([x, y], corner) => {
+        const [sx, sy] = project(x, y);
+        return { sx, sy, kind: "corner", corner };
+      })
+    : [];
   // Rotate knob: beyond the middle of the box's (local) top edge.
   const b = g.box;
   const [kx, ky] = frameToImage(g, (b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
@@ -322,10 +325,17 @@ export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
   return out;
 }
 
-export function hitTestGroupHandle(b: GroupFrame, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
+export function hitTestGroupHandle(
+  b: GroupFrame,
+  view: RegionView,
+  mx: number,
+  my: number,
+  corners = true,
+  tol = 7,
+): GroupHandle | null {
   let best: GroupHandle | null = null;
   let bestD = tol * view.dpr;
-  for (const hd of groupHandles(b, view)) {
+  for (const hd of groupHandles(b, view, corners)) {
     const d = Math.hypot(mx - hd.sx, my - hd.sy);
     if (d <= bestD) {
       bestD = d;
@@ -347,7 +357,15 @@ export function groupHandleCursor(g: GroupFrame, hd: GroupHandle, view: RegionVi
   return "nesw-resize";
 }
 
-function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: RegionView, edit: boolean): void {
+function drawGroupBox(
+  ctx: CanvasRenderingContext2D,
+  b: GroupFrame,
+  view: RegionView,
+  edit: boolean,
+  corners: boolean,
+): void {
+  // A lone polygon outside edit mode needs no box (nothing to grab).
+  if (!corners && !edit) return;
   const project = screenMap(view);
   const pts = boxCorners(b).map(([x, y]) => project(x, y));
   ctx.save();
@@ -360,8 +378,8 @@ function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: Region
   ctx.stroke();
   if (edit) {
     // Stem from the top edge to the rotate knob.
-    const hs = groupHandles(b, view);
-    const knob = hs[4];
+    const hs = groupHandles(b, view, corners);
+    const knob = hs[hs.length - 1];
     ctx.beginPath();
     ctx.moveTo((pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2);
     ctx.lineTo(knob.sx, knob.sy);
@@ -370,7 +388,7 @@ function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: Region
     ctx.fillStyle = "#ffffff";
     ctx.strokeStyle = "#000000";
     const s = 3.5 * view.dpr;
-    for (const hd of groupHandles(b, view)) {
+    for (const hd of hs) {
       if (hd.kind === "rot") {
         ctx.beginPath();
         ctx.arc(hd.sx, hd.sy, s + 0.5 * view.dpr, 0, 2 * Math.PI);
@@ -483,55 +501,147 @@ export function regionCenterPx(reg: PixelRegion): [number, number] {
   return [reg.x, reg.y];
 }
 
-/** Indices of regions whose center falls inside the device-px screen rect
- *  (rubber-band select). Corners may be given in any order. */
-export function regionsInRect(
+/** A region's outline in screen (device px) space, as a closed polygon.
+ *  Curves are sampled (48 segments; ≤ 0.2% radius error); a point marker is
+ *  its ~5 px box. Annulus = its outer circle (the hole counts as touching). */
+function screenOutline(reg: PixelRegion, view: RegionView): [number, number][] {
+  const project = screenMap(view);
+  const N = 48;
+  const ring = (cx: number, cy: number, rx: number, ry: number, deg: number): [number, number][] => {
+    const [ux, uy] = axisVectors(deg);
+    const out: [number, number][] = [];
+    for (let k = 0; k < N; k++) {
+      const t = (2 * Math.PI * k) / N;
+      const a = rx * Math.cos(t);
+      const b = ry * Math.sin(t);
+      out.push(project(cx + a * ux[0] + b * uy[0], cy + a * ux[1] + b * uy[1]));
+    }
+    return out;
+  };
+  switch (reg.shape) {
+    case "circle":
+      return ring(reg.x, reg.y, reg.r, reg.r, 0);
+    case "annulus":
+      return ring(reg.x, reg.y, reg.rout, reg.rout, 0);
+    case "ellipse":
+      return ring(reg.x, reg.y, reg.rx, reg.ry, reg.angle);
+    case "box": {
+      const [ux, uy] = axisVectors(reg.angle);
+      const hw = reg.w / 2;
+      const hh = reg.h / 2;
+      return [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ].map(([i, j]) => project(reg.x + i * hw * ux[0] + j * hh * uy[0], reg.y + i * hw * ux[1] + j * hh * uy[1]));
+    }
+    case "polygon":
+      return reg.xs.map((x, i) => project(x, reg.ys[i]));
+    case "point": {
+      const [x, y] = project(reg.x, reg.y);
+      const r = 5 * view.dpr;
+      return [
+        [x - r, y - r],
+        [x + r, y - r],
+        [x + r, y + r],
+        [x - r, y + r],
+      ];
+    }
+  }
+}
+
+function polyBox(p: readonly [number, number][]): [number, number, number, number] {
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const [x, y] of p) {
+    x0 = Math.min(x0, x);
+    y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x);
+    y1 = Math.max(y1, y);
+  }
+  return [x0, y0, x1, y1];
+}
+
+function inPoly(x: number, y: number, p: readonly [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    const [xi, yi] = p[i];
+    const [xj, yj] = p[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function segmentsCross(
+  a: [number, number],
+  b: [number, number],
+  c: [number, number],
+  d: [number, number],
+): boolean {
+  const o = (p: [number, number], q: [number, number], r: [number, number]): number =>
+    Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+  return o(a, b, c) !== o(a, b, d) && o(c, d, a) !== o(c, d, b);
+}
+
+/** Whether two closed polygons overlap at all: a vertex of either inside the
+ *  other, or any pair of edges crossing. */
+function polysTouch(a: readonly [number, number][], b: readonly [number, number][]): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  if (inPoly(a[0][0], a[0][1], b) || inPoly(b[0][0], b[0][1], a)) return true;
+  for (let i = 0, j = a.length - 1; i < a.length; j = i++) {
+    for (let k = 0, l = b.length - 1; k < b.length; l = k++) {
+      if (segmentsCross(a[j], a[i], b[l], b[k])) return true;
+    }
+  }
+  return false;
+}
+
+/** Indices of visible regions that any part of touches the screen-space
+ *  (device px) selection polygon — a rectangle or a freehand lasso. A
+ *  bounding-box test skips far regions; the exact test only runs on release. */
+export function regionsTouching(
   regions: readonly PixelRegion[],
   view: RegionView,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
+  sel: readonly [number, number][],
   layers?: LayerStyle,
 ): number[] {
-  const project = screenMap(view);
-  const lox = Math.min(x0, x1);
-  const hix = Math.max(x0, x1);
-  const loy = Math.min(y0, y1);
-  const hiy = Math.max(y0, y1);
+  if (sel.length < 3) return [];
+  const sb = polyBox(sel);
   const out: number[] = [];
   for (let i = 0; i < regions.length; i++) {
     if (!regionShown(regions[i], layers)) continue;
-    const [cx, cy] = regionCenterPx(regions[i]);
-    const [sx, sy] = project(cx, cy);
-    if (sx >= lox && sx <= hix && sy >= loy && sy <= hiy) out.push(i);
+    const o = screenOutline(regions[i], view);
+    const rb = polyBox(o);
+    if (rb[2] < sb[0] || rb[0] > sb[2] || rb[3] < sb[1] || rb[1] > sb[3]) continue;
+    if (polysTouch(o, sel)) out.push(i);
   }
   return out;
 }
 
-/** Draw the rubber-band selection rectangle (device px), without clearing —
- *  call after drawRegions. */
-export function drawRubberBand(
+/** Draw a selection marquee (device px) without clearing — call after
+ *  drawRegions. A rectangle is closed and tinted; a lasso is just the open
+ *  path traced so far (like Photoshop — no fill, no closing segment back to
+ *  the start; a filled preview is a parked preference, see BACKLOG). */
+export function drawMarquee(
   canvas: HTMLCanvasElement,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
+  pts: readonly [number, number][],
   dpr: number,
+  closed: boolean,
 ): void {
   const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const x = Math.min(x0, x1);
-  const y = Math.min(y0, y1);
-  const w = Math.abs(x1 - x0);
-  const h = Math.abs(y1 - y0);
+  if (!ctx || pts.length < 2) return;
   ctx.save();
   ctx.strokeStyle = "#5aa7ff";
   ctx.fillStyle = "rgba(90, 167, 255, 0.12)";
   ctx.lineWidth = dpr;
   ctx.setLineDash([4 * dpr, 3 * dpr]);
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeRect(x, y, w, h);
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+  if (closed) {
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -753,6 +863,8 @@ function drawMarker(
       break;
     default: // "boxcircle" (DS9 default) and anything unrecognized
       ctx.rect(x - r, y - r, 2 * r, 2 * r);
+      // Lift the pen: without it the path joins the box corner to the circle.
+      ctx.moveTo(x + r * 0.6, y);
       ctx.arc(x, y, r * 0.6, 0, 2 * Math.PI);
       break;
   }

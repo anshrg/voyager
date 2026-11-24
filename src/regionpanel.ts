@@ -36,6 +36,10 @@ export interface RegionPanelHost {
    *  identified by `session`). */
   setColor(id: number, color: string, session: number): void;
   save(id: number): void;
+  /** Other open image frames a layer can be copied onto. */
+  copyTargets(): { key: number; name: string }[];
+  /** Copy a layer onto those frames (sky-matched when both have a WCS). */
+  copyTo(id: number, targets: number[]): void;
   close(id: number): void;
   load(): void;
   newLayer(): void;
@@ -126,6 +130,13 @@ export function renderRegionLayers(
       session = nextPickerSession();
     });
 
+    const copy = el("button", "rl-btn", "⧉");
+    copy.title = "Copy this layer onto other open images (matched on the sky when both have a WCS)";
+    copy.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openCopyMenu(copy, l.id, host);
+    });
+
     const save = el("button", "rl-btn", "Save");
     save.title = "Save this layer as a .reg file (frame from the selector below)";
     save.addEventListener("click", () => host.save(l.id));
@@ -133,9 +144,46 @@ export function renderRegionLayers(
     close.title = "Remove this layer (unsaved edits are lost)";
     close.addEventListener("click", () => host.close(l.id));
 
-    row.append(vis, act, name, color, save, close);
+    row.append(vis, act, name, color, copy, save, close);
     root.append(row);
   }
+}
+
+/** Small popup under a layer's ⧉ button: one entry per other image frame,
+ *  plus "All images". Closes on pick or outside click. */
+function openCopyMenu(anchor: HTMLElement, id: number, host: RegionPanelHost): void {
+  document.querySelector(".rl-copy-menu")?.remove();
+  const targets = host.copyTargets();
+  const menu = el("div", "rl-copy-menu");
+  const head = el("div", "rl-copy-head", "Copy layer to");
+  menu.append(head);
+  if (targets.length === 0) {
+    menu.append(el("div", "rl-dim", "no other image frames open"));
+  } else {
+    const item = (label: string, keys: number[]): void => {
+      const b = el("button", "rl-copy-item", label);
+      b.addEventListener("click", () => {
+        menu.remove();
+        host.copyTo(id, keys);
+      });
+      menu.append(b);
+    };
+    for (const t of targets) item(t.name, [t.key]);
+    if (targets.length > 1) item(`All ${targets.length} images`, targets.map((t) => t.key));
+  }
+  const panel = anchor.closest(".region-panel") ?? document.body;
+  panel.append(menu);
+  const a = anchor.getBoundingClientRect();
+  const p = panel.getBoundingClientRect();
+  menu.style.top = `${a.bottom - p.top + 4}px`;
+  menu.style.right = `${p.right - a.right}px`;
+  const close = (e: PointerEvent): void => {
+    if (!menu.contains(e.target as Node)) {
+      menu.remove();
+      document.removeEventListener("pointerdown", close, true);
+    }
+  };
+  setTimeout(() => document.addEventListener("pointerdown", close, true));
 }
 
 /** The static panel chrome (title, list body, footer); returns the body to
