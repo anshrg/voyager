@@ -150,9 +150,13 @@ anything. Promote items into a milestone deliberately, not casually.
 
 ## RGB composites v2 (from #14, shipped 2026-11-23)
 
-- **Mismatched pixel grids**: GPU reprojection so bands on different grids
-  composite (NIRCam 0.03″ + MIRI 0.11″, HST + JWST). Today the dialog greys
-  them out with the reason (`gridMismatch` in src/render/trilogy.ts).
+- ~~**Mismatched pixel grids**~~ **done (branch rgb-reproject)**: GPU mesh
+  warp through both WCSs (src/render/warp.ts). Follow-ups:
+  - **Bilinear sampling** toggle for reprojected bands (manual 4-tap in the
+    band pass; needs a 1-px tile apron or neighbor-tile fetch to avoid seams).
+  - **SIP distortion** support (today SIP-flagged WCSs are refused).
+  - **Change the reference grid** of an existing composite (today: dialog only).
+  - **PSF matching** (MIRI vs NIRCam halos) — a science step; probably out of scope.
 - **Save the composite to a file** (optional): PNG of the current view and/or
   a full-resolution render.
 - **Reset to defaults** button (next to ✦ rainbow, separate from it): restore

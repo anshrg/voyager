@@ -54,6 +54,9 @@ pub struct WcsParams {
     pub cd_inv: [[f64; 2]; 2],
     pub lonpole: f64,
     pub swapped: bool,
+    /// CTYPE had -SIP but the distortion is not applied (pixel positions can
+    /// be off by up to a few px) — RGB reprojection refuses such bands.
+    pub sip_ignored: bool,
 }
 
 /// Axis classification from the first 4 chars of CTYPEn.
@@ -225,6 +228,7 @@ impl Wcs {
             cd_inv: self.cd_inv,
             lonpole: self.lonpole,
             swapped: self.swapped,
+            sip_ignored: self.sip_ignored,
         }
     }
 }

@@ -21,6 +21,7 @@ import {
   type TrilogyStats,
 } from "./render/trilogy";
 import type { CompositeDisplay, CompositeSource } from "./render/viewer";
+import type { Wcs } from "./render/wcs";
 
 export type RgbMode = "trilogy" | "simple";
 
@@ -35,6 +36,11 @@ export interface RgbBand<F> {
   stats: TrilogyStats | null;
   zscale: [number, number] | null;
   bunit: string | null;
+  /** The band's own pixel grid (it may differ from the composite's
+   *  reference grid; the viewer then reprojects it through the WCSs). */
+  nx: number;
+  ny: number;
+  wcs: Wcs | null;
   /** Participates in the trilogy mix. */
   include: boolean;
   weight: BandWeight;
@@ -54,8 +60,11 @@ export interface RgbState<F> {
   /** The user hand-edited a weight since the last rainbow spread; a band
    *  reorder then keeps weights instead of re-spreading the rainbow. */
   customWeights: boolean;
+  /** The reference pixel grid the composite is drawn on (finest band by
+   *  default); its frame's file/HDU is the composite frame's. */
   nx: number;
   ny: number;
+  wcs: Wcs | null;
 }
 
 /** Build the initial state for bands already sorted blue → red. */
@@ -63,6 +72,7 @@ export function initialRgbState<F>(
   bands: Omit<RgbBand<F>, "include" | "weight">[],
   nx: number,
   ny: number,
+  wcs: Wcs | null,
 ): RgbState<F> {
   const usable = bands.filter((b) => b.stats !== null).length;
   const n = bands.length;
@@ -82,6 +92,7 @@ export function initialRgbState<F>(
     customWeights: false,
     nx,
     ny,
+    wcs,
   };
   resetSimpleLimits(state);
   return state;
@@ -132,7 +143,7 @@ export function compositeDraw<F>(s: RgbState<F>): { sources: CompositeSource[]; 
     for (const b of s.bands) {
       if (!b.include || !b.stats) continue;
       const lv = trilogyLevels(b.stats, s.params);
-      sources.push({ path: b.path, hdu: b.hdu, label: b.label });
+      sources.push({ path: b.path, hdu: b.hdu, label: b.label, nx: b.nx, ny: b.ny, wcs: b.wcs });
       bands.push({ lo: lv.x0, hi: lv.x2, k: lv.k, weight: [...b.weight] });
     }
   } else {
@@ -148,7 +159,7 @@ export function compositeDraw<F>(s: RgbState<F>): { sources: CompositeSource[]; 
       if (at >= 0) {
         for (let c = 0; c < 3; c++) bands[at].weight[c] += w[c];
       } else {
-        sources.push({ path: b.path, hdu: b.hdu, label: b.label });
+        sources.push({ path: b.path, hdu: b.hdu, label: b.label, nx: b.nx, ny: b.ny, wcs: b.wcs });
         bands.push({ lo: s.simple.lo, hi: s.simple.hi, k: 0, weight: [...w] });
       }
     }

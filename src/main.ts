@@ -8,7 +8,7 @@ import {
   onOpenRequest,
   openFits,
   parseCoord,
-  pickFitsFile,
+  pickFitsFiles,
   pickFitsSavePath,
   pickRegionFiles,
   pickRegionSavePath,
@@ -36,7 +36,8 @@ import { HistogramPanel } from "./render/histogram";
 import { TableView } from "./render/table";
 import { COLORMAPS, STRETCHES, Viewer, type RegionTool, type Stretch } from "./render/viewer";
 import { Wcs } from "./render/wcs";
-import { MAX_BANDS, gridMismatch } from "./render/trilogy";
+import { MAX_BANDS } from "./render/trilogy";
+import { gridMapFor } from "./render/warp";
 import {
   buildRegionPanel,
   newLayer,
@@ -87,8 +88,9 @@ interface Frame {
    *  indices refer to the frame's table HDU. null = auto-detect by name. */
   posOverride: PosOverride | null;
   /** RGB composite frame: its bands + display state. Its `file`/HDU are the
-   *  reference band's (same grid), so WCS, lock, regions, goto and overlays
-   *  work unchanged. null = an ordinary file frame. */
+   *  reference band's (the grid it's drawn on; other bands are reprojected
+   *  onto it), so WCS, lock, regions, goto and overlays work unchanged.
+   *  null = an ordinary file frame. */
   composite: RgbState<Frame> | null;
   /** Band frame folded into this composite: hidden from the frame bar, grid,
    *  and cycling unless the composite chip is expanded. Kept open — the
@@ -1159,8 +1161,9 @@ async function loadFrameImage(frame: Frame): Promise<void> {
     frame.viewer.setTool(frame === activeFrame() ? regionTool : "pan");
     frame.viewer.setCreateShape(createShape);
     if (frame.composite) {
-      const { sources, display } = compositeDraw(frame.composite);
-      frame.viewer.setComposite(sources, frame.composite.nx, frame.composite.ny);
+      const c = frame.composite;
+      const { sources, display } = compositeDraw(c);
+      frame.viewer.setComposite(sources, { path: frame.file.path, hdu: imgHdu, nx: c.nx, ny: c.ny, wcs: c.wcs });
       frame.viewer.setCompositeDisplay(display);
     } else {
       await frame.viewer.setImage(frame.file.path, imgHdu, hdu.shape[0], hdu.shape[1]);
@@ -1494,40 +1497,91 @@ async function openRgbDialog(): Promise<void> {
     cands.push({ frame: f, hdu, nx: info.shape[0], ny: info.shape[1], wcs, band, label, reason: null });
   }
   if (cands.length < 2) {
-    readout.textContent = "RGB needs at least 2 open image frames of the same field (same pixel grid)";
+    readout.textContent = "RGB needs at least 2 open image frames";
     return;
   }
-  const act = activeFrame();
-  const ref = cands.find((c) => c.frame === act || c.frame === act?.hiddenBy) ?? cands[0];
-  for (const c of cands) c.reason = c === ref ? null : gridMismatch(ref, c);
   // Blue → red, unrecognized filters last (stable for ties).
   cands.sort((a, b) => (a.band?.pivot_um ?? Infinity) - (b.band?.pivot_um ?? Infinity));
   rgbCandidates = cands;
+  // Reference grid: start from the active image, then take the finest pixel
+  // scale among the frames that can join it (overlapping sky, usable WCS) —
+  // ties keep the active frame, then the bluest. Bands on other grids are
+  // reprojected onto it. Frames elsewhere on the sky never steal it.
+  const act = activeFrame();
+  const start = cands.find((c) => c.frame === act || c.frame === act?.hiddenBy) ?? cands[0];
+  let ref = start;
+  for (const c of cands) {
+    if (c !== start && typeof gridMapFor(start, c) === "string") continue;
+    const sc = c.wcs?.pixScale();
+    const sr = ref.wcs?.pixScale();
+    if (sc !== undefined && (sr === undefined || sc < sr * (1 - 1e-6))) ref = c;
+  }
+  const sel = must<HTMLSelectElement>("rgb-ref-select");
+  sel.replaceChildren(
+    ...cands.map((c, i) => {
+      const o = el("option", "", `${c.label} · ${gridLabel(c)}`);
+      o.value = String(i);
+      return o;
+    }),
+  );
+  sel.value = String(cands.indexOf(ref));
 
   const list = must<HTMLElement>("rgb-dialog-list");
   list.replaceChildren();
-  let ticked = 0;
   cands.forEach((c, i) => {
     const row = el("label", "rgb-cand");
     const cb = el("input");
     cb.type = "checkbox";
     cb.id = `rgb-cand-${i}`;
-    cb.disabled = c.reason !== null;
-    cb.checked = c.reason === null && ticked < MAX_BANDS;
-    if (cb.checked) ticked++;
+    cb.addEventListener("change", refreshRgbDialog);
     const name = el("span", "rgb-cand-label", c.label);
     const file = el("span", "rgb-cand-file", displayName(c.frame.file.path));
     file.title = c.frame.file.path;
-    const st = el("span", c.reason ? "rgb-cand-bad" : "rgb-cand-ok", c === ref ? "reference grid" : c.reason ?? "same grid");
+    const st = el("span", "rgb-cand-ok");
+    st.id = `rgb-cand-st-${i}`;
     row.append(cb, name, file, st);
     list.append(row);
   });
-  const bad = cands.filter((c) => c.reason).length;
-  must<HTMLElement>("rgb-dialog-status").textContent =
-    `${cands.length - bad} of ${cands.length} frames share ${ref.label}'s ${ref.nx}×${ref.ny} grid` +
-    (bad > 0 ? " (mismatched grids need reprojection — not supported yet)" : "") +
-    (ticked >= MAX_BANDS ? ` · at most ${MAX_BANDS} bands` : "");
+  refreshRgbDialog(true);
   must<HTMLElement>("rgb-dialog").style.display = "";
+}
+
+/** "30 mas" (pixel scale) or the size when there's no WCS. */
+function gridLabel(c: { nx: number; ny: number; wcs: Wcs | null }): string {
+  return c.wcs ? `${Math.round(c.wcs.pixScale() * 3.6e6 * 10) / 10} mas` : `${c.nx}×${c.ny} px, no WCS`;
+}
+
+/** Re-derive each candidate's status against the chosen reference grid:
+ *  same grid, reprojected, or disabled with the reason. `initial` ticks every
+ *  band that can join (≤ MAX_BANDS); later calls keep the user's ticks. */
+function refreshRgbDialog(initial: boolean | Event = false): void {
+  const sel = must<HTMLSelectElement>("rgb-ref-select");
+  const ref = rgbCandidates[Number(sel.value)];
+  if (!ref) return;
+  let ticked = 0;
+  let warped = 0;
+  let bad = 0;
+  rgbCandidates.forEach((c, i) => {
+    const cb = must<HTMLInputElement>(`rgb-cand-${i}`);
+    const st = must<HTMLElement>(`rgb-cand-st-${i}`);
+    const m = c === ref ? null : gridMapFor(ref, c);
+    c.reason = typeof m === "string" ? m : null;
+    cb.disabled = c.reason !== null;
+    if (c.reason !== null) cb.checked = false;
+    else if (initial === true) cb.checked = ticked < MAX_BANDS;
+    if (c === ref) cb.checked = true;
+    if (cb.checked) ticked++;
+    if (c.reason !== null) bad++;
+    const reproj = m !== null && typeof m !== "string" && !m.identity;
+    if (reproj && cb.checked) warped++;
+    st.className = c.reason ? "rgb-cand-bad" : "rgb-cand-ok";
+    st.textContent =
+      c === ref ? `reference · ${gridLabel(c)}` : c.reason ?? (reproj ? `reprojected · ${gridLabel(c)}` : "same grid");
+  });
+  must<HTMLElement>("rgb-dialog-status").textContent =
+    `${rgbCandidates.length - bad} of ${rgbCandidates.length} frames can join ${ref.label}'s grid` +
+    (warped > 0 ? ` · ${warped} reprojected (nearest pixel)` : "") +
+    (ticked > MAX_BANDS ? ` · at most ${MAX_BANDS} bands` : "");
 }
 
 /** Build the composite from the ticked bands: sample each band's stats
@@ -1536,8 +1590,13 @@ async function openRgbDialog(): Promise<void> {
 async function createComposite(): Promise<void> {
   const statusEl = must<HTMLElement>("rgb-dialog-status");
   const chosen = rgbCandidates.filter(
-    (_, i) => (document.getElementById(`rgb-cand-${i}`) as HTMLInputElement | null)?.checked,
+    (c, i) => c.reason === null && (document.getElementById(`rgb-cand-${i}`) as HTMLInputElement | null)?.checked,
   );
+  const ref = rgbCandidates[Number(must<HTMLSelectElement>("rgb-ref-select").value)];
+  if (!ref || !chosen.includes(ref)) {
+    statusEl.textContent = "the reference band must be one of the ticked bands";
+    return;
+  }
   if (chosen.length === 0) {
     statusEl.textContent = "tick at least one band";
     return;
@@ -1560,14 +1619,17 @@ async function createComposite(): Promise<void> {
       stats: infos[i].stats,
       zscale: infos[i].zscale,
       bunit: infos[i].bunit,
+      nx: c.nx,
+      ny: c.ny,
+      wcs: c.wcs,
     }));
     if (bands.every((b) => b.stats === null && b.zscale === null)) {
       statusEl.textContent = "the chosen bands have no usable (finite, non-constant) pixels";
       return;
     }
-    const state = initialRgbState(bands, chosen[0].nx, chosen[0].ny);
+    const state = initialRgbState(bands, ref.nx, ref.ny, ref.wcs);
     must<HTMLElement>("rgb-dialog").style.display = "none";
-    await addFrame(chosen[0].frame.file, { composite: state, hdu: chosen[0].hdu });
+    await addFrame(ref.frame.file, { composite: state, hdu: ref.hdu });
     const units = distinctUnits(state);
     if (units.length > 1) {
       must<HTMLElement>("readout").textContent = `⚠ RGB bands have different units: ${units.join(", ")}`;
@@ -2227,16 +2289,32 @@ async function addFrame(
       // keeping its settings + regions; rebuilt lazily (ensureViewer) if the
       // composite is expanded or closed.
       retireViewer(b.frame);
-      // Paint the band's region layers onto the composite too: every band is
-      // on the composite's pixel grid, so pixel regions carry over 1:1. The
-      // composite gets copies ("F444W · sources.reg"); edits don't flow back.
+      // Paint the band's region layers onto the composite too. The composite
+      // gets copies ("F444W · sources.reg"); edits don't flow back. A band on
+      // the reference grid carries pixel regions 1:1; a reprojected band's go
+      // through the sky (as layer "Copy to…").
       const regs = b.frame.pendingRegions ?? [];
+      const ref = { nx: rgb.composite.nx, ny: rgb.composite.ny, wcs: rgb.composite.wcs };
+      const m = gridMapFor(ref, b);
+      const sameGrid = typeof m !== "string" && m.identity;
       for (const l of b.frame.regionLayers) {
         const copy = newLayer(`${b.label} · ${l.name}`, null);
         copy.visible = l.visible;
         copy.warnings = l.warnings;
         frame.regionLayers.push(copy);
-        for (const r of regs) if (r.layer === l.id) carried.push({ ...structuredClone(r), layer: copy.id });
+        const mine = regs.filter((r) => r.layer === l.id);
+        if (sameGrid) {
+          for (const r of mine) carried.push({ ...structuredClone(r), layer: copy.id });
+          continue;
+        }
+        try {
+          const plain = mine.map(({ layer: _l, ...r }) => r as PixelRegion);
+          const res = await transferRegions(b.path, b.hdu, file.path, rgb.hdu, plain);
+          copy.warnings = [...copy.warnings, ...res.warnings];
+          for (const r of res.regions) carried.push({ ...r, layer: copy.id });
+        } catch (err) {
+          copy.warnings = [...copy.warnings, `couldn't reproject from ${b.label}: ${String(err)}`];
+        }
       }
     }
     if (frame.regionLayers.length > 0) {
@@ -2323,8 +2401,8 @@ async function closeFrame(i: number): Promise<void> {
 }
 
 async function openViaDialog(): Promise<void> {
-  const path = await pickFitsFile();
-  if (path) await openPath(path);
+  // One at a time, in the dialog's order; the last one ends up active.
+  for (const path of await pickFitsFiles()) await openPath(path);
 }
 
 function makeSelect(
@@ -2602,13 +2680,19 @@ function buildUi(): void {
   const rgbDialog = el("div", "match-panel");
   rgbDialog.id = "rgb-dialog";
   rgbDialog.style.display = "none";
-  const rdTitle = el("div", "match-title", "RGB composite — bands on one pixel grid");
+  const rdTitle = el("div", "match-title", "RGB composite");
   const rdClose = el("button", "match-close", "×");
   rdClose.title = "Close";
   rdClose.addEventListener("click", () => {
     rgbDialog.style.display = "none";
   });
   rdTitle.append(rdClose);
+  const rdRef = el("label", "match-row", "Reference grid ");
+  rdRef.title = "The pixel grid the composite is drawn on (WCS, regions, readout). Bands on other grids are reprojected onto it.";
+  const rdRefSel = el("select");
+  rdRefSel.id = "rgb-ref-select";
+  rdRefSel.addEventListener("change", () => refreshRgbDialog());
+  rdRef.append(rdRefSel);
   const rdList = el("div", "rgb-cand-list");
   rdList.id = "rgb-dialog-list";
   const rdRow = el("div", "match-row");
@@ -2618,7 +2702,7 @@ function buildUi(): void {
   rdRow.append(rdCreate);
   const rdStatus = el("div", "match-status");
   rdStatus.id = "rgb-dialog-status";
-  rgbDialog.append(rdTitle, rdList, rdRow, rdStatus);
+  rgbDialog.append(rdTitle, rdRef, rdList, rdRow, rdStatus);
   document.body.append(rgbDialog);
 
   const content = el("div", "content");

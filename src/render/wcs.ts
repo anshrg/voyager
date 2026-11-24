@@ -82,6 +82,12 @@ export class Wcs {
     const cd = this.p.cd;
     return Math.sqrt(Math.abs(cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0]));
   }
+
+  /** CTYPE carried -SIP but the distortion is not applied (positions can be
+   *  off by a few px), so this WCS isn't trusted for reprojection. */
+  sipIgnored(): boolean {
+    return this.p.sip_ignored === true;
+  }
 }
 
 function clamp(v: number, lo: number, hi: number): number {
