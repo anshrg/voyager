@@ -9,7 +9,9 @@
 
 Composites now accept bands on different grids (NIRCam 30 mas + MIRI 60 mas, rotated, offset tangent points). No pixels are resampled on the CPU.
 
-- **Reference grid**: the RGB dialog has a "Reference grid" select. The default is the finest pixel scale (ties → active frame, then bluest), and it must be a ticked band. The composite frame's file/HDU is the reference's, so WCS, lock, regions, goto and overlays are unchanged. Rows show "reference · 30 mas" / "same grid" / "reprojected · 60 mas" / the reason a band can't join.
+- **Reference grid**: the RGB dialog has a "Reference grid" select. The default starts from the active image and takes the finest pixel scale among frames that can join it (overlapping sky, usable WCS); ties keep the active frame, then the bluest. It must be a ticked band. Frames with no sky overlap show "no sky overlap" and can't be ticked (`footprintsOverlap` in warp.ts).
+- **Zero-fill padding**: `rgb::trilogy_stats` drops exact zeros when they're > 5% of the sample (`ZERO_FILL_FRACTION`). GOODS-N NIRCam mosaics are ~75% 0.0 padding, which had put median/MAD at 0 and locked those bands out of trilogy. The padding still draws as dark sky in the composite.
+- **Open** now takes several FITS files at once (`pickFitsFiles`); they open in dialog order and the last one is active. The composite frame's file/HDU is the reference's, so WCS, lock, regions, goto and overlays are unchanged. Rows show "reference · 30 mas" / "same grid" / "reprojected · 60 mas" / the reason a band can't join.
 - **Geometry** (`src/render/warp.ts`, pure):
   - `gridMapFor(ref, band)` → `IDENTITY_MAP` (co-gridded, per `gridMismatch`), a `WcsWarp` (ref pixel → sky → band pixel through both TAN WCSs), or a reason string (no WCS, or SIP ignored: `WcsParams.sip_ignored` is new).
   - `tileMesh` places a 9×9 vertex mesh per band tile exactly through the WCS. The linear interpolation in between is ≤ 1.4e-3 px even with a tangent point 0.5° away (most of that is float32 storage).

@@ -469,14 +469,16 @@ export function onOpenRequest(handler: (path: string) => void): Promise<Unlisten
   return listen<string>("voyager://open-request", (e) => handler(e.payload));
 }
 
-export async function pickFitsFile(): Promise<string | null> {
+/** Pick one or more FITS files (⌘/⇧-click in the dialog for several). */
+export async function pickFitsFiles(): Promise<string[]> {
   const selected = await openDialog({
-    multiple: false,
+    multiple: true,
     directory: false,
     filters: [
       { name: "FITS", extensions: ["fits", "fit", "fts", "fits.gz", "fits.fz"] },
       { name: "All files", extensions: ["*"] },
     ],
   });
-  return typeof selected === "string" ? selected : null;
+  if (selected === null) return [];
+  return Array.isArray(selected) ? selected : [selected];
 }

@@ -8,7 +8,7 @@ import {
   onOpenRequest,
   openFits,
   parseCoord,
-  pickFitsFile,
+  pickFitsFiles,
   pickFitsSavePath,
   pickRegionFiles,
   pickRegionSavePath,
@@ -1503,12 +1503,15 @@ async function openRgbDialog(): Promise<void> {
   // Blue → red, unrecognized filters last (stable for ties).
   cands.sort((a, b) => (a.band?.pivot_um ?? Infinity) - (b.band?.pivot_um ?? Infinity));
   rgbCandidates = cands;
-  // Reference grid: the finest pixel scale (ties → the active frame, then
-  // the bluest). Bands on other grids are reprojected onto it.
+  // Reference grid: start from the active image, then take the finest pixel
+  // scale among the frames that can join it (overlapping sky, usable WCS) —
+  // ties keep the active frame, then the bluest. Bands on other grids are
+  // reprojected onto it. Frames elsewhere on the sky never steal it.
   const act = activeFrame();
-  const isAct = (c: RgbCandidate): boolean => c.frame === act || c.frame === act?.hiddenBy;
-  let ref = cands.find(isAct) ?? cands[0];
+  const start = cands.find((c) => c.frame === act || c.frame === act?.hiddenBy) ?? cands[0];
+  let ref = start;
   for (const c of cands) {
+    if (c !== start && typeof gridMapFor(start, c) === "string") continue;
     const sc = c.wcs?.pixScale();
     const sr = ref.wcs?.pixScale();
     if (sc !== undefined && (sr === undefined || sc < sr * (1 - 1e-6))) ref = c;
@@ -2398,8 +2401,8 @@ async function closeFrame(i: number): Promise<void> {
 }
 
 async function openViaDialog(): Promise<void> {
-  const path = await pickFitsFile();
-  if (path) await openPath(path);
+  // One at a time, in the dialog's order; the last one ends up active.
+  for (const path of await pickFitsFiles()) await openPath(path);
 }
 
 function makeSelect(
