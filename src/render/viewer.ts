@@ -1182,7 +1182,9 @@ export class Viewer {
         const text = this.sources
           ? rs.map((ri, i) => `${srcs[i].label} ${fmt(ri.value)}`).join(" · ")
           : fmt(r.value);
-        this.lastSky = r.sky ?? "";
+        // Sexagesimal, then decimal degrees (6 dp ≈ 4 mas) for copy-paste.
+        this.lastSky =
+          r.sky && r.ra !== null && r.dec !== null ? `${r.sky}  ${r.ra.toFixed(6)} ${r.dec.toFixed(6)}` : (r.sky ?? "");
         this.callbacks.onReadout({ x: x + 1, y: y + 1, value: text, sky: this.lastSky });
       }
     } catch {

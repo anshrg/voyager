@@ -907,6 +907,11 @@ function syncRegionTools(): void {
   });
 }
 
+/** Typographic minus/dashes → ASCII hyphen-minus. */
+function asciiMinus(t: string): string {
+  return t.replace(/[\u2212\u2012\u2013\u2014\uFE63\uFF0D]/g, "-");
+}
+
 /** Typed limit fields (Display section); a focused field isn't overwritten. */
 function showLimits(lo: number, hi: number): void {
   for (const [id, v] of [
@@ -1038,10 +1043,12 @@ function makeViewer(frame: Frame): Viewer {
       // A pinned readout belongs to its frame: other frames' hovers (grid
       // mode) don't overwrite it.
       if (pinnedFrame && frame !== pinnedFrame) return;
-      must<HTMLElement>("readout").textContent =
+      // Plain ASCII "-" for every minus sign (copy-paste into code/catalogs).
+      must<HTMLElement>("readout").textContent = asciiMinus(
         info.x === null
           ? ""
-          : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`;
+          : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`,
+      );
     },
     onPin: (pinned) => {
       if (!pinned && pinnedFrame !== frame) return;
