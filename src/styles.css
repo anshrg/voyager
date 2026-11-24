@@ -1020,7 +1020,8 @@ table.cards td {
 
 .rl-row {
   display: grid;
-  grid-template-columns: 16px 16px 1fr 26px auto auto;
+  /* vis · active · name · color · copy · save · close */
+  grid-template-columns: 16px 16px 1fr 26px auto auto auto;
   align-items: center;
   gap: 6px;
   padding: 2px 4px;
