@@ -2459,6 +2459,8 @@ function buildUi(): void {
   hduList.id = "hdu-list";
   const sideGoto = el("div", "side-goto");
   sideGoto.append(gotoBox);
+  // View switch (Image / Table / Header + Split) lives in the sidebar as a
+  // segmented control rather than tabs over the image (#22).
   sidebar.append(sideTop, sideGoto, sidebarHead, hduList, display);
 
   const main = el("main", "main");
@@ -2485,6 +2487,7 @@ function buildUi(): void {
   splitBtn.style.display = "none";
   splitBtn.addEventListener("click", () => void toggleSplit());
   tabs.append(splitBtn);
+  sideGoto.after(tabs);
 
   const imagePane = el("div", "image-pane");
   imagePane.id = "image-pane";
@@ -2521,7 +2524,7 @@ function buildUi(): void {
   const viewPanes = el("div", "view-panes");
   viewPanes.id = "view-panes";
   viewPanes.append(imagePane, tablePane, headerPane);
-  main.append(frameBar, tabs, viewPanes);
+  main.append(frameBar, viewPanes);
   content.append(sidebar, main);
 
   const empty = el("div", "empty-state");

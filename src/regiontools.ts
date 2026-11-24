@@ -28,7 +28,9 @@ export interface RegionToolsHost {
 
 /** 18×18 stroke icons (currentColor). */
 const ICONS: Record<string, string> = {
-  fit: '<path d="M2.5 6.5v-4h4M11.5 2.5h4v4M15.5 11.5v4h-4M6.5 15.5h-4v-4"/><rect x="6" y="6" width="6" height="6" rx="1"/>',
+  fit: '<path d="M3.5 14.5 14.5 3.5"/><path d="M9.5 3.5h5v5"/><path d="M8.5 14.5h-5v-5"/>',
+  collapse: '<path d="M11 4.5 6.5 9l4.5 4.5"/>',
+  expand: '<path d="M7 4.5 11.5 9 7 13.5"/>',
   grid: '<rect x="2.5" y="2.5" width="5.5" height="5.5"/><rect x="10" y="2.5" width="5.5" height="5.5"/><rect x="2.5" y="10" width="5.5" height="5.5"/><rect x="10" y="10" width="5.5" height="5.5"/>',
   blink: '<path d="M1.5 9s2.8-5 7.5-5 7.5 5 7.5 5-2.8 5-7.5 5-7.5-5-7.5-5z"/><circle cx="9" cy="9" r="2.2"/>',
   lock: '<rect x="3.5" y="8" width="11" height="8" rx="1.5"/><path d="M6 8V5.5a3 3 0 0 1 6 0V8"/>',
@@ -112,6 +114,8 @@ export class RegionTools {
   private readonly redoBtn: HTMLButtonElement;
   private readonly deleteBtn: HTMLButtonElement;
   private readonly host: RegionToolsHost;
+  private readonly body: HTMLElement;
+  private readonly collapseBtn: HTMLButtonElement;
   private state: RegionToolsState | null = null;
 
   constructor(host: RegionToolsHost) {
@@ -134,6 +138,14 @@ export class RegionTools {
       return d;
     };
 
+    // Collapse/expand the whole bar (remembered per machine).
+    const body = document.createElement("div");
+    body.className = "rt-body";
+    const collapse = btn("collapse", "Hide the tool bar", () => this.setCollapsed(!this.collapsed));
+    collapse.classList.add("rt-collapse");
+    this.collapseBtn = collapse;
+    this.body = body;
+
     // View.
     this.gridBtn = btn("grid", "Grid: tile all image frames (g)", () => host.grid());
     this.blinkBtn = btn("blink", "Blink: cycle through the image frames (b)", () => host.blink());
@@ -141,7 +153,7 @@ export class RegionTools {
     this.lockBadge = document.createElement("span");
     this.lockBadge.className = "rt-badge";
     this.lockBtn.append(this.lockBadge);
-    this.root.append(
+    body.append(
       btn("fit", "Fit the image to the window (double-click the image also fits)", () => host.fit()),
       this.gridBtn,
       this.blinkBtn,
@@ -173,7 +185,7 @@ export class RegionTools {
     document.addEventListener("pointerdown", (e) => {
       if (this.flyout.style.display !== "none" && !drawWrap.contains(e.target as Node)) this.closeFlyout();
     });
-    this.root.append(
+    body.append(
       btn("load", "Load DS9 region files (.reg) as new layers (several at once is fine)", () => host.load()),
       this.layersBtn,
       drawWrap,
@@ -195,18 +207,43 @@ export class RegionTools {
     this.redoBtn = btn("redo", "Redo region edit (⌘⇧Z)", () => host.redo());
     this.deleteBtn = btn("delete", "Delete the selected region(s) (Delete)", () => host.deleteSelected());
     this.editSection.append(sep(), this.undoBtn, this.redoBtn, this.deleteBtn);
-    this.root.append(this.editSection);
+    body.append(this.editSection);
+    this.root.append(collapse, body);
+    let saved = false;
+    try {
+      saved = localStorage.getItem("voyager.toolbarCollapsed") === "1";
+    } catch {
+      // storage unavailable: start expanded
+    }
+    this.setCollapsed(saved);
   }
 
-  /** Draw button: activate drawing with the last shape and open the shape
-   *  flyout (a second click closes it). */
+  private collapsed = false;
+
+  private setCollapsed(c: boolean): void {
+    this.collapsed = c;
+    this.body.style.display = c ? "none" : "";
+    this.root.classList.toggle("collapsed", c);
+    this.collapseBtn.replaceChildren(icon(c ? "expand" : "collapse"));
+    this.collapseBtn.title = c ? "Show the tool bar" : "Hide the tool bar";
+    if (c) this.closeFlyout();
+    try {
+      localStorage.setItem("voyager.toolbarCollapsed", c ? "1" : "0");
+    } catch {
+      // per-machine convenience only
+    }
+  }
+
+  /** Draw button toggles drawing: off → draw with the last shape and open
+   *  the shape flyout; on → back to Pan (collapsing the edit tools when the
+   *  frame has no layers). */
   private onDraw(): void {
-    if (this.flyout.style.display !== "none") {
+    if (this.state?.tool === "draw") {
       this.closeFlyout();
+      this.host.setTool("pan", null);
       return;
     }
-    const shape = this.state?.shape ?? "circle";
-    if (this.state?.tool !== "draw") this.host.setTool("draw", shape);
+    this.host.setTool("draw", this.state?.shape ?? "circle");
     this.flyout.style.display = "";
   }
 
@@ -232,7 +269,9 @@ export class RegionTools {
     this.drawBtn.replaceChildren(icon(state.shape));
     this.drawBtn.classList.toggle("on", state.tool === "draw");
     this.drawBtn.title =
-      `Draw ${state.shape}s (click to pick another shape).` + EDIT_TIP;
+      state.tool === "draw"
+        ? `Drawing ${state.shape}s — click to stop (back to Pan). Pick another shape from the strip.` + EDIT_TIP
+        : `Draw regions (last shape: ${state.shape}); opens the shape strip.` + EDIT_TIP;
     this.layersBtn.classList.toggle("on", state.layersOpen);
     this.editSection.style.display = state.hasLayers || state.tool !== "pan" ? "" : "none";
     this.undoBtn.disabled = !state.canUndo;
