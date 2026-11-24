@@ -33,7 +33,7 @@ import {
 import type { CreatableShape } from "./render/regionlayer";
 import { HistogramPanel } from "./render/histogram";
 import { TableView } from "./render/table";
-import { COLORMAPS, STRETCHES, Viewer, type Stretch } from "./render/viewer";
+import { COLORMAPS, STRETCHES, Viewer, type RegionTool, type Stretch } from "./render/viewer";
 import { Wcs } from "./render/wcs";
 import { MAX_BANDS, gridMismatch } from "./render/trilogy";
 import {
@@ -44,6 +44,7 @@ import {
   type RegionPanelHost,
 } from "./regionpanel";
 import { RegionProps } from "./regionprops";
+import { RegionTools } from "./regiontools";
 import { compositeDraw, distinctUnits, initialRgbState, moveRgbBand, renderRgbPanel, type RgbState } from "./rgb";
 
 type ViewTab = "image" | "table" | "header";
@@ -117,10 +118,11 @@ type LockMode = "none" | "wcs" | "pixel";
 let lockMode: LockMode = "none";
 /** Blink auto-cycle timer (undefined = off). */
 let blinkTimer: number | undefined;
-/** Region edit mode + create shape are global toggles applied to the active
- *  frame's viewer (only the active frame is editable at a time). */
-let editMode = false;
+/** Region tool + draw shape (left tool bar) are global, applied to the
+ *  active frame's viewer (only the active frame is editable at a time). */
+let regionTool: RegionTool = "pan";
 let createShape: CreatableShape = "circle";
+let regionTools: RegionTools | null = null;
 
 const BLINK_MS = 500;
 
@@ -751,8 +753,21 @@ let regionSaveFrame: HTMLSelectElement | null = null;
 
 function showRegionPanel(show: boolean): void {
   must<HTMLElement>("region-panel").style.display = show ? "" : "none";
-  must<HTMLElement>("region-panel-btn").classList.toggle("active-btn", show);
+  syncRegionTools();
   if (show) renderRegionPanel();
+}
+
+/** Reflect tool / panel / undo state on the region tool bar. */
+function syncRegionTools(): void {
+  const v = activeFrame()?.viewer;
+  regionTools?.sync({
+    tool: regionTool,
+    shape: createShape,
+    layersOpen: document.getElementById("region-panel")?.style.display !== "none",
+    canUndo: v?.canUndo() ?? false,
+    canRedo: v?.canRedo() ?? false,
+    hasSelection: v?.hasSelection() ?? false,
+  });
 }
 
 /** Host callbacks for the panel, acting on the active frame. */
@@ -864,9 +879,12 @@ function makeViewer(frame: Frame): Viewer {
       if (frame !== activeFrame()) return;
       must<HTMLElement>("region-info").textContent = desc ?? "";
       if (must<HTMLElement>("region-panel").style.display !== "none") regionProps?.sync();
+      syncRegionTools();
     },
     onRegionsChanged: () => {
-      if (frame === activeFrame()) renderRegionPanel();
+      if (frame !== activeFrame()) return;
+      renderRegionPanel();
+      syncRegionTools();
     },
     drawLayer: () => drawLayerFor(frame),
     onCameraChange: (cx, cy, scale) => mirrorCameraFrom(frame, cx, cy, scale),
@@ -944,7 +962,7 @@ async function loadFrameImage(frame: Frame): Promise<void> {
   frame.viewerHdu = imgHdu;
   if (imgHdu !== null) {
     const hdu = frame.file.hdus[imgHdu];
-    frame.viewer.setEditMode(frame === activeFrame() ? editMode : false);
+    frame.viewer.setTool(frame === activeFrame() ? regionTool : "pan");
     frame.viewer.setCreateShape(createShape);
     if (frame.composite) {
       const { sources, display } = compositeDraw(frame.composite);
@@ -1010,8 +1028,7 @@ function syncToolbar(frame: Frame): void {
   const [lo, hi] = v.getLimits();
   must<HTMLElement>("limits-label").textContent = `[${lo.toPrecision(5)}, ${hi.toPrecision(5)}]`;
   histPanel?.setLimits(lo, hi);
-  must<HTMLElement>("region-edit-btn").classList.toggle("active-btn", editMode);
-  must<HTMLElement>("region-shape-select").style.display = editMode ? "" : "none";
+  syncRegionTools();
   renderRegionPanel();
   must<HTMLElement>("region-info").textContent = "";
 }
@@ -1067,7 +1084,7 @@ async function setActive(i: number): Promise<void> {
   // while this frame was inactive, changing which HDU the viewer should show).
   if (frame.viewer && frame.viewerHdu !== frameImageHdu(frame)) await loadFrameImage(frame);
   // Only the active frame is editable at a time.
-  for (const f of frames) f.viewer?.setEditMode(f === frame ? editMode : false);
+  for (const f of frames) f.viewer?.setTool(f === frame ? regionTool : "pan");
   renderFrameBar();
   renderHduList();
   renderView();
@@ -2183,39 +2200,6 @@ function buildUi(): void {
     histBtn.classList.toggle("active-btn", histPanel.toggle());
     ensureHistogram();
   });
-  const regBtn = el("button", "", "Reg…");
-  regBtn.title = "Load DS9 region files (.reg) as new layers on the image (several at once is fine)";
-  regBtn.addEventListener("click", () => void loadRegionsViaDialog());
-  const regPanelBtn = el("button", "", "Layers");
-  regPanelBtn.id = "region-panel-btn";
-  regPanelBtn.title = "Region layers: show/hide, recolor, save, or close each loaded/drawn region file";
-  regPanelBtn.addEventListener("click", () => {
-    showRegionPanel(must<HTMLElement>("region-panel").style.display === "none");
-  });
-  // Region edit mode toggle + create-shape picker.
-  const editBtn = el("button", "", "Edit");
-  editBtn.id = "region-edit-btn";
-  editBtn.title =
-    "Region edit mode: drag empty space to draw the chosen shape; click a region to select, then drag its body to move or a handle to resize. ⌥-drag or right-drag pans. Delete removes the selected region. Selected polygon: double-click an edge to add a vertex, a vertex to remove it. ⌘Z/⌘⇧Z undo/redo.";
-  const shapeSel = makeSelect(
-    "region-shape-select",
-    ["circle", "box", "ellipse", "annulus", "point", "polygon"],
-    (v) => {
-      createShape = v as CreatableShape;
-      activeFrame()?.viewer?.setCreateShape(createShape);
-    },
-  );
-  shapeSel.style.display = "none";
-  shapeSel.title =
-    "Shape drawn on an empty-space drag. Polygon: click to add vertices, " +
-    "close by clicking near the first vertex, double-clicking, or Enter.";
-  editBtn.addEventListener("click", () => {
-    editMode = !editBtn.classList.contains("active-btn");
-    editBtn.classList.toggle("active-btn", editMode);
-    shapeSel.style.display = editMode ? "" : "none";
-    activeFrame()?.viewer?.setEditMode(editMode);
-  });
-
   const gotoBox = el("input", "goto");
   gotoBox.id = "goto-box";
   gotoBox.placeholder = "goto α δ";
@@ -2247,10 +2231,6 @@ function buildUi(): void {
     scaleSel,
     fitBtn,
     histBtn,
-    regBtn,
-    regPanelBtn,
-    editBtn,
-    shapeSel,
     gotoBox,
     limitsLabel,
     cbLabel,
@@ -2577,6 +2557,23 @@ function buildUi(): void {
 
   const rp = buildRegionPanel(regionHost, () => showRegionPanel(false));
   imagePane.append(rp.root);
+  regionTools = new RegionTools({
+    load: () => void loadRegionsViaDialog(),
+    toggleLayers: () => showRegionPanel(must<HTMLElement>("region-panel").style.display === "none"),
+    setTool: (tool, shape) => {
+      regionTool = tool;
+      if (shape) createShape = shape;
+      const v = activeFrame()?.viewer;
+      v?.setCreateShape(createShape);
+      v?.setTool(regionTool);
+      syncRegionTools();
+    },
+    undo: () => activeFrame()?.viewer?.undo(),
+    redo: () => activeFrame()?.viewer?.redo(),
+    deleteSelected: () => activeFrame()?.viewer?.deleteSelected(),
+  });
+  imagePane.append(regionTools.root);
+  syncRegionTools();
   regionPanelBody = rp.body;
   regionSaveFrame = rp.frameSelect;
   const propsBox = el("div", "rp-box");

@@ -13,7 +13,7 @@ import {
   drawCrosshair,
   drawPolygonDraft,
   drawRegions,
-  drawRubberBand,
+  drawMarquee,
   drawSourceMarkers,
   boxCenter,
   boxCorners,
@@ -28,7 +28,7 @@ import {
   hitTestRegion,
   hitTestSourceMarkers,
   makeRegion,
-  regionsInRect,
+  regionsTouching,
   regionShown,
   type LayerStyle,
   resizeRegion,
@@ -104,6 +104,20 @@ export interface ViewerCallbacks {
   /** Layer id for a region about to be drawn (edit mode). The host returns
    *  its active visible layer, creating an "untitled" one if needed. */
   drawLayer?(): number | undefined;
+}
+
+/** Region tool (left tool bar, #20). pan: drag pans, click selects. select:
+ *  drag empty space = rectangle select. lasso: freehand select. draw: drag
+ *  empty space draws `createShape`. In every tool but pan, regions can be
+ *  moved/resized/rotated through their body and handles. */
+export type RegionTool = "pan" | "select" | "lasso" | "draw";
+
+/** In-progress selection drag (device px). `additive` keeps the current
+ *  selection (shift); otherwise the result replaces it. */
+interface Marquee {
+  kind: "rect" | "lasso";
+  pts: [number, number][];
+  additive: boolean;
 }
 
 /** In-progress region edit gesture (edit mode, left-drag). */
@@ -187,7 +201,7 @@ export class Viewer {
   private groupAngle = 0;
   private groupAngleKey = "";
   /** In-progress rubber-band select rectangle (device px), or null. */
-  private rubberBand: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  private marquee: Marquee | null = null;
 
   /** Catalog source markers as flat image-pixel pairs [x0,y0,x1,y1,…], or
    *  null. Projected from a catalog frame's RA/Dec through this image's WCS
@@ -207,6 +221,7 @@ export class Viewer {
   /** Region edit mode: left-drag moves/resizes/creates regions instead of
    *  panning (pan moves to ⌥+left or right-drag). */
   private editMode = false;
+  private tool: RegionTool = "pan";
   /** Shape the create tool draws on an empty-space drag. */
   private createShape: CreatableShape = "circle";
   private editDrag: EditDrag | null = null;
@@ -364,7 +379,7 @@ export class Viewer {
     this.hoverIndex = -1;
     this.clearSelection();
     this.editDrag = null;
-    this.rubberBand = null;
+    this.marquee = null;
     this.polygonDraft = null;
     this.polygonCursor = null;
     this.undoStack = [];
@@ -393,7 +408,7 @@ export class Viewer {
     this.hoverIndex = -1;
     this.clearSelection();
     this.editDrag = null;
-    this.rubberBand = null;
+    this.marquee = null;
     this.polygonDraft = null;
     this.polygonCursor = null;
     this.undoStack = [];
@@ -448,9 +463,9 @@ export class Viewer {
       this.polygonCursor = null;
       this.drawOverlay();
     }
-    if (this.selection.size > 0 || this.rubberBand) {
+    if (this.selection.size > 0 || this.marquee) {
       this.clearSelection();
-      this.rubberBand = null;
+      this.marquee = null;
       this.callbacks.onRegionPick(null);
       this.requestDraw();
     }
@@ -583,6 +598,10 @@ export class Viewer {
     return m;
   }
 
+  hasSelection(): boolean {
+    return this.selection.size > 0;
+  }
+
   canUndo(): boolean {
     return this.undoStack.length > 0;
   }
@@ -657,7 +676,18 @@ export class Viewer {
     return this.regions ?? [];
   }
 
-  setEditMode(on: boolean): void {
+  /** Cursor over empty image in an editing tool. */
+  private emptyCursor(): string {
+    return this.tool === "select" ? "default" : "crosshair";
+  }
+
+  /** Switch region tool (pan disables editing). */
+  setTool(tool: RegionTool): void {
+    this.tool = tool;
+    this.setEditMode(tool !== "pan");
+  }
+
+  private setEditMode(on: boolean): void {
     this.editMode = on;
     this.editDrag = null;
     this.polygonDraft = null;
@@ -665,7 +695,7 @@ export class Viewer {
     // Edit mode can create regions even with no .reg loaded — give it an
     // array to append to.
     if (on && this.regions === null) this.regions = [];
-    this.canvas.style.cursor = on ? "crosshair" : "";
+    this.canvas.style.cursor = on ? this.emptyCursor() : "";
     this.drawOverlay();
   }
 
@@ -923,8 +953,7 @@ export class Viewer {
           return;
         }
         if (e.shiftKey) {
-          this.rubberBand = { x0: mx, y0: my, x1: mx, y1: my };
-          this.drawOverlay();
+          this.startMarquee(this.tool === "lasso" ? "lasso" : "rect", mx, my, true);
           return;
         }
       }
@@ -939,8 +968,8 @@ export class Viewer {
       }
     });
     this.canvas.addEventListener("pointerup", (e) => {
-      if (this.rubberBand) {
-        this.applyRubberBand();
+      if (this.marquee) {
+        this.applyMarquee();
         this.canvas.releasePointerCapture(e.pointerId);
         return;
       }
@@ -966,10 +995,22 @@ export class Viewer {
       }
     });
     this.canvas.addEventListener("pointermove", (e) => {
-      if (this.rubberBand) {
+      if (this.marquee) {
         const [mx, my] = this.toCanvasPx(e);
-        this.rubberBand.x1 = mx;
-        this.rubberBand.y1 = my;
+        const m = this.marquee;
+        if (m.kind === "rect") {
+          const [x0, y0] = m.pts[0];
+          m.pts = [
+            [x0, y0],
+            [mx, y0],
+            [mx, my],
+            [x0, my],
+          ];
+        } else {
+          // Lasso: add a point once the cursor has moved ≥ 2 device px.
+          const [lx, ly] = m.pts[m.pts.length - 1];
+          if (Math.hypot(mx - lx, my - ly) >= 2) m.pts.push([mx, my]);
+        }
         this.drawOverlay();
         this.updateReadout(e);
         return;
@@ -1113,7 +1154,7 @@ export class Viewer {
             ? handleCursor(sel, hd, view)
             : idx >= 0
               ? "move"
-              : "crosshair";
+              : this.emptyCursor();
     } else {
       this.canvas.style.cursor = idx >= 0 ? "pointer" : "";
     }
@@ -1214,19 +1255,26 @@ export class Viewer {
       });
   }
 
-  /** Finalize a rubber-band drag: add every region whose center lies inside
-   *  the rectangle to the selection. */
-  private applyRubberBand(): void {
-    const rb = this.rubberBand;
-    this.rubberBand = null;
-    if (!rb || !this.regions) {
+  private startMarquee(kind: Marquee["kind"], mx: number, my: number, additive: boolean): void {
+    this.marquee = { kind, pts: kind === "rect" ? [[mx, my], [mx, my], [mx, my], [mx, my]] : [[mx, my]], additive };
+    this.drawOverlay();
+  }
+
+  /** Finish a rectangle/lasso drag: select every region any part of which
+   *  touches it (added to the selection when additive, else replacing it —
+   *  so a plain click on empty space with the Select tool deselects). */
+  private applyMarquee(): void {
+    const m = this.marquee;
+    this.marquee = null;
+    if (!m || !this.regions) {
       this.requestDraw();
       return;
     }
-    const inside = regionsInRect(this.regions, this.regionView(), rb.x0, rb.y0, rb.x1, rb.y1, this.layerStyle);
-    for (const i of inside) this.selection.add(i);
-    if (this.selectedIndex < 0 && inside.length > 0) {
-      this.selectedIndex = inside[inside.length - 1];
+    const hits = regionsTouching(this.regions, this.regionView(), m.pts, this.layerStyle);
+    if (!m.additive) this.clearSelection();
+    for (const i of hits) this.selection.add(i);
+    if ((this.selectedIndex < 0 || !this.selection.has(this.selectedIndex)) && this.selection.size > 0) {
+      this.selectedIndex = hits.length > 0 ? hits[hits.length - 1] : [...this.selection][0];
     }
     this.emitSelectionPick();
     this.requestDraw();
@@ -1297,7 +1345,12 @@ export class Viewer {
       }
       return;
     }
-    // 3. Empty space → start drawing a new region of the chosen shape.
+    // 3. Empty space: Select/Lasso start a (replacing) marquee; Draw draws.
+    if (this.tool === "select" || this.tool === "lasso") {
+      this.startMarquee(this.tool === "lasso" ? "lasso" : "rect", mx, my, false);
+      return;
+    }
+    // Draw tool → start drawing a new region of the chosen shape.
     //    Polygon is a multi-click draft (see addPolygonVertex/closePolygonDraft);
     //    everything else is a single drag.
     if (this.createShape === "polygon") {
@@ -1709,10 +1762,7 @@ export class Viewer {
     if (this.image && this.marker) {
       drawCrosshair(this.overlay, view, this.marker[0], this.marker[1], this.markerAlpha);
     }
-    if (this.rubberBand) {
-      const rb = this.rubberBand;
-      drawRubberBand(this.overlay, rb.x0, rb.y0, rb.x1, rb.y1, view.dpr);
-    }
+    if (this.marquee) drawMarquee(this.overlay, this.marquee.pts, view.dpr);
     if (this.polygonDraft) {
       drawPolygonDraft(this.overlay, view, this.polygonDraft.xs, this.polygonDraft.ys, this.polygonCursor);
     }

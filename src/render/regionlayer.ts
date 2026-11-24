@@ -483,55 +483,138 @@ export function regionCenterPx(reg: PixelRegion): [number, number] {
   return [reg.x, reg.y];
 }
 
-/** Indices of regions whose center falls inside the device-px screen rect
- *  (rubber-band select). Corners may be given in any order. */
-export function regionsInRect(
+/** A region's outline in screen (device px) space, as a closed polygon.
+ *  Curves are sampled (48 segments; ≤ 0.2% radius error); a point marker is
+ *  its ~5 px box. Annulus = its outer circle (the hole counts as touching). */
+function screenOutline(reg: PixelRegion, view: RegionView): [number, number][] {
+  const project = screenMap(view);
+  const N = 48;
+  const ring = (cx: number, cy: number, rx: number, ry: number, deg: number): [number, number][] => {
+    const [ux, uy] = axisVectors(deg);
+    const out: [number, number][] = [];
+    for (let k = 0; k < N; k++) {
+      const t = (2 * Math.PI * k) / N;
+      const a = rx * Math.cos(t);
+      const b = ry * Math.sin(t);
+      out.push(project(cx + a * ux[0] + b * uy[0], cy + a * ux[1] + b * uy[1]));
+    }
+    return out;
+  };
+  switch (reg.shape) {
+    case "circle":
+      return ring(reg.x, reg.y, reg.r, reg.r, 0);
+    case "annulus":
+      return ring(reg.x, reg.y, reg.rout, reg.rout, 0);
+    case "ellipse":
+      return ring(reg.x, reg.y, reg.rx, reg.ry, reg.angle);
+    case "box": {
+      const [ux, uy] = axisVectors(reg.angle);
+      const hw = reg.w / 2;
+      const hh = reg.h / 2;
+      return [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ].map(([i, j]) => project(reg.x + i * hw * ux[0] + j * hh * uy[0], reg.y + i * hw * ux[1] + j * hh * uy[1]));
+    }
+    case "polygon":
+      return reg.xs.map((x, i) => project(x, reg.ys[i]));
+    case "point": {
+      const [x, y] = project(reg.x, reg.y);
+      const r = 5 * view.dpr;
+      return [
+        [x - r, y - r],
+        [x + r, y - r],
+        [x + r, y + r],
+        [x - r, y + r],
+      ];
+    }
+  }
+}
+
+function polyBox(p: readonly [number, number][]): [number, number, number, number] {
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const [x, y] of p) {
+    x0 = Math.min(x0, x);
+    y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x);
+    y1 = Math.max(y1, y);
+  }
+  return [x0, y0, x1, y1];
+}
+
+function inPoly(x: number, y: number, p: readonly [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    const [xi, yi] = p[i];
+    const [xj, yj] = p[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function segmentsCross(
+  a: [number, number],
+  b: [number, number],
+  c: [number, number],
+  d: [number, number],
+): boolean {
+  const o = (p: [number, number], q: [number, number], r: [number, number]): number =>
+    Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]));
+  return o(a, b, c) !== o(a, b, d) && o(c, d, a) !== o(c, d, b);
+}
+
+/** Whether two closed polygons overlap at all: a vertex of either inside the
+ *  other, or any pair of edges crossing. */
+function polysTouch(a: readonly [number, number][], b: readonly [number, number][]): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  if (inPoly(a[0][0], a[0][1], b) || inPoly(b[0][0], b[0][1], a)) return true;
+  for (let i = 0, j = a.length - 1; i < a.length; j = i++) {
+    for (let k = 0, l = b.length - 1; k < b.length; l = k++) {
+      if (segmentsCross(a[j], a[i], b[l], b[k])) return true;
+    }
+  }
+  return false;
+}
+
+/** Indices of visible regions that any part of touches the screen-space
+ *  (device px) selection polygon — a rectangle or a freehand lasso. A
+ *  bounding-box test skips far regions; the exact test only runs on release. */
+export function regionsTouching(
   regions: readonly PixelRegion[],
   view: RegionView,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
+  sel: readonly [number, number][],
   layers?: LayerStyle,
 ): number[] {
-  const project = screenMap(view);
-  const lox = Math.min(x0, x1);
-  const hix = Math.max(x0, x1);
-  const loy = Math.min(y0, y1);
-  const hiy = Math.max(y0, y1);
+  if (sel.length < 3) return [];
+  const sb = polyBox(sel);
   const out: number[] = [];
   for (let i = 0; i < regions.length; i++) {
     if (!regionShown(regions[i], layers)) continue;
-    const [cx, cy] = regionCenterPx(regions[i]);
-    const [sx, sy] = project(cx, cy);
-    if (sx >= lox && sx <= hix && sy >= loy && sy <= hiy) out.push(i);
+    const o = screenOutline(regions[i], view);
+    const rb = polyBox(o);
+    if (rb[2] < sb[0] || rb[0] > sb[2] || rb[3] < sb[1] || rb[1] > sb[3]) continue;
+    if (polysTouch(o, sel)) out.push(i);
   }
   return out;
 }
 
-/** Draw the rubber-band selection rectangle (device px), without clearing —
- *  call after drawRegions. */
-export function drawRubberBand(
-  canvas: HTMLCanvasElement,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-  dpr: number,
-): void {
+/** Draw a selection marquee (rectangle or lasso, device px) without
+ *  clearing — call after drawRegions. */
+export function drawMarquee(canvas: HTMLCanvasElement, pts: readonly [number, number][], dpr: number): void {
   const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const x = Math.min(x0, x1);
-  const y = Math.min(y0, y1);
-  const w = Math.abs(x1 - x0);
-  const h = Math.abs(y1 - y0);
+  if (!ctx || pts.length < 2) return;
   ctx.save();
   ctx.strokeStyle = "#5aa7ff";
   ctx.fillStyle = "rgba(90, 167, 255, 0.12)";
   ctx.lineWidth = dpr;
   ctx.setLineDash([4 * dpr, 3 * dpr]);
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeRect(x, y, w, h);
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
   ctx.restore();
 }
 
