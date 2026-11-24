@@ -15,11 +15,22 @@ import {
   drawRegions,
   drawRubberBand,
   drawSourceMarkers,
+  boxCenter,
+  boxCorners,
+  groupBox,
+  groupHandleCursor,
+  handleCursor,
+  hitTestGroupHandle,
   hitTestHandle,
+  hitTestPolygonEdge,
+  rotateRegionAbout,
+  scaleRegionAbout,
   hitTestRegion,
   hitTestSourceMarkers,
   makeRegion,
   regionsInRect,
+  regionShown,
+  type LayerStyle,
   resizeRegion,
   translateRegion,
   type CreatableShape,
@@ -45,6 +56,16 @@ const NAN_READOUT = "NaN";
 // we requested each one we'd fetch (and mostly discard) hundreds of tiles.
 // During the burst the backdrop + already-cached levels keep the view filled.
 const ZOOM_SETTLE_MS = 120;
+/** One undo/redo state: the full region array plus the selection at that
+ *  moment, so ⌘Z brings back what was selected when the edit was made. */
+interface UndoEntry {
+  regions: PixelRegion[];
+  selection: number[];
+  primary: number;
+  /** Multi-selection box orientation at that moment. */
+  groupAngle: number;
+}
+
 // Bound on the region-edit undo stack (Cmd+Z / Cmd+Shift+Z).
 const MAX_UNDO = 50;
 
@@ -80,12 +101,40 @@ export interface ViewerCallbacks {
    *  link). `row` is the native table row index the marker was projected from.
    *  Only fired when the markers carry row indices (same-frame overlay). */
   onSourcePick?(row: number): void;
+  /** Layer id for a region about to be drawn (edit mode). The host returns
+   *  its active visible layer, creating an "untitled" one if needed. */
+  drawLayer?(): number | undefined;
 }
 
 /** In-progress region edit gesture (edit mode, left-drag). */
 type EditDrag =
-  | { mode: "move"; index: number; last: [number, number] }
-  | { mode: "resize"; index: number; role: HandleRole; nodeIndex: number }
+  | { mode: "move"; index: number; last: [number, number]; moved: boolean }
+  | {
+      mode: "resize";
+      index: number;
+      role: HandleRole;
+      nodeIndex: number;
+      moved: boolean;
+    }
+  | {
+      /** Multi-select bounding-box handle: corner = uniform scale about the
+       *  opposite corner, rot = rotation about the box center. Always applied
+       *  to the originals (no drift). */
+      mode: "group";
+      index: number;
+      kind: "corner" | "rot";
+      orig: Map<number, PixelRegion>;
+      /** Scale anchor (opposite corner) or rotation center, image px. */
+      ax: number;
+      ay: number;
+      /** Grabbed corner (scale) / press angle in degrees (rot). */
+      gx: number;
+      gy: number;
+      startDeg: number;
+      /** Box orientation when the drag began. */
+      startAngle: number;
+      moved: boolean;
+    }
   | { mode: "create"; index: number; anchor: [number, number]; moved: boolean };
 
 interface ImageRef {
@@ -122,6 +171,10 @@ export class Viewer {
   private readonly callbacks: ViewerCallbacks;
   /** Loaded region overlay (pixel space of the current HDU), or null. */
   private regions: PixelRegion[] | null = null;
+  /** Per-layer visibility + color overrides (multiple region files). */
+  private layerStyle: LayerStyle = { hidden: new Set() };
+  /** Layer the region being created in the current gesture goes into. */
+  private createLayer: number | undefined = undefined;
   /** Region indices under the cursor / clicked (-1 = none). */
   private hoverIndex = -1;
   /** Primary selected region (drives handles + description; -1 = none). */
@@ -129,6 +182,10 @@ export class Viewer {
   /** All highlighted regions (multi-select). Always contains selectedIndex
    *  when it is ≥ 0; empty when nothing is selected. */
   private selection = new Set<number>();
+  /** Orientation (deg) of the multi-selection box. Belongs to one selection:
+   *  `groupAngleKey` records which, and any other selection reads as 0. */
+  private groupAngle = 0;
+  private groupAngleKey = "";
   /** In-progress rubber-band select rectangle (device px), or null. */
   private rubberBand: { x0: number; y0: number; x1: number; y1: number } | null = null;
 
@@ -164,8 +221,11 @@ export class Viewer {
   /** Region-edit undo/redo: snapshots of the full region array taken just
    *  before each mutating gesture (create/move/resize/delete). Cleared
    *  whenever the region set is replaced wholesale (load, HDU/image switch). */
-  private undoStack: PixelRegion[][] = [];
-  private redoStack: PixelRegion[][] = [];
+  private undoStack: UndoEntry[] = [];
+  private redoStack: UndoEntry[] = [];
+  /** Key of the coalescing edit (e.g. one color-picker drag) that made the
+   *  top undo entry; a further edit with the same key reuses that entry. */
+  private undoCoalesce: string | null = null;
 
   private image: ImageRef | null = null;
   /** RGB composite mode: the bands (all on `image`'s grid; image = bands[0]
@@ -436,6 +496,93 @@ export class Viewer {
     this.requestDraw();
   }
 
+  /** Append a layer's regions (a newly loaded file). Undo history is reset:
+   *  snapshots predate the layer and would silently drop it. */
+  addRegions(regions: PixelRegion[]): void {
+    if (this.regions === null) this.regions = [];
+    this.regions.push(...regions);
+    this.undoStack = [];
+    this.redoStack = [];
+    this.callbacks.onRegionsChanged();
+    this.requestDraw();
+  }
+
+  /** Remove every region of a layer (layer closed). Resets selection + undo. */
+  removeLayer(layer: number): void {
+    if (!this.regions) return;
+    this.regions = this.regions.filter((r) => r.layer !== layer);
+    this.hoverIndex = -1;
+    this.clearSelection();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.callbacks.onRegionPick(null);
+    this.callbacks.onRegionsChanged();
+    this.requestDraw();
+  }
+
+  /** Layer visibility + color overrides. Selection drops regions that just
+   *  became hidden (they can't be seen or edited). */
+  setLayerStyle(style: LayerStyle): void {
+    this.layerStyle = style;
+    if (this.regions) {
+      const regs = this.regions;
+      const hidden = (i: number): boolean => {
+        const l = regs[i]?.layer;
+        return l !== undefined && style.hidden.has(l);
+      };
+      let changed = false;
+      for (const i of [...this.selection]) {
+        if (hidden(i)) {
+          this.selection.delete(i);
+          changed = true;
+        }
+      }
+      if (this.selectedIndex >= 0 && hidden(this.selectedIndex)) {
+        this.selectedIndex = this.selection.size > 0 ? [...this.selection][this.selection.size - 1] : -1;
+      }
+      if (hidden(this.hoverIndex)) this.hoverIndex = -1;
+      if (changed) this.emitSelectionPick();
+    }
+    this.requestDraw();
+  }
+
+  /** Regions in one layer (for saving it), without the frontend tag. */
+  layerRegions(layer: number): PixelRegion[] {
+    return (this.regions ?? []).filter((r) => r.layer === layer);
+  }
+
+  /** Each layer's display color: the shared color of its regions, or the
+   *  first region's with `mixed` when they differ (layer swatch). */
+  layerColors(): Map<number, { color: string; mixed: boolean }> {
+    const m = new Map<number, { color: string; mixed: boolean }>();
+    for (const r of this.regions ?? []) {
+      if (r.layer === undefined) continue;
+      const c = (r.color ?? "#00ff00").toLowerCase();
+      const cur = m.get(r.layer);
+      if (!cur) m.set(r.layer, { color: c, mixed: false });
+      else if (cur.color !== c) cur.mixed = true;
+    }
+    return m;
+  }
+
+  /** Indices of every region in a layer. */
+  layerIndices(layer: number): number[] {
+    const out: number[] = [];
+    (this.regions ?? []).forEach((r, i) => {
+      if (r.layer === layer) out.push(i);
+    });
+    return out;
+  }
+
+  /** Region count per layer id. */
+  layerCounts(): Map<number, number> {
+    const m = new Map<number, number>();
+    for (const r of this.regions ?? []) {
+      if (r.layer !== undefined) m.set(r.layer, (m.get(r.layer) ?? 0) + 1);
+    }
+    return m;
+  }
+
   canUndo(): boolean {
     return this.undoStack.length > 0;
   }
@@ -447,10 +594,41 @@ export class Viewer {
   /** Snapshot the current region set for undo, just before a mutating edit
    *  gesture (create/move/resize/delete). Caps the stack and drops redo
    *  history (a fresh edit invalidates any undone-then-redone future). */
-  private snapshotForUndo(): void {
-    this.undoStack.push(this.regions ? structuredClone(this.regions) : []);
+  private snapshotForUndo(coalesce: string | null = null): void {
+    if (coalesce !== null && coalesce === this.undoCoalesce && this.undoStack.length > 0) return;
+    this.undoCoalesce = coalesce;
+    this.undoStack.push(this.undoState());
     if (this.undoStack.length > MAX_UNDO) this.undoStack.shift();
     this.redoStack = [];
+  }
+
+  private undoState(): UndoEntry {
+    return {
+      regions: this.regions ? structuredClone(this.regions) : [],
+      selection: [...this.selection],
+      primary: this.selectedIndex,
+      groupAngle: this.currentGroupAngle(),
+    };
+  }
+
+  /** Restore an undo/redo state, selection included (indices refer to that
+   *  state's own region array, so they stay valid). */
+  private restoreUndoState(e: UndoEntry): void {
+    this.undoCoalesce = null;
+    this.regions = e.regions;
+    this.hoverIndex = -1;
+    const n = e.regions.length;
+    const hidden = (i: number): boolean => !regionShown(e.regions[i], this.layerStyle);
+    this.selection = new Set(e.selection.filter((i) => i < n && !hidden(i)));
+    this.selectedIndex = this.selection.has(e.primary)
+      ? e.primary
+      : this.selection.size > 0
+        ? [...this.selection][this.selection.size - 1]
+        : -1;
+    this.setGroupAngle(e.groupAngle);
+    this.emitSelectionPick();
+    this.callbacks.onRegionsChanged();
+    this.requestDraw();
   }
 
   /** Undo the last region edit (create/move/resize/delete). No-op if there's
@@ -458,26 +636,16 @@ export class Viewer {
   undo(): void {
     if (this.undoStack.length === 0) return;
     const prev = this.undoStack.pop()!;
-    this.redoStack.push(this.regions ? structuredClone(this.regions) : []);
-    this.regions = prev;
-    this.hoverIndex = -1;
-    this.clearSelection();
-    this.callbacks.onRegionPick(null);
-    this.callbacks.onRegionsChanged();
-    this.requestDraw();
+    this.redoStack.push(this.undoState());
+    this.restoreUndoState(prev);
   }
 
   /** Redo the last undone region edit. No-op if there's nothing to redo. */
   redo(): void {
     if (this.redoStack.length === 0) return;
     const next = this.redoStack.pop()!;
-    this.undoStack.push(this.regions ? structuredClone(this.regions) : []);
-    this.regions = next;
-    this.hoverIndex = -1;
-    this.clearSelection();
-    this.callbacks.onRegionPick(null);
-    this.callbacks.onRegionsChanged();
-    this.requestDraw();
+    this.undoStack.push(this.undoState());
+    this.restoreUndoState(next);
   }
 
   hasRegions(): boolean {
@@ -749,7 +917,7 @@ export class Viewer {
       // region toggles it in the set; shift+drag on empty space rubber-bands.
       if ((e.shiftKey || e.metaKey) && this.regions) {
         const [mx, my] = this.toCanvasPx(e);
-        const hit = hitTestRegion(this.regions, this.regionView(), mx, my);
+        const hit = hitTestRegion(this.regions, this.regionView(), mx, my, 6, this.layerStyle);
         if (hit >= 0) {
           this.toggleSelect(hit);
           return;
@@ -868,13 +1036,16 @@ export class Viewer {
       { passive: false },
     );
 
-    this.canvas.addEventListener("dblclick", () => {
+    this.canvas.addEventListener("dblclick", (e) => {
       // A dblclick's two pointerdowns already each added a vertex (via the
       // polygonDraft branch above); dedupe the accidental extra and close.
       if (this.polygonDraft) {
         this.closePolygonDraft(true);
         return;
       }
+      // Edit mode, selected polygon: dblclick a vertex deletes it, an edge
+      // inserts one (#6). Otherwise dblclick fits the view.
+      if (this.editMode && this.editPolygonTopology(e)) return;
       this.fit();
     });
   }
@@ -928,14 +1099,21 @@ export class Viewer {
    *  overlay (the GL image is unchanged) when the hover target changes. */
   private updateHover(mx: number, my: number): void {
     const view = this.regionView();
-    const idx = this.regions ? hitTestRegion(this.regions, view, mx, my) : -1;
+    const idx = this.regions ? hitTestRegion(this.regions, view, mx, my, 6, this.layerStyle) : -1;
     if (this.editMode) {
       // Cursor hints the gesture: resize a handle, move a body, or draw.
-      const onHandle =
-        this.regions !== null &&
-        this.selectedIndex >= 0 &&
-        hitTestHandle(this.regions[this.selectedIndex], view, mx, my) !== null;
-      this.canvas.style.cursor = onHandle ? "pointer" : idx >= 0 ? "move" : "crosshair";
+      const box = this.groupBoxNow();
+      const ghd = box ? hitTestGroupHandle(box, view, mx, my) : null;
+      const sel = !box && this.regions !== null && this.selectedIndex >= 0 ? this.regions[this.selectedIndex] : null;
+      const hd = sel ? hitTestHandle(sel, view, mx, my) : null;
+      this.canvas.style.cursor =
+        box && ghd
+          ? groupHandleCursor(box, ghd, view)
+          : sel && hd
+            ? handleCursor(sel, hd, view)
+            : idx >= 0
+              ? "move"
+              : "crosshair";
     } else {
       this.canvas.style.cursor = idx >= 0 ? "pointer" : "";
     }
@@ -957,7 +1135,7 @@ export class Viewer {
    *  (image→row reverse link) before deselecting. */
   private pickRegionAt(mx: number, my: number, additive: boolean): void {
     if (!this.image) return;
-    const idx = this.regions ? hitTestRegion(this.regions, this.regionView(), mx, my) : -1;
+    const idx = this.regions ? hitTestRegion(this.regions, this.regionView(), mx, my, 6, this.layerStyle) : -1;
     if (additive) {
       this.toggleSelect(idx);
       return;
@@ -1045,7 +1223,7 @@ export class Viewer {
       this.requestDraw();
       return;
     }
-    const inside = regionsInRect(this.regions, this.regionView(), rb.x0, rb.y0, rb.x1, rb.y1);
+    const inside = regionsInRect(this.regions, this.regionView(), rb.x0, rb.y0, rb.x1, rb.y1, this.layerStyle);
     for (const i of inside) this.selection.add(i);
     if (this.selectedIndex < 0 && inside.length > 0) {
       this.selectedIndex = inside[inside.length - 1];
@@ -1063,8 +1241,35 @@ export class Viewer {
     const view = this.regionView();
     if (this.regions === null) this.regions = [];
     const regs = this.regions;
-    // 1. Handle of the already-selected region → resize/rotate/node-drag.
-    if (this.selectedIndex >= 0) {
+    // 1a. Several selected → the group box's corner/rotate handles.
+    const box = this.groupBoxNow();
+    if (box) {
+      const ghd = hitTestGroupHandle(box, view, mx, my);
+      if (ghd) {
+        const orig = new Map<number, PixelRegion>();
+        for (const i of this.selection) orig.set(i, structuredClone(regs[i]));
+        const cs = boxCorners(box);
+        const [gx, gy] = ghd.kind === "corner" ? cs[ghd.corner] : [ix, iy];
+        const [ax, ay] = ghd.kind === "corner" ? cs[(ghd.corner + 2) % 4] : boxCenter(box);
+        this.snapshotForUndo();
+        this.editDrag = {
+          mode: "group",
+          index: this.selectedIndex >= 0 ? this.selectedIndex : [...this.selection][0],
+          kind: ghd.kind,
+          orig,
+          ax,
+          ay,
+          gx,
+          gy,
+          startDeg: (Math.atan2(iy - ay, ix - ax) * 180) / Math.PI,
+          startAngle: box.angle,
+          moved: false,
+        };
+        return;
+      }
+    }
+    // 1b. Handle of the single selected region → resize/rotate/node-drag.
+    if (!box && this.selectedIndex >= 0) {
       const hd = hitTestHandle(regs[this.selectedIndex], view, mx, my);
       if (hd) {
         this.snapshotForUndo();
@@ -1073,18 +1278,19 @@ export class Viewer {
           index: this.selectedIndex,
           role: hd.role,
           nodeIndex: hd.index,
+          moved: false,
         };
         return;
       }
     }
     // 2. Body of a region → select it; move it (with the whole multi-select
     //    group) only if it was already selected (click to select first).
-    const hit = hitTestRegion(regs, view, mx, my);
+    const hit = hitTestRegion(regs, view, mx, my, 6, this.layerStyle);
     if (hit >= 0) {
       if (this.selection.has(hit)) {
         this.snapshotForUndo();
         this.selectedIndex = hit;
-        this.editDrag = { mode: "move", index: hit, last: [ix, iy] };
+        this.editDrag = { mode: "move", index: hit, last: [ix, iy], moved: false };
       } else {
         this.selectRegion(hit);
         this.editDrag = null;
@@ -1102,7 +1308,9 @@ export class Viewer {
       return;
     }
     this.snapshotForUndo();
+    this.createLayer = this.callbacks.drawLayer?.();
     const reg = makeRegion(this.createShape, "#00ff00", ix, iy, ix, iy);
+    reg.layer = this.createLayer;
     regs.push(reg);
     this.selectedIndex = regs.length - 1;
     this.selection = new Set([this.selectedIndex]);
@@ -1170,6 +1378,7 @@ export class Viewer {
       shape: "polygon",
       xs: d.xs,
       ys: d.ys,
+      layer: this.callbacks.drawLayer?.(),
     };
     this.regions.push(reg);
     this.callbacks.onRegionsChanged();
@@ -1180,6 +1389,7 @@ export class Viewer {
     const regs = this.regions;
     const d = this.editDrag;
     if (!regs || !d) return;
+    if (d.mode !== "create") d.moved = true;
     switch (d.mode) {
       case "move": {
         const dx = ix - d.last[0];
@@ -1194,14 +1404,111 @@ export class Viewer {
       case "resize":
         resizeRegion(regs[d.index], d.role, d.nodeIndex, ix, iy);
         break;
+      case "group": {
+        let apply: (r: PixelRegion) => void;
+        if (d.kind === "rot") {
+          const deg = (Math.atan2(iy - d.ay, ix - d.ax) * 180) / Math.PI - d.startDeg;
+          apply = (r) => rotateRegionAbout(r, d.ax, d.ay, deg);
+          this.setGroupAngle(d.startAngle + deg);
+        } else {
+          // Project the cursor onto the anchor→corner diagonal: uniform scale.
+          const vx = d.gx - d.ax;
+          const vy = d.gy - d.ay;
+          const len2 = vx * vx + vy * vy;
+          if (len2 === 0) break;
+          const sc = Math.max(0.02, ((ix - d.ax) * vx + (iy - d.ay) * vy) / len2);
+          apply = (r) => scaleRegionAbout(r, d.ax, d.ay, sc);
+        }
+        for (const [i, o] of d.orig) {
+          const r = structuredClone(o);
+          apply(r);
+          regs[i] = r;
+        }
+        break;
+      }
       case "create": {
         d.moved = true;
         const [ax, ay] = d.anchor;
         regs[d.index] = makeRegion(this.createShape, "#00ff00", ax, ay, ix, iy);
+        regs[d.index].layer = this.createLayer;
         break;
       }
     }
     this.requestDraw();
+  }
+
+  private selectionKey(): string {
+    return [...this.selection].sort((a, b) => a - b).join(",");
+  }
+
+  /** Box orientation for the current selection (0 unless this selection was
+   *  rotated as a group). */
+  private currentGroupAngle(): number {
+    return this.groupAngleKey === this.selectionKey() ? this.groupAngle : 0;
+  }
+
+  private setGroupAngle(deg: number): void {
+    this.groupAngle = deg;
+    this.groupAngleKey = this.selectionKey();
+  }
+
+  /** Bounding box of the multi-selection (≥ 2 regions), else null. */
+  private groupBoxNow(): ReturnType<typeof groupBox> {
+    if (!this.regions || this.selection.size < 2) return null;
+    return groupBox(this.regions, this.selection, this.layerStyle, this.currentGroupAngle());
+  }
+
+  /** The selected regions (primary first), for the properties panel. */
+  selectedIndices(): number[] {
+    if (this.selectedIndex < 0) return [...this.selection];
+    return [this.selectedIndex, ...[...this.selection].filter((i) => i !== this.selectedIndex)];
+  }
+
+  regionAt(i: number): PixelRegion | null {
+    return this.regions?.[i] ?? null;
+  }
+
+  /** Apply a property edit to regions (numeric entry, color, label): one
+   *  undo step, redraw, and re-report the selection. */
+  editRegions(indices: number[], fn: (r: PixelRegion) => void, coalesce: string | null = null): void {
+    if (!this.regions || indices.length === 0) return;
+    this.snapshotForUndo(coalesce);
+    for (const i of indices) {
+      const r = this.regions[i];
+      if (r) fn(r);
+    }
+    this.requestDraw();
+    this.emitSelectionPick();
+  }
+
+  /** Insert/delete a vertex of the selected polygon under a dblclick.
+   *  Returns true if the dblclick was consumed (even when refused). */
+  private editPolygonTopology(e: MouseEvent): boolean {
+    const regs = this.regions;
+    if (!regs || this.selectedIndex < 0) return false;
+    const reg = regs[this.selectedIndex];
+    if (reg.shape !== "polygon") return false;
+    const view = this.regionView();
+    const [mx, my] = this.toCanvasPx(e);
+    const hd = hitTestHandle(reg, view, mx, my);
+    if (hd && hd.role === "node") {
+      if (reg.xs.length <= 3) {
+        this.callbacks.onRegionPick("a polygon needs at least 3 vertices");
+        return true;
+      }
+      this.snapshotForUndo();
+      reg.xs.splice(hd.index, 1);
+      reg.ys.splice(hd.index, 1);
+    } else {
+      const edge = hitTestPolygonEdge(reg, view, mx, my);
+      if (!edge) return false;
+      this.snapshotForUndo();
+      reg.xs.splice(edge.after + 1, 0, edge.x);
+      reg.ys.splice(edge.after + 1, 0, edge.y);
+    }
+    this.emitSelectionPick();
+    this.requestDraw();
+    return true;
   }
 
   private endEditGesture(): void {
@@ -1217,8 +1524,18 @@ export class Viewer {
       this.selectRegion(-1);
       return;
     }
-    // Report the finished region and refresh toolbar (create adds to the set).
-    this.selectRegion(d.index);
+    // A press on a handle/body that never moved changed nothing: drop its
+    // undo snapshot so ⌘Z undoes real edits, not clicks (and dblclicks).
+    if (d.mode !== "create" && !d.moved) this.undoStack.pop();
+    // Moving/resizing one member of a multi-selection keeps the whole group
+    // selected (with the dragged region as primary); otherwise select just it.
+    if (d.mode !== "create" && this.selection.has(d.index)) {
+      this.selectedIndex = d.index;
+      this.requestDraw();
+      this.emitSelectionPick();
+    } else {
+      this.selectRegion(d.index);
+    }
     if (d.mode === "create") this.callbacks.onRegionsChanged();
   }
 
@@ -1384,7 +1701,8 @@ export class Viewer {
       selected: this.selectedIndex,
       selection: this.selection,
       edit: this.editMode,
-    });
+      groupAngle: this.currentGroupAngle(),
+    }, this.layerStyle);
     if (this.image && this.sourceMarkers) {
       drawSourceMarkers(this.overlay, this.sourceMarkers, view, this.sourceColor);
     }

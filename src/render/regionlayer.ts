@@ -19,6 +19,23 @@ export interface RegionView {
 
 const DEFAULT_COLOR = "#00ff00"; // DS9 default green; .reg names are CSS-valid
 
+/** Per-layer display state (multiple region files on one image). Regions in
+ *  a hidden layer are neither drawn nor hit-tested. (Layer colors are not an
+ *  override: the panel's layer swatch writes each region's own color, so it
+ *  is undoable and saved with the layer.) */
+export interface LayerStyle {
+  hidden: ReadonlySet<number>;
+}
+
+/** Whether a region is in a visible layer (untagged regions always are). */
+export function regionShown(reg: PixelRegion, layers?: LayerStyle): boolean {
+  return !layers || reg.layer === undefined || !layers.hidden.has(reg.layer);
+}
+
+function regionColor(reg: PixelRegion): string {
+  return reg.color ?? DEFAULT_COLOR;
+}
+
 /** Which regions to draw emphasized (indices into the region array, -1 =
  *  none). `selected` is the primary region — white glow + corner handles;
  *  every index in `selection` (a multi-select set) gets a white glow without
@@ -30,6 +47,8 @@ export interface RegionHighlight {
   /** All highlighted regions (multi-select). Always includes `selected`. */
   selection?: ReadonlySet<number>;
   edit: boolean;
+  /** Orientation of the multi-selection box (degrees, CCW). */
+  groupAngle?: number;
 }
 
 /** Image pixel center (0-based coord p) → device-pixel screen position.
@@ -53,6 +72,7 @@ export function drawRegions(
   regions: readonly PixelRegion[] | null,
   view: RegionView,
   hl?: RegionHighlight,
+  layers?: LayerStyle,
 ): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -60,19 +80,25 @@ export function drawRegions(
   if (!regions || regions.length === 0) return;
 
   const project = screenMap(view);
+  // Several regions selected: one bounding box with group handles replaces
+  // the primary's own handles (#7).
+  const group =
+    hl?.selection && hl.selection.size >= 2 ? groupBox(regions, hl.selection, layers, hl.groupAngle ?? 0) : null;
 
   for (let i = 0; i < regions.length; i++) {
     const reg = regions[i];
+    if (!regionShown(reg, layers)) continue;
+    const color = regionColor(reg);
     // 2 = primary (white glow + handles), 3 = also-selected (white glow, no
     // handles), 1 = hover (color glow), 0 = plain.
     const emph =
-      hl && i === hl.selected ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
+      hl && i === hl.selected && !group ? 2 : hl?.selection?.has(i) ? 3 : hl && i === hl.hover ? 1 : 0;
     ctx.save();
-    ctx.strokeStyle = ctx.fillStyle = reg.color ?? DEFAULT_COLOR;
+    ctx.strokeStyle = ctx.fillStyle = color;
     ctx.lineWidth = Math.max(1, (reg.width ?? 1) * view.dpr) + (emph ? 1.5 * view.dpr : 0);
     ctx.setLineDash(reg.dash ? [6 * view.dpr, 4 * view.dpr] : []);
     if (emph) {
-      ctx.shadowColor = emph === 1 ? reg.color ?? DEFAULT_COLOR : "#ffffff";
+      ctx.shadowColor = emph === 1 ? color : "#ffffff";
       ctx.shadowBlur = (emph === 1 ? 5 : 8) * view.dpr;
     }
 
@@ -178,6 +204,185 @@ export function drawRegions(
     if (emph === 2 && hl?.edit) drawEditHandles(ctx, reg, view);
     else if (emph === 2 && bbox) drawHandles(ctx, bbox, view.dpr);
   }
+  if (group) drawGroupBox(ctx, group, view, hl?.edit ?? false);
+}
+
+// ---- multi-selection bounding box (#7) -------------------------------------
+
+/** Image-px axis-aligned box [x0, y0, x1, y1] (y up). */
+type ImageBox = [number, number, number, number];
+
+/** The multi-selection box: an axis-aligned box [u0, v0, u1, v1] in a frame
+ *  rotated `angle`° CCW about the image origin, so the box turns with the
+ *  group when it is rotated (and keeps its size). */
+export interface GroupFrame {
+  box: ImageBox;
+  angle: number;
+}
+
+/** Local (u, v) of a group frame → image px. */
+function frameToImage(g: GroupFrame, u: number, v: number): [number, number] {
+  const a = (g.angle * Math.PI) / 180;
+  const c = Math.cos(a);
+  const sn = Math.sin(a);
+  return [c * u - sn * v, sn * u + c * v];
+}
+
+/** A region's image-px extent. */
+function regionExtent(reg: PixelRegion): ImageBox {
+  switch (reg.shape) {
+    case "circle":
+      return [reg.x - reg.r, reg.y - reg.r, reg.x + reg.r, reg.y + reg.r];
+    case "annulus":
+      return [reg.x - reg.rout, reg.y - reg.rout, reg.x + reg.rout, reg.y + reg.rout];
+    case "ellipse": {
+      // Exact extent of a rotated ellipse.
+      const a = (reg.angle * Math.PI) / 180;
+      const ex = Math.hypot(reg.rx * Math.cos(a), reg.ry * Math.sin(a));
+      const ey = Math.hypot(reg.rx * Math.sin(a), reg.ry * Math.cos(a));
+      return [reg.x - ex, reg.y - ey, reg.x + ex, reg.y + ey];
+    }
+    case "box": {
+      const a = (reg.angle * Math.PI) / 180;
+      const c = Math.abs(Math.cos(a));
+      const sn = Math.abs(Math.sin(a));
+      const ex = (reg.w * c + reg.h * sn) / 2;
+      const ey = (reg.w * sn + reg.h * c) / 2;
+      return [reg.x - ex, reg.y - ey, reg.x + ex, reg.y + ey];
+    }
+    case "polygon":
+      return [Math.min(...reg.xs), Math.min(...reg.ys), Math.max(...reg.xs), Math.max(...reg.ys)];
+    case "point":
+      return [reg.x, reg.y, reg.x, reg.y];
+  }
+}
+
+/** Bounding box of the given (visible) regions in a frame at `angle`°, or
+ *  null if none. Each region is rotated into the frame and its exact extent
+ *  taken there. */
+export function groupBox(
+  regions: readonly PixelRegion[],
+  indices: Iterable<number>,
+  layers?: LayerStyle,
+  angle = 0,
+): GroupFrame | null {
+  let b: ImageBox | null = null;
+  for (const i of indices) {
+    const r = regions[i];
+    if (!r || !regionShown(r, layers)) continue;
+    let local = r;
+    if (angle !== 0) {
+      local = structuredClone(r);
+      rotateRegionAbout(local, 0, 0, -angle);
+    }
+    const e = regionExtent(local);
+    b = b ? [Math.min(b[0], e[0]), Math.min(b[1], e[1]), Math.max(b[2], e[2]), Math.max(b[3], e[3])] : e;
+  }
+  return b ? { box: b, angle } : null;
+}
+
+/** Image-px corners of a group box, in order around it (opposite corner of
+ *  i is (i + 2) % 4). */
+export function boxCorners(g: GroupFrame): [number, number][] {
+  const b = g.box;
+  return [
+    frameToImage(g, b[0], b[1]),
+    frameToImage(g, b[2], b[1]),
+    frameToImage(g, b[2], b[3]),
+    frameToImage(g, b[0], b[3]),
+  ];
+}
+
+/** Image-px center of a group box. */
+export function boxCenter(g: GroupFrame): [number, number] {
+  return frameToImage(g, (g.box[0] + g.box[2]) / 2, (g.box[1] + g.box[3]) / 2);
+}
+
+/** A group handle: a corner (scale about the opposite corner) or the rotate
+ *  knob above the box's top edge (rotate about the box center). */
+export interface GroupHandle {
+  sx: number;
+  sy: number;
+  kind: "corner" | "rot";
+  /** Corner index into boxCorners (−1 for rot). */
+  corner: number;
+}
+
+export function groupHandles(g: GroupFrame, view: RegionView): GroupHandle[] {
+  const project = screenMap(view);
+  const out: GroupHandle[] = boxCorners(g).map(([x, y], corner) => {
+    const [sx, sy] = project(x, y);
+    return { sx, sy, kind: "corner", corner };
+  });
+  // Rotate knob: beyond the middle of the box's (local) top edge.
+  const b = g.box;
+  const [kx, ky] = frameToImage(g, (b[0] + b[2]) / 2, b[3] + (20 * view.dpr) / view.scale);
+  const [sx, sy] = project(kx, ky);
+  out.push({ sx, sy, kind: "rot", corner: -1 });
+  return out;
+}
+
+export function hitTestGroupHandle(b: GroupFrame, view: RegionView, mx: number, my: number, tol = 7): GroupHandle | null {
+  let best: GroupHandle | null = null;
+  let bestD = tol * view.dpr;
+  for (const hd of groupHandles(b, view)) {
+    const d = Math.hypot(mx - hd.sx, my - hd.sy);
+    if (d <= bestD) {
+      bestD = d;
+      best = hd;
+    }
+  }
+  return best;
+}
+
+/** Hover cursor for a group handle: diagonal resize at corners, grab on rot. */
+export function groupHandleCursor(g: GroupFrame, hd: GroupHandle, view: RegionView): string {
+  if (hd.kind === "rot") return "grab";
+  const [px, py] = boxCenter(g);
+  const [cx, cy] = screenMap(view)(px, py);
+  const deg = (((Math.atan2(hd.sy - cy, hd.sx - cx) * 180) / Math.PI) % 180 + 180) % 180;
+  if (deg < 22.5 || deg >= 157.5) return "ew-resize";
+  if (deg < 67.5) return "nwse-resize";
+  if (deg < 112.5) return "ns-resize";
+  return "nesw-resize";
+}
+
+function drawGroupBox(ctx: CanvasRenderingContext2D, b: GroupFrame, view: RegionView, edit: boolean): void {
+  const project = screenMap(view);
+  const pts = boxCorners(b).map(([x, y]) => project(x, y));
+  ctx.save();
+  ctx.setLineDash([5 * view.dpr, 4 * view.dpr]);
+  ctx.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx.lineWidth = view.dpr;
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
+  ctx.closePath();
+  ctx.stroke();
+  if (edit) {
+    // Stem from the top edge to the rotate knob.
+    const hs = groupHandles(b, view);
+    const knob = hs[4];
+    ctx.beginPath();
+    ctx.moveTo((pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2);
+    ctx.lineTo(knob.sx, knob.sy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#000000";
+    const s = 3.5 * view.dpr;
+    for (const hd of groupHandles(b, view)) {
+      if (hd.kind === "rot") {
+        ctx.beginPath();
+        ctx.arc(hd.sx, hd.sy, s + 0.5 * view.dpr, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.fillRect(hd.sx - s, hd.sy - s, 2 * s, 2 * s);
+        ctx.strokeRect(hd.sx - s, hd.sy - s, 2 * s, 2 * s);
+      }
+    }
+  }
+  ctx.restore();
 }
 
 /** Nearest catalog source marker to the screen point (mx, my) within `tol`
@@ -269,7 +474,8 @@ export function drawSourceMarkers(
 }
 
 /** Center pixel (0-based) of a region; polygon uses its vertex centroid. */
-function regionCenterPx(reg: PixelRegion): [number, number] {
+/** Region center in image px (polygon: vertex centroid). */
+export function regionCenterPx(reg: PixelRegion): [number, number] {
   if (reg.shape === "polygon") {
     const n = reg.xs.length || 1;
     return [reg.xs.reduce((a, b) => a + b, 0) / n, reg.ys.reduce((a, b) => a + b, 0) / n];
@@ -286,6 +492,7 @@ export function regionsInRect(
   y0: number,
   x1: number,
   y1: number,
+  layers?: LayerStyle,
 ): number[] {
   const project = screenMap(view);
   const lox = Math.min(x0, x1);
@@ -294,6 +501,7 @@ export function regionsInRect(
   const hiy = Math.max(y0, y1);
   const out: number[] = [];
   for (let i = 0; i < regions.length; i++) {
+    if (!regionShown(regions[i], layers)) continue;
     const [cx, cy] = regionCenterPx(regions[i]);
     const [sx, sy] = project(cx, cy);
     if (sx >= lox && sx <= hix && sy >= loy && sy <= hiy) out.push(i);
@@ -403,11 +611,13 @@ export function hitTestRegion(
   mx: number,
   my: number,
   tol = 6,
+  layers?: LayerStyle,
 ): number {
   if (!regions) return -1;
   const project = screenMap(view);
   const slack = tol * view.dpr;
   for (let i = regions.length - 1; i >= 0; i--) {
+    if (!regionShown(regions[i], layers)) continue;
     if (regionHit(regions[i], view, project, mx, my, slack)) return i;
   }
   return -1;
@@ -628,6 +838,44 @@ export function handlesFor(reg: PixelRegion, view: RegionView): Handle[] {
   return out;
 }
 
+/** Nearest polygon edge within `tol` screen px of (mx, my): the vertex index
+ *  to insert after and the image-pixel point on the edge, or null. Used to
+ *  insert a vertex (double-click an edge, issue #6). */
+export function hitTestPolygonEdge(
+  reg: PixelRegion,
+  view: RegionView,
+  mx: number,
+  my: number,
+  tol = 6,
+): { after: number; x: number; y: number } | null {
+  if (reg.shape !== "polygon" || reg.xs.length < 2) return null;
+  const project = screenMap(view);
+  const n = reg.xs.length;
+  let best: { after: number; x: number; y: number } | null = null;
+  let bestD = tol * view.dpr;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    const [ax, ay] = project(reg.xs[i], reg.ys[i]);
+    const [bx, by] = project(reg.xs[j], reg.ys[j]);
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) continue;
+    const t = Math.min(1, Math.max(0, ((mx - ax) * dx + (my - ay) * dy) / len2));
+    const d = Math.hypot(mx - (ax + t * dx), my - (ay + t * dy));
+    if (d < bestD) {
+      bestD = d;
+      // Projection is affine, so t carries over to image space.
+      best = {
+        after: i,
+        x: reg.xs[i] + t * (reg.xs[j] - reg.xs[i]),
+        y: reg.ys[i] + t * (reg.ys[j] - reg.ys[i]),
+      };
+    }
+  }
+  return best;
+}
+
 /** Nearest handle within `tol` screen px of (mx, my), or null. */
 export function hitTestHandle(
   reg: PixelRegion,
@@ -732,6 +980,71 @@ export function resizeRegion(
     case "point":
       break;
   }
+}
+
+/** CSS cursor for hovering a handle (#7): rotate → grab, polygon vertex →
+ *  move, size handles → the resize arrow along the handle's direction from
+ *  the region center on screen. */
+export function handleCursor(reg: PixelRegion, hd: Handle, view: RegionView): string {
+  if (hd.role === "rot") return "grab";
+  if (hd.role === "node") return "move";
+  const [px, py] = regionCenterPx(reg);
+  const [cx, cy] = screenMap(view)(px, py);
+  const deg = (((Math.atan2(hd.sy - cy, hd.sx - cx) * 180) / Math.PI) % 180 + 180) % 180;
+  // Screen y grows down: 45° points down-right (nwse), 135° down-left (nesw).
+  if (deg < 22.5 || deg >= 157.5) return "ew-resize";
+  if (deg < 67.5) return "nwse-resize";
+  if (deg < 112.5) return "ns-resize";
+  return "nesw-resize";
+}
+
+/** Scale a region about image point (cx, cy) by `s` (center + sizes). */
+export function scaleRegionAbout(reg: PixelRegion, cx: number, cy: number, s: number): void {
+  if (reg.shape === "polygon") {
+    for (let i = 0; i < reg.xs.length; i++) {
+      reg.xs[i] = cx + s * (reg.xs[i] - cx);
+      reg.ys[i] = cy + s * (reg.ys[i] - cy);
+    }
+    return;
+  }
+  reg.x = cx + s * (reg.x - cx);
+  reg.y = cy + s * (reg.y - cy);
+  switch (reg.shape) {
+    case "circle":
+      reg.r = Math.max(0.5, reg.r * s);
+      break;
+    case "annulus":
+      reg.rin = Math.max(0.5, reg.rin * s);
+      reg.rout = Math.max(reg.rin + 0.5, reg.rout * s);
+      break;
+    case "ellipse":
+      reg.rx = Math.max(0.5, reg.rx * s);
+      reg.ry = Math.max(0.5, reg.ry * s);
+      break;
+    case "box":
+      reg.w = Math.max(1, reg.w * s);
+      reg.h = Math.max(1, reg.h * s);
+      break;
+    case "point":
+      break;
+  }
+}
+
+/** Rotate a region about image point (cx, cy) by `deg` (CCW, image y up). */
+export function rotateRegionAbout(reg: PixelRegion, cx: number, cy: number, deg: number): void {
+  const a = (deg * Math.PI) / 180;
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  const rot = (x: number, y: number): [number, number] => [
+    cx + c * (x - cx) - s * (y - cy),
+    cy + s * (x - cx) + c * (y - cy),
+  ];
+  if (reg.shape === "polygon") {
+    for (let i = 0; i < reg.xs.length; i++) [reg.xs[i], reg.ys[i]] = rot(reg.xs[i], reg.ys[i]);
+    return;
+  }
+  [reg.x, reg.y] = rot(reg.x, reg.y);
+  if (reg.shape === "ellipse" || reg.shape === "box") reg.angle = normDeg(reg.angle + deg);
 }
 
 /** Shapes the create tool can draw. Polygon is click-to-add-vertices

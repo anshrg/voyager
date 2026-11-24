@@ -66,16 +66,16 @@ anything. Promote items into a milestone deliberately, not casually.
   `PixelRegion[]` in image/sky frame; multi-select moves/deletes the group).
   ~~**New-polygon creation**~~ **DONE 2026-07-12, verified live** (click-to-add
   vertices; close via first-vertex click / Enter / dblclick; Escape discards).
-  Still open: handle-hover cursor shapes (nesw/nwse); numeric entry of region
-  params; per-region color/label editing UI; multi-select resize (only the
-  primary resizes today).
+  ~~Handle-hover cursors; numeric entry; per-region color/label UI;
+  multi-select resize~~ **DONE 2026-11-23 (#7)** — Selected-region section in
+  the Layers panel; multi-selection bounding box (corner scale, rotate knob).
 - ~~**Region undo/redo (user request 2026-07-05)**~~ **DONE 2026-07-12,
   verified live**: ⌘Z/⌘⇧Z, bounded 50-state stack in `viewer.ts`, snapshots
   around every edit-mode mutation incl. polygon-draft commit.
-- **Edit polygon topology (user request 2026-07-05)**: add or remove vertices on
-  existing polygons (today only existing vertices can be dragged; new-polygon
-  creation is separately parked above). E.g. double-click an edge to insert a
-  node, double-click / modifier-click a node to delete it.
+- ~~**Edit polygon topology**~~ **DONE 2026-11-23 (#6)**: dblclick an edge
+  inserts a vertex, a vertex deletes it (≥3 kept).
+- Region tool bar v2: configurable single-letter tool shortcuts (user wants
+  them configurable; left out of v1).
 - Region text label size option (fixed 11px now).
 
 ## From M4 implementation (parked, not blocking)

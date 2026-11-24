@@ -5,6 +5,30 @@
 > history lives in `git log`. New feature ideas go to `BACKLOG.md`, durable
 > decisions with rationale to `CLAUDE.md`.
 
+## Region layers + editing polish (issues #18, #6, #7) — user-verified 2026-11-23
+
+Several .reg files per image as **layers** (`src/regionpanel.ts`, floating
+"Region layers" panel): visibility, active (draw-into) layer, color swatch,
+per-layer save (image/sky), close. Regions live in the Viewer tagged with a
+frontend-only `layer` id (stripped on save). The swatch shows the layer's
+real region colors (rainbow ring = mixed) and **writes region colors**
+(undoable, saved) — there is no display override. "Selected region" section
+(`src/regionprops.ts`): numeric center/size/angle in sky or pixel units,
+label, color, width, dash, exclude; every edit is one undo step (color
+pickers coalesce per picker session, live on `input`).
+
+Viewer: undo entries carry `{regions, selection, primary, groupAngle}` so ⌘Z
+restores the selection; drags on a multi-selection keep it. ≥2 selected →
+group box (`groupBox` in regionlayer.ts, oriented frame) with corner scale
+(about the opposite corner) and a rotate knob; the box turns with the group.
+Polygon dblclick: edge inserts / vertex deletes a node (#6).
+
+Gotchas: untitled-layer regions and edits to file layers are lost on an
+image/HDU reload (file layers re-read from disk); adding/closing a layer
+resets undo; global ⌘Z ignores focus on color/checkbox/radio inputs (only
+text inputs block it). The group-box rotate fix (box turning with the group)
+landed after the user's last pass — confirm in the tool-bar test round.
+
 ## Drag-to-reorder frame chips (issue #16) — user-verified 2026-11-23
 
 Frame-bar chips reorder by pointer drag (`bindChipDrag`/`reorderFrame`/
