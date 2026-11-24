@@ -1493,3 +1493,14 @@ table.cards td {
   line-height: 15px;
   background: color-mix(in srgb, var(--bg-panel) 85%, transparent);
 }
+
+/* Pinned readout (click a point in Pan): frozen, selectable for copying. */
+.readout.pinned {
+  color: var(--accent);
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}

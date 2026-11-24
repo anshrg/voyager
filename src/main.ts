@@ -185,6 +185,8 @@ let tableView: TableView | null = null;
 /** `${path}#${hdu}` the shared TableView currently displays. */
 let tableLoadedFor: string | null = null;
 let histPanel: HistogramPanel | null = null;
+/** Frame whose viewer holds a pinned readout (click in Pan), or null. */
+let pinnedFrame: Frame | null = null;
 /** `${path}#${hdu}` the shared histogram currently displays. */
 let histLoadedFor: string | null = null;
 
@@ -474,7 +476,7 @@ function renderFrameBar(): void {
   if (frames.length > 0) {
     const nav = el("div", "frame-nav");
     const fit = el("button", "frame-nav-btn frame-fit-btn");
-    fit.title = "Fit the image to the window (double-click the image also fits)";
+    fit.title = "Fit the image to the window";
     fit.innerHTML =
       '<svg viewBox="0 0 18 18" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">' +
       '<path d="M3.5 14.5 14.5 3.5"/><path d="M9.5 3.5h5v5"/><path d="M8.5 14.5h-5v-5"/></svg>';
@@ -1029,10 +1031,21 @@ function renderRegionLayerList(): boolean {
 function makeViewer(frame: Frame): Viewer {
   return new Viewer(frame.cell, {
     onReadout: (info) => {
+      // A pinned readout belongs to its frame: other frames' hovers (grid
+      // mode) don't overwrite it.
+      if (pinnedFrame && frame !== pinnedFrame) return;
       must<HTMLElement>("readout").textContent =
         info.x === null
           ? ""
           : `x ${info.x}  y ${info.y}  ${info.value}${info.sky ? `  ${info.sky}` : ""}`;
+    },
+    onPin: (pinned) => {
+      if (!pinned && pinnedFrame !== frame) return;
+      if (pinned && pinnedFrame && pinnedFrame !== frame) pinnedFrame.viewer?.escape();
+      pinnedFrame = pinned ? frame : null;
+      const r = must<HTMLElement>("readout");
+      r.classList.toggle("pinned", pinned);
+      r.title = pinned ? "Pinned readout — select to copy; Esc to release" : "";
     },
     onLimits: (lo, hi) => {
       if (frame !== activeFrame()) return;
@@ -2265,6 +2278,10 @@ async function closeFrame(i: number): Promise<void> {
     return;
   }
   frame.viewer?.destroy();
+  if (pinnedFrame === frame) {
+    pinnedFrame = null;
+    must<HTMLElement>("readout").classList.remove("pinned");
+  }
   frame.cell.remove();
   if (frame.composite) {
     // The composite shares its reference band's file: un-hide the bands, but
@@ -2716,7 +2733,10 @@ function buildUi(): void {
       if (active >= 0) void closeFrame(active);
       return;
     }
-    if (e.key === "Escape") activeFrame()?.viewer?.escape();
+    if (e.key === "Escape") {
+      if (pinnedFrame && pinnedFrame !== activeFrame()) pinnedFrame.viewer?.escape();
+      activeFrame()?.viewer?.escape();
+    }
     if ((e.key === "Delete" || e.key === "Backspace") && !typing) {
       e.preventDefault();
       activeFrame()?.viewer?.deleteSelected();
